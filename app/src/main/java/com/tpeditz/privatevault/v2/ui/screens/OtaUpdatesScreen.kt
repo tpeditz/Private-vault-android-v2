@@ -31,25 +31,22 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.Switch
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tpeditz.privatevault.v2.BuildConfig
 import com.tpeditz.privatevault.v2.ota.OtaState
 import com.tpeditz.privatevault.v2.ota.OtaUpdateManager
-import kotlinx.coroutines.launch
+import com.tpeditz.privatevault.v2.ota.isPendingInstallation
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -57,29 +54,15 @@ fun OtaUpdatesScreen(
     otaUpdateManager: OtaUpdateManager,
     onCheckForUpdates: () -> Unit = {},
     onDownloadUpdate: (com.tpeditz.privatevault.v2.ota.UpdateManifest) -> Unit = {},
+    automaticCheckEnabled: Boolean = true,
+    onSetAutomaticCheck: (Boolean) -> Unit = {},
+    onInstallNow: (File) -> Unit = {},
+    onCancelDownload: () -> Unit = {},
+    onOpenUnknownSources: () -> Unit = {},
+    onRefreshPermission: () -> Unit = {},
     onBack: () -> Unit
 ) {
     val otaState by otaUpdateManager.otaState.collectAsStateWithLifecycle()
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val scope = rememberCoroutineScope()
-
-    // Re-evaluate Install Permission cleanly when returning from Android Settings
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                if (otaUpdateManager.otaState.value is OtaState.NeedsUnknownSourcesPermission) {
-                    scope.launch {
-                        otaUpdateManager.recheckInstallPermissionAndVerifyCandidate()
-                    }
-                }
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-        }
-    }
-
     Scaffold(
         topBar = {
             TopAppBar(
@@ -122,11 +105,22 @@ fun OtaUpdatesScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
 
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Automatically check for updates", fontWeight = FontWeight.SemiBold)
+                                Text("Notify me when a new version is available.", style = MaterialTheme.typography.bodySmall)
+                            }
+                            Switch(checked = automaticCheckEnabled, onCheckedChange = onSetAutomaticCheck)
+                        }
                         Spacer(modifier = Modifier.height(6.dp))
                         Button(
                             onClick = onCheckForUpdates,
                             modifier = Modifier.fillMaxWidth(),
-                            enabled = otaState !is OtaState.Checking && otaState !is OtaState.Downloading && otaState !is OtaState.Verifying
+                            enabled = otaState !is OtaState.Checking && otaState !is OtaState.Downloading &&
+                                otaState !is OtaState.Verifying && !otaState.isPendingInstallation
                         ) {
                             if (otaState is OtaState.Checking) {
                                 CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
@@ -211,7 +205,7 @@ fun OtaUpdatesScreen(
                                 )
                                 Text("${formatFileSize(state.bytesDownloaded)} / ${formatFileSize(state.totalBytes)}", style = MaterialTheme.typography.labelSmall)
                                 OutlinedButton(
-                                    onClick = { otaUpdateManager.cancelActiveDownload() },
+                                    onClick = onCancelDownload,
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
                                     Text("Cancel")
@@ -246,12 +240,12 @@ fun OtaUpdatesScreen(
                                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
                                     Button(
-                                        onClick = { otaUpdateManager.launchPackageInstaller(state.verifiedApkFile) },
+                                        onClick = { onInstallNow(state.verifiedApkFile) },
                                         modifier = Modifier.weight(1f)
                                     ) {
                                         Text("Install Now")
                                     }
-                                    OutlinedButton(onClick = { otaUpdateManager.cancelActiveDownload() }) {
+                                    OutlinedButton(onClick = onCancelDownload) {
                                         Text("Cancel")
                                     }
                                 }
@@ -267,7 +261,7 @@ fun OtaUpdatesScreen(
                             Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                                 Text("Permission Needed to Install", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
                                 Text(
-                                    "Android needs permission to let Private Vault open the update installer. Tap Open Settings, allow installs from this source, then press Back to continue.",
+                                    "Your update is already downloaded. Allow installs from this source in Android Settings, then press Back. Private Vault will keep the update and check permission automatically.",
                                     style = MaterialTheme.typography.bodySmall
                                 )
                                 Row(
@@ -275,14 +269,17 @@ fun OtaUpdatesScreen(
                                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
                                     Button(
-                                        onClick = { otaUpdateManager.openUnknownSourcesSettings() },
+                                        onClick = onOpenUnknownSources,
                                         modifier = Modifier.weight(1f)
                                     ) {
                                         Text("Open Settings")
                                     }
-                                    OutlinedButton(onClick = { otaUpdateManager.cancelActiveDownload() }) {
+                                    OutlinedButton(onClick = onCancelDownload) {
                                         Text("Cancel")
                                     }
+                                }
+                                OutlinedButton(onClick = onRefreshPermission, modifier = Modifier.fillMaxWidth()) {
+                                    Text("I've allowed permission — check again")
                                 }
                             }
                         }
@@ -313,7 +310,7 @@ fun OtaUpdatesScreen(
                                         ) {
                                             Text("Try Again")
                                         }
-                                        OutlinedButton(onClick = { otaUpdateManager.cancelActiveDownload() }) {
+                                        OutlinedButton(onClick = onCancelDownload) {
                                             Text("Cancel")
                                         }
                                     } else {

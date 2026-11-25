@@ -41,6 +41,7 @@ class AppPreferencesRepository(private val context: Context) {
         val KEY_LAST_CLOUD_BACKUP = longPreferencesKey("last_cloud_backup_epoch_ms")
         val KEY_CONNECTED_GOOGLE_ACCOUNT = stringPreferencesKey("connected_google_account")
         val KEY_AUTO_CLOUD_BACKUP_STATUS = stringPreferencesKey("auto_cloud_backup_status")
+        val KEY_AUTO_OTA_CHECK = booleanPreferencesKey("automatic_ota_check_enabled")
         val KEY_LAST_OTA_CHECK = longPreferencesKey("last_ota_check_epoch_ms")
     }
 
@@ -102,6 +103,10 @@ class AppPreferencesRepository(private val context: Context) {
         prefs[KEY_AUTO_CLOUD_BACKUP_STATUS].orEmpty()
     }
 
+    val automaticOtaCheckEnabled: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[KEY_AUTO_OTA_CHECK] ?: true
+    }
+
     val lastOtaCheckEpochMs: Flow<Long> = context.dataStore.data.map { prefs ->
         prefs[KEY_LAST_OTA_CHECK] ?: 0L
     }
@@ -160,6 +165,10 @@ class AppPreferencesRepository(private val context: Context) {
 
     suspend fun setAutoCloudBackupStatus(status: String) {
         context.dataStore.edit { it[KEY_AUTO_CLOUD_BACKUP_STATUS] = status }
+    }
+
+    suspend fun setAutomaticOtaCheckEnabled(enabled: Boolean) {
+        context.dataStore.edit { it[KEY_AUTO_OTA_CHECK] = enabled }
     }
 
     suspend fun setLastOtaCheckEpochMs(timestamp: Long = System.currentTimeMillis()) {

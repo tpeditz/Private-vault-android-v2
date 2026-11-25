@@ -45,3 +45,25 @@ sealed interface OtaState {
         val recoverableManifest: UpdateManifest? = null
     ) : OtaState
 }
+
+internal val OtaState.pendingManifest: UpdateManifest?
+    get() = when (this) {
+        is OtaState.ReadyToInstall -> manifest
+        is OtaState.NeedsUnknownSourcesPermission -> manifest
+        else -> null
+    }
+
+internal val OtaState.isPendingInstallation: Boolean
+    get() = pendingManifest != null
+
+/** Called only after the candidate has passed actual APK verification. */
+internal fun pendingInstallState(
+    manifest: UpdateManifest,
+    apk: File,
+    verifiedCertificate: String,
+    permissionGranted: Boolean
+): OtaState = if (permissionGranted) {
+    OtaState.ReadyToInstall(manifest, apk, verifiedCertificate)
+} else {
+    OtaState.NeedsUnknownSourcesPermission(manifest, apk, verifiedCertificate)
+}

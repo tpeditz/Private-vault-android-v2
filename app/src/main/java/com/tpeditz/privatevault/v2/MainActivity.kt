@@ -93,6 +93,8 @@ import com.tpeditz.privatevault.v2.ui.screens.MediaScreen
 import com.tpeditz.privatevault.v2.ui.screens.MediaViewerScreen
 import com.tpeditz.privatevault.v2.ui.screens.NoteEditorScreen
 import com.tpeditz.privatevault.v2.ui.screens.NotesScreen
+import com.tpeditz.privatevault.v2.ota.OtaState
+import com.tpeditz.privatevault.v2.ota.pendingManifest
 import com.tpeditz.privatevault.v2.ui.screens.OtaUpdatesScreen
 import com.tpeditz.privatevault.v2.ui.screens.PasswordEditorScreen
 import com.tpeditz.privatevault.v2.ui.screens.PasswordsScreen
@@ -150,13 +152,24 @@ class MainActivity : FragmentActivity() {
             val snackbarHostState = remember { SnackbarHostState() }
             val scope = rememberCoroutineScope()
             val lifecycleOwner = LocalLifecycleOwner.current
+            val otaState by viewModel.otaState.collectAsStateWithLifecycle()
+            val showPendingUpdateReminder by viewModel.showPendingUpdateReminder.collectAsStateWithLifecycle()
+            val unknownSourcesLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.StartActivityForResult()
+            ) {
+                // Result codes are not reliable for this Settings screen. Re-read the permission.
+                viewModel.refreshOtaOnForeground()
+            }
 
             DisposableEffect(lifecycleOwner) {
                 val observer = LifecycleEventObserver { _, event ->
                     when (event) {
                         Lifecycle.Event.ON_STOP -> viewModel.onAppBackgrounded()
                         Lifecycle.Event.ON_START -> viewModel.onAppForegrounded()
-                        Lifecycle.Event.ON_RESUME -> viewModel.refreshSystemSecurityStatus()
+                        Lifecycle.Event.ON_RESUME -> {
+                            viewModel.refreshSystemSecurityStatus()
+                            viewModel.refreshOtaOnForeground()
+                        }
                         else -> {}
                     }
                 }
@@ -739,6 +752,22 @@ class MainActivity : FragmentActivity() {
                                             otaUpdateManager = viewModel.otaUpdateManager,
                                             onCheckForUpdates = { viewModel.checkForUpdates(manual = true) },
                                             onDownloadUpdate = { viewModel.startUpdateDownload(it) },
+                                            automaticCheckEnabled = uiState.automaticOtaCheckEnabled,
+                                            onSetAutomaticCheck = { viewModel.setAutomaticOtaCheckEnabled(it) },
+                                            onInstallNow = { viewModel.launchPackageInstaller(it) },
+                                            onCancelDownload = { viewModel.cancelUpdateDownload() },
+                                            onOpenUnknownSources = {
+                                                viewModel.rearmPendingUpdateReminder()
+                                                val settingsIntent = viewModel.otaUpdateManager.unknownSourcesSettingsIntent()
+                                                if (settingsIntent != null) {
+                                                    runCatching { unknownSourcesLauncher.launch(settingsIntent) }.onFailure {
+                                                        scope.launch { snackbarHostState.showSnackbar("Open Android settings to allow app updates, then return here.") }
+                                                    }
+                                                } else {
+                                                    viewModel.refreshOtaOnForeground()
+                                                }
+                                            },
+                                            onRefreshPermission = { viewModel.refreshOtaOnForeground() },
                                             onBack = { viewModel.navigateBack() }
                                         )
                                     }
@@ -1135,6 +1164,61 @@ class MainActivity : FragmentActivity() {
                         }
 
                         val incomingShared = uiState.pendingSharedText
+                        // Update notifications live above navigation, not on the update screen.
+                        // Never display them over a locked vault or interfere with lock timing.
+                        if (uiState.isVaultInitialized && uiState.isUnlocked &&
+                            uiState.currentSecondary !is SecondaryDestination.OtaUpdates &&
+                            incomingShared == null && uiState.pendingRestorePayload == null &&
+                            uiState.backupProgressRatio == null && !uiState.isLoading) {
+                            val available = otaState as? OtaState.UpdateAvailable
+                            if (available?.showPromptDialog == true && uiState.automaticOtaCheckEnabled) {
+                                AlertDialog(
+                                    onDismissRequest = { viewModel.dismissUpdateReminder() },
+                                    title = { Text("Update available") },
+                                    text = {
+                                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            Text("Private Vault ${available.manifest.versionName} is ready to download.")
+                                            if (available.manifest.releaseNotes.isNotBlank()) {
+                                                Text(available.manifest.releaseNotes.take(1200))
+                                            }
+                                        }
+                                    },
+                                    confirmButton = {
+                                        Button(onClick = {
+                                            viewModel.dismissUpdateReminder()
+                                            viewModel.navigateToSecondary(SecondaryDestination.OtaUpdates)
+                                            viewModel.startUpdateDownload(available.manifest)
+                                        }) { Text("Update now") }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = { viewModel.dismissUpdateReminder() }) { Text("Later") }
+                                    }
+                                )
+                            } else if (showPendingUpdateReminder && otaState.pendingManifest != null) {
+                                val pending = otaState.pendingManifest!!
+                                AlertDialog(
+                                    onDismissRequest = { viewModel.dismissUpdateReminder() },
+                                    title = { Text("Update downloaded") },
+                                    text = {
+                                        Text(
+                                            if (otaState is OtaState.ReadyToInstall)
+                                                "Private Vault ${pending.versionName} is verified and ready to install. No need to download it again."
+                                            else
+                                                "Private Vault ${pending.versionName} is downloaded. Continue to finish Android's installation permission step."
+                                        )
+                                    },
+                                    confirmButton = {
+                                        Button(onClick = {
+                                            viewModel.navigateToSecondary(SecondaryDestination.OtaUpdates)
+                                        }) { Text("Continue update") }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = { viewModel.dismissUpdateReminder() }) { Text("Later") }
+                                    }
+                                )
+                            }
+                        }
+
                         if (uiState.isVaultInitialized && uiState.isUnlocked && incomingShared != null) {
                             val trimmedShared = incomingShared.trim()
                             val looksLikeUrl = remember(trimmedShared) {

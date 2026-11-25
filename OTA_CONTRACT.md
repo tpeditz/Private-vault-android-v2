@@ -85,3 +85,13 @@ Every production release APK is verified against these immutable fingerprints in
 - **Key Alias:** `privatevault`
 - **Certificate SHA-1:** `32:19:54:C3:81:B4:A7:9D:76:B8:90:FF:05:A3:18:D0:21:FB:AD:FC`
 - **Certificate SHA-256:** `3B:EE:FF:13:8B:71:61:68:B2:F1:66:98:3D:42:49:6B:9D:24:F6:29:B7:5E:E2:5B:DA:FD:16:67:6F:06:A7:70`
+
+
+## 5. Version 2.0.2: Automatic checks and permission recovery
+
+- Automatic checks are enabled by default for the production app, after the vault is unlocked. Foreground checks are throttled to one attempt every 15 minutes in the same process. Settings > App Updates lets users disable them. Manual checking remains available.
+- When a new version is found, the application presents an Update now / Later dialog outside the update screen. It never downloads or installs without the user's action.
+- A successfully downloaded and cryptographically verified APK and its public manifest are retained in an app-private update directory. When the process is recreated or the user returns from Android's install-permission settings, the file and manifest are reverified before returning to the Ready to Install state.
+- Android's actual install permission is read on app resume and on the Settings activity result. If Android has locked the vault, the pending update is shown after the next normal unlock. Vault locking is not weakened.
+- The update screen keeps a manual permission-refresh action and prevents a new check from discarding a pending verified APK. Installation still requires the user to tap Install Now and accept the Android package installer.
+- Device acceptance test: install 2.0.2, publish a higher version with the same package and release key, verify the automatic prompt, download once, allow installation permission, return and install without another network download, then confirm vault data is preserved. Repeat with permission denied, process recreation, and lock timeout.

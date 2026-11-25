@@ -83,6 +83,7 @@ data class VaultUiState(
     val lastCloudBackupEpochMs: Long = 0L,
 
     // OTA State
+    val automaticOtaCheckEnabled: Boolean = true,
     val lastOtaCheckEpochMs: Long = 0L,
 
     // Incoming Share-to-Vault State
