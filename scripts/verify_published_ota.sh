@@ -65,7 +65,14 @@ APKSIGNER=${BUILD_TOOLS_DIR}/apksigner
 AAPT2=${BUILD_TOOLS_DIR}/aapt2
 SIGNATURE=$("$APKSIGNER" verify --verbose --print-certs "$WORK/versioned.apk")
 printf '%s\n' "$SIGNATURE"
-printf '%s\n' "$SIGNATURE" | awk -v expected="$EXPECTED_CERT" '/Signer #[0-9]+ certificate SHA-256 digest:/ { count++; if (tolower($NF) == expected) match_count++ } END { exit !(count == 1 && match_count == 1) }'
+printf '%s\n' "$SIGNATURE" | awk -v expected="$EXPECTED_CERT" '
+  /^Number of signers: / { signers=$NF }
+  /(^|[[:space:]])Signer( #[0-9]+)?:? certificate SHA-256 digest:/ {
+    count++
+    if (tolower($NF) != expected) wrong++
+  }
+  END { exit !(signers == 1 && count >= 1 && wrong == 0) }
+'
 
 "$AAPT2" dump badging "$WORK/versioned.apk" > "$WORK/badging.txt"
 python3 - "$WORK/latest.json" "$WORK/badging.txt" <<'PY'
