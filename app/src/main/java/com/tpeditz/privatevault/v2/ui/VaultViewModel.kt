@@ -2,6 +2,8 @@ package com.tpeditz.privatevault.v2.ui
 
 import android.app.PendingIntent
 import android.content.Context
+import android.os.SystemClock
+import com.tpeditz.privatevault.v2.BuildConfig
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -30,6 +32,7 @@ import com.tpeditz.privatevault.v2.data.VaultItem
 import com.tpeditz.privatevault.v2.data.VaultRepository
 import com.tpeditz.privatevault.v2.ota.OtaState
 import com.tpeditz.privatevault.v2.ota.OtaUpdateManager
+import com.tpeditz.privatevault.v2.ota.isPendingInstallation
 import com.tpeditz.privatevault.v2.security.BiometricKeystoreManager
 import com.tpeditz.privatevault.v2.security.OfflinePasswordStrengthEstimator
 import com.tpeditz.privatevault.v2.security.PasswordGeneratorEngine
@@ -83,6 +86,13 @@ class VaultViewModel(
     private var totpTickerJob: Job? = null
     private var activeBackupJob: Job? = null
     private var activeRestoreJob: Job? = null
+    private var foregroundOtaJob: Job? = null
+    private var installUpdateJob: Job? = null
+    private var lastAutomaticOtaAttemptElapsed: Long? = null
+    private var otaForeground = false
+    private val _showPendingUpdateReminder = MutableStateFlow(true)
+    val showPendingUpdateReminder: StateFlow<Boolean> = _showPendingUpdateReminder.asStateFlow()
+
 
     init {
         // Collect session state
@@ -106,6 +116,7 @@ class VaultViewModel(
                         }
                         loadActiveVaultItems()
                         startTotpTicker()
+                        refreshOtaOnForeground()
                     }
                     is VaultSessionManager.SessionState.Locked -> {
                         lastActiveSessionId = null
@@ -243,6 +254,11 @@ class VaultViewModel(
             }
         }
         viewModelScope.launch {
+            preferencesRepository.automaticOtaCheckEnabled.collect { enabled ->
+                _uiState.update { it.copy(automaticOtaCheckEnabled = enabled) }
+            }
+        }
+        viewModelScope.launch {
             preferencesRepository.lastOtaCheckEpochMs.collect { epoch ->
                 _uiState.update { it.copy(lastOtaCheckEpochMs = epoch) }
             }
@@ -308,10 +324,12 @@ class VaultViewModel(
     }
 
     fun onAppBackgrounded() {
+        otaForeground = false
         sessionManager.onAppBackgrounded()
     }
 
     fun onAppForegrounded() {
+        otaForeground = true
         viewModelScope.launch {
             val timeoutSec = preferencesRepository.autoLockTimeoutSeconds.first()
             sessionManager.onAppForegrounded(timeoutSec)
@@ -1844,14 +1862,66 @@ class VaultViewModel(
         }
     }
 
-    fun checkForUpdates(manual: Boolean = true) {
-        viewModelScope.launch {
-            otaUpdateManager.checkForUpdates(isUserInitiated = manual)
-            runCatching { preferencesRepository.setLastOtaCheckEpochMs() }
+    /**
+     * Called on activity resume, result from Android Settings, and vault unlock.
+     * Recover the current download before considering a new network request.
+     */
+    fun refreshOtaOnForeground() {
+        if (!otaForeground || foregroundOtaJob?.isActive == true) return
+        foregroundOtaJob = viewModelScope.launch {
+            otaUpdateManager.recheckInstallPermissionAndVerifyCandidate()
+            if (!otaForeground || !_uiState.value.isUnlocked || BuildConfig.DEBUG) return@launch
+            if (!preferencesRepository.automaticOtaCheckEnabled.first()) return@launch
+            val current = otaUpdateManager.otaState.value
+            if (current.isPendingInstallation || current is OtaState.Downloading || current is OtaState.Verifying || current is OtaState.Checking) {
+                return@launch
+            }
+            val now = SystemClock.elapsedRealtime()
+            val last = lastAutomaticOtaAttemptElapsed
+            if (last != null && now - last < 15 * 60 * 1000L) return@launch
+            lastAutomaticOtaAttemptElapsed = now
+            val result = otaUpdateManager.checkForUpdates(isUserInitiated = false)
+            if (result is OtaState.UpdateAvailable || result is OtaState.UpToDate) {
+                runCatching { preferencesRepository.setLastOtaCheckEpochMs() }
+            }
         }
     }
 
+    fun setAutomaticOtaCheckEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            preferencesRepository.setAutomaticOtaCheckEnabled(enabled)
+            if (enabled) {
+                lastAutomaticOtaAttemptElapsed = null
+                refreshOtaOnForeground()
+            } else {
+                otaUpdateManager.dismissUpdatePrompt()
+            }
+        }
+    }
+
+    fun checkForUpdates(manual: Boolean = true) {
+        viewModelScope.launch {
+            val recovered = otaUpdateManager.recheckInstallPermissionAndVerifyCandidate()
+            if (recovered.isPendingInstallation) return@launch
+            val result = otaUpdateManager.checkForUpdates(isUserInitiated = manual)
+            if (result is OtaState.UpdateAvailable || result is OtaState.UpToDate) {
+                lastAutomaticOtaAttemptElapsed = SystemClock.elapsedRealtime()
+                runCatching { preferencesRepository.setLastOtaCheckEpochMs() }
+            }
+        }
+    }
+
+    fun dismissUpdateReminder() {
+        otaUpdateManager.dismissUpdatePrompt()
+        _showPendingUpdateReminder.value = false
+    }
+
+    fun rearmPendingUpdateReminder() {
+        _showPendingUpdateReminder.value = true
+    }
+
     fun startUpdateDownload(manifest: com.tpeditz.privatevault.v2.ota.UpdateManifest) {
+        _showPendingUpdateReminder.value = true
         viewModelScope.launch {
             otaUpdateManager.startDownload(manifest)
         }
@@ -1862,11 +1932,10 @@ class VaultViewModel(
     }
 
     fun launchPackageInstaller(apkFile: File) {
-        otaUpdateManager.launchPackageInstaller(apkFile)
-    }
-
-    fun openUnknownSourcesSettings() {
-        otaUpdateManager.openUnknownSourcesSettings()
+        if (installUpdateJob?.isActive == true) return
+        installUpdateJob = viewModelScope.launch {
+            otaUpdateManager.launchPackageInstaller(apkFile)
+        }
     }
 
     // ============================================================================================

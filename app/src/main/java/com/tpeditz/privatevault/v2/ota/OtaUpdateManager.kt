@@ -11,11 +11,14 @@ import androidx.core.content.FileProvider
 import com.android.apksig.ApkVerifier
 import com.tpeditz.privatevault.v2.BuildConfig
 import com.tpeditz.privatevault.v2.security.SafeVaultLogger
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -47,7 +50,8 @@ class OtaUpdateManager(
             PackageManager.GET_META_DATA
         )
     },
-    private val cacheDirProvider: () -> File = { requireNotNull(context).cacheDir },
+    // Keep the verified candidate in private files, not evictable cache.
+    private val cacheDirProvider: () -> File = { requireNotNull(context).filesDir },
     private val canRequestPackageInstallsProvider: () -> Boolean = {
         val ctx = context
         if (ctx != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -67,6 +71,10 @@ class OtaUpdateManager(
 
     private val _otaState = MutableStateFlow<OtaState>(OtaState.Idle)
     val otaState: StateFlow<OtaState> = _otaState.asStateFlow()
+
+    private val operationMutex = Mutex()
+    private val pendingStore: PendingOtaDownloadStore
+        get() = PendingOtaDownloadStore(File(cacheDirProvider(), "ota_updates"))
 
     @Volatile
     private var activeDownloadCall: okhttp3.Call? = null
@@ -155,189 +163,257 @@ class OtaUpdateManager(
         manifestUrl: String = BuildConfig.UPDATE_MANIFEST_URL,
         isUserInitiated: Boolean = true
     ): OtaState = withContext(Dispatchers.IO) {
-        if (!isUserInitiated && _otaState.value !is OtaState.Idle) {
-            return@withContext _otaState.value
-        }
-        _otaState.value = OtaState.Checking
-
+        if (!operationMutex.tryLock()) return@withContext _otaState.value
         try {
-            validateManifestUrl(manifestUrl)
-            val request = Request.Builder().url(manifestUrl).get().build()
-            val manifestJsonString = executeWithRedirects(request, maxHops = 3)
-            val manifest = parseAndValidateManifest(manifestJsonString)
-
-            val currentVersionCode = installedVersionCodeProvider()
-            val currentVersionName = BuildConfig.VERSION_NAME
-
-            if (manifest.versionCode > currentVersionCode) {
-                val state = OtaState.UpdateAvailable(manifest = manifest, showPromptDialog = isUserInitiated)
-                _otaState.value = state
-                state
-            } else {
-                val state = OtaState.UpToDate(currentVersionName, currentVersionCode)
-                _otaState.value = state
-                state
+            val previous = _otaState.value
+            // Checking must never discard a verified candidate or interrupt a download.
+            if (previous.isPendingInstallation || previous is OtaState.Downloading ||
+                previous is OtaState.Verifying || previous is OtaState.Checking) {
+                return@withContext previous
             }
-        } catch (e: HttpStatusException) {
-            SafeVaultLogger.w("OTA", "HTTP ${e.code} while checking updates")
-            val state = if (e.code == 404) {
-                OtaState.Error(
-                    title = "No Release Published Yet",
-                    detail = "No public release was found on GitHub yet. You are running Private Vault ${BuildConfig.VERSION_NAME}."
+            _otaState.value = OtaState.Checking
+
+            try {
+                validateManifestUrl(manifestUrl)
+                val request = Request.Builder().url(manifestUrl).get().build()
+                val manifestJsonString = executeWithRedirects(request, maxHops = 3)
+                val manifest = parseAndValidateManifest(manifestJsonString)
+
+                val currentVersionCode = installedVersionCodeProvider()
+                val currentVersionName = BuildConfig.VERSION_NAME
+
+                if (manifest.versionCode > currentVersionCode) {
+                    val showPrompt = !isUserInitiated && (
+                        previous !is OtaState.UpdateAvailable ||
+                            previous.manifest.versionCode != manifest.versionCode ||
+                            previous.showPromptDialog
+                        )
+                    val state = OtaState.UpdateAvailable(manifest = manifest, showPromptDialog = showPrompt)
+                    _otaState.value = state
+                    state
+                } else {
+                    val state = OtaState.UpToDate(currentVersionName, currentVersionCode)
+                    _otaState.value = state
+                    state
+                }
+            } catch (e: CancellationException) {
+                _otaState.value = OtaState.Idle
+                throw e
+            } catch (e: HttpStatusException) {
+                SafeVaultLogger.w("OTA", "HTTP ${e.code} while checking updates")
+                val state = if (e.code == 404) {
+                    OtaState.Error(
+                        title = "No Release Published Yet",
+                        detail = "No public release was found on GitHub yet. You are running Private Vault ${BuildConfig.VERSION_NAME}."
+                    )
+                } else {
+                    OtaState.Error(
+                        title = "Update Check Failed",
+                        detail = "Server returned status ${e.code}. Please try again later."
+                    )
+                }
+                _otaState.value = state
+                state
+            } catch (e: java.io.IOException) {
+                SafeVaultLogger.w("OTA", "Network error during update check: ${e.message}")
+                val state = OtaState.Error(
+                    title = "Connection Error",
+                    detail = "Could not connect to GitHub. Check your internet connection and try again."
                 )
-            } else {
-                OtaState.Error(
+                _otaState.value = state
+                state
+            } catch (e: Exception) {
+                SafeVaultLogger.w("OTA", "Check failed: ${e.message}")
+                val state = OtaState.Error(
                     title = "Update Check Failed",
-                    detail = "Server returned status ${e.code}. Please try again later."
+                    detail = e.message ?: "Could not check for updates. Check your connection."
                 )
+                _otaState.value = state
+                state
             }
-            _otaState.value = state
-            state
-        } catch (e: java.io.IOException) {
-            SafeVaultLogger.w("OTA", "Network error during update check: ${e.message}")
-            val state = OtaState.Error(
-                title = "Connection Error",
-                detail = "Could not connect to GitHub. Check your internet connection and try again."
-            )
-            _otaState.value = state
-            state
-        } catch (e: Exception) {
-            SafeVaultLogger.w("OTA", "Check failed: ${e.message}")
-            val state = OtaState.Error(
-                title = "Update Check Failed",
-                detail = e.message ?: "Could not check for updates. Check your connection."
-            )
-            _otaState.value = state
-            state
+        } finally {
+            operationMutex.unlock()
+        }
+    }
+
+    fun dismissUpdatePrompt() {
+        val current = _otaState.value
+        if (current is OtaState.UpdateAvailable) {
+            _otaState.compareAndSet(current, current.copy(showPromptDialog = false))
         }
     }
 
     suspend fun startDownload(manifest: UpdateManifest): Unit = withContext(Dispatchers.IO) {
-        isDownloadCancelled = false
-        _otaState.value = OtaState.Downloading(manifest, 0L, manifest.sizeBytes)
-
-        val targetDir = File(cacheDirProvider(), "ota_updates")
-        targetDir.mkdirs()
-        targetDir.listFiles()?.forEach { runCatching { it.delete() } }
-
-        val targetApk = File(targetDir, "private-vault-v2-${manifest.versionCode}.apk")
-        var currentUrl = manifest.apkUrl
-
+        operationMutex.lock()
         try {
-            var hopCount = 0
-            var finalResponse: Response? = null
+            if (_otaState.value.isPendingInstallation) return@withContext
+            isDownloadCancelled = false
+            _otaState.value = OtaState.Downloading(manifest, 0L, manifest.sizeBytes)
 
-            while (hopCount < 5) {
-                validateDownloadHopUrl(currentUrl)
-                val request = Request.Builder().url(currentUrl).get().build()
-                val call = httpClient.newCall(request)
-                activeDownloadCall = call
-                val response = call.execute()
+            val store = pendingStore
+            store.clear()
+            val targetApk = store.apkFile(manifest.versionCode)
+            targetApk.parentFile?.mkdirs()
+            var currentUrl = manifest.apkUrl
 
-                if (response.isRedirect) {
-                    val location = response.header("Location")
-                    response.close()
-                    require(!location.isNullOrBlank()) { "Redirect missing Location header." }
-                    currentUrl = resolveRedirect(currentUrl, location)
-                    hopCount++
-                    continue
-                }
+            try {
+                var hopCount = 0
+                var finalResponse: Response? = null
 
-                if (!response.isSuccessful) {
-                    response.close()
-                    throw IllegalArgumentException("HTTP download failed with code ${response.code}.")
-                }
-                finalResponse = response
-                break
-            }
+                while (hopCount < 5) {
+                    validateDownloadHopUrl(currentUrl)
+                    val request = Request.Builder().url(currentUrl).get().build()
+                    val call = httpClient.newCall(request)
+                    activeDownloadCall = call
+                    val response = call.execute()
 
-            val response = finalResponse ?: throw IllegalArgumentException("Too many redirects.")
-            val body = response.body ?: throw IllegalArgumentException("Response body is empty.")
-            val declaredLen = body.contentLength()
-            require(declaredLen <= MAX_APK_DOWNLOAD_BYTES) {
-                "Update package exceeds maximum supported size limit."
-            }
-            val totalBytes = if (declaredLen > 0) declaredLen else manifest.sizeBytes
-
-            body.byteStream().use { input ->
-                FileOutputStream(targetApk).use { output ->
-                    val buffer = ByteArray(64 * 1024)
-                    var bytesDownloaded = 0L
-                    var read: Int
-                    while (input.read(buffer).also { read = it } != -1) {
-                        if (isDownloadCancelled) {
-                            targetApk.delete()
-                            return@withContext
-                        }
-                        bytesDownloaded += read.toLong()
-                        require(bytesDownloaded <= MAX_APK_DOWNLOAD_BYTES) {
-                            "Update package exceeded maximum size limit during download."
-                        }
-                        output.write(buffer, 0, read)
-                        _otaState.value = OtaState.Downloading(manifest, bytesDownloaded, totalBytes)
+                    if (response.isRedirect) {
+                        val location = response.header("Location")
+                        response.close()
+                        require(!location.isNullOrBlank()) { "Redirect missing Location header." }
+                        currentUrl = resolveRedirect(currentUrl, location)
+                        hopCount++
+                        continue
                     }
-                    output.flush()
-                    output.fd.sync()
+
+                    if (!response.isSuccessful) {
+                        response.close()
+                        throw IllegalArgumentException("HTTP download failed with code ${response.code}.")
+                    }
+                    finalResponse = response
+                    break
                 }
-            }
 
-            _otaState.value = OtaState.Verifying(manifest)
-            val certSha256 = verifyCandidateApkFile(targetApk, manifest)
+                val response = finalResponse ?: throw IllegalArgumentException("Too many redirects.")
+                val body = response.body ?: throw IllegalArgumentException("Response body is empty.")
+                val declaredLen = body.contentLength()
+                require(declaredLen <= MAX_APK_DOWNLOAD_BYTES) {
+                    "Update package exceeds maximum supported size limit."
+                }
+                val totalBytes = if (declaredLen > 0) declaredLen else manifest.sizeBytes
 
-            if (!canRequestPackageInstallsProvider()) {
-                _otaState.value = OtaState.NeedsUnknownSourcesPermission(manifest, targetApk, certSha256)
-                return@withContext
+                body.byteStream().use { input ->
+                    FileOutputStream(targetApk).use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        var bytesDownloaded = 0L
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            if (isDownloadCancelled) {
+                                targetApk.delete()
+                                return@withContext
+                            }
+                            bytesDownloaded += read.toLong()
+                            require(bytesDownloaded <= MAX_APK_DOWNLOAD_BYTES) {
+                                "Update package exceeded maximum size limit during download."
+                            }
+                            output.write(buffer, 0, read)
+                            _otaState.value = OtaState.Downloading(manifest, bytesDownloaded, totalBytes)
+                        }
+                        output.flush()
+                        output.fd.sync()
+                    }
+                }
+
+                _otaState.value = OtaState.Verifying(manifest)
+                val certSha256 = verifyCandidateApkFile(targetApk, manifest)
+
+                if (isDownloadCancelled) {
+                    store.clear()
+                    return@withContext
+                }
+                // Commit metadata only after cryptographic verification succeeds.
+                store.save(manifest)
+                if (isDownloadCancelled) {
+                    store.clear()
+                    return@withContext
+                }
+                _otaState.value = pendingInstallState(manifest, targetApk, certSha256, canRequestPackageInstallsProvider())
+            } catch (e: CancellationException) {
+                store.clear()
+                _otaState.value = OtaState.Idle
+                throw e
+            } catch (e: java.io.IOException) {
+                store.clear()
+                if (isDownloadCancelled) return@withContext
+                SafeVaultLogger.e("OTA", "Download/verify I/O error", e)
+                _otaState.value = OtaState.Error(
+                    title = "Download Interrupted",
+                    detail = "Could not download the update. Check your internet connection and try again.",
+                    recoverableManifest = manifest
+                )
+            } catch (e: Exception) {
+                store.clear()
+                if (isDownloadCancelled) return@withContext
+                SafeVaultLogger.e("OTA", "Download/verify error", e)
+                val friendlyDetail = when {
+                    e is IllegalArgumentException && e.message?.contains("APK") == true ->
+                        "The downloaded update failed security verification and was removed."
+                    e is IllegalArgumentException && e.message?.contains("host", ignoreCase = true) == true ->
+                        "Update download host could not be verified."
+                    else -> "Could not prepare update installation. Check your connection and try again."
+                }
+                _otaState.value = OtaState.Error(
+                    title = "Update Could Not Be Verified",
+                    detail = friendlyDetail,
+                    recoverableManifest = manifest
+                )
+            } finally {
+                activeDownloadCall = null
             }
-            _otaState.value = OtaState.ReadyToInstall(manifest, targetApk, certSha256)
-        } catch (e: java.io.IOException) {
-            targetApk.delete()
-            SafeVaultLogger.e("OTA", "Download/verify I/O error", e)
-            _otaState.value = OtaState.Error(
-                title = "Download Interrupted",
-                detail = "Could not download the update. Check your internet connection and try again.",
-                recoverableManifest = manifest
-            )
-        } catch (e: Exception) {
-            targetApk.delete()
-            SafeVaultLogger.e("OTA", "Download/verify error", e)
-            val friendlyDetail = when {
-                e is IllegalArgumentException && e.message?.contains("APK") == true ->
-                    "The downloaded update failed security verification and was removed."
-                e is IllegalArgumentException && e.message?.contains("host", ignoreCase = true) == true ->
-                    "Update download host could not be verified."
-                else -> "Could not prepare update installation. Check your connection and try again."
-            }
-            _otaState.value = OtaState.Error(
-                title = "Update Could Not Be Verified",
-                detail = friendlyDetail,
-                recoverableManifest = manifest
-            )
         } finally {
-            activeDownloadCall = null
+            operationMutex.unlock()
         }
     }
 
+    // Called from the activity foreground and the Settings activity-result callback.
+    // Also recovers a verified download after Android kills/recreates the process.
     suspend fun recheckInstallPermissionAndVerifyCandidate(): OtaState = withContext(Dispatchers.IO) {
-        val current = _otaState.value
-        if (current !is OtaState.NeedsUnknownSourcesPermission) return@withContext current
-        if (!canRequestPackageInstallsProvider()) {
-            return@withContext current
-        }
-        return@withContext try {
-            val verifiedCert = verifyCandidateApkFile(current.verifiedApkFile, current.manifest)
-            val next = OtaState.ReadyToInstall(current.manifest, current.verifiedApkFile, verifiedCert)
-            _otaState.value = next
-            next
-        } catch (e: Exception) {
-            runCatching { current.verifiedApkFile.delete() }
-            SafeVaultLogger.w("OTA", "Candidate re-verification after permission grant failed: ${e.message}")
-            val err = OtaState.Error(
-                title = "Update Needs Re-Download",
-                detail = "The downloaded update is no longer available or could not be re-verified. Please try downloading again.",
-                recoverableManifest = current.manifest
-            )
-            _otaState.value = err
-            err
+        operationMutex.withLock {
+            val current = _otaState.value
+            if (!current.isPendingInstallation && current !is OtaState.Idle) return@withLock current
+            val store = pendingStore
+            var manifest: UpdateManifest? = null
+            try {
+                val saved = store.readManifestJson()
+                if (saved == null) {
+                    if (!current.isPendingInstallation) {
+                        store.clear() // clean up any interrupted, unverified download
+                        return@withLock current
+                    }
+                    manifest = current.pendingManifest
+                    throw IllegalStateException("Downloaded update is missing its metadata")
+                }
+                val parsed = parseAndValidateManifest(saved)
+                manifest = parsed
+                if (parsed.versionCode <= installedVersionCodeProvider()) {
+                    store.clear()
+                    _otaState.value = OtaState.Idle
+                    return@withLock OtaState.Idle
+                }
+                val apk = store.apkFile(parsed.versionCode)
+                val cert = verifyCandidateApkFile(apk, parsed)
+                if (isDownloadCancelled) {
+                    store.clear()
+                    _otaState.value = OtaState.Idle
+                    return@withLock OtaState.Idle
+                }
+                val next = pendingInstallState(parsed, apk, cert, canRequestPackageInstallsProvider())
+                _otaState.value = next
+                next
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                store.clear()
+                if (isDownloadCancelled) return@withLock OtaState.Idle
+                SafeVaultLogger.w("OTA", "Pending candidate re-verification failed")
+                val error = OtaState.Error(
+                    title = "Update Needs Re-Download",
+                    detail = "The saved update is missing or could not be verified. Download it again to continue.",
+                    recoverableManifest = manifest
+                )
+                _otaState.value = error
+                error
+            }
         }
     }
 
@@ -345,74 +421,76 @@ class OtaUpdateManager(
         isDownloadCancelled = true
         activeDownloadCall?.cancel()
         activeDownloadCall = null
-        val targetDir = File(cacheDirProvider(), "ota_updates")
-        targetDir.listFiles()?.forEach { runCatching { it.delete() } }
-        _otaState.value = OtaState.Idle
+        // An active operation performs its cleanup before releasing the mutex.
+        if (operationMutex.tryLock()) {
+            try {
+                pendingStore.clear()
+                _otaState.value = OtaState.Idle
+            } finally {
+                operationMutex.unlock()
+            }
+        } else if (_otaState.value.isPendingInstallation || _otaState.value is OtaState.Downloading ||
+            _otaState.value is OtaState.Verifying) {
+            _otaState.value = OtaState.Idle
+        }
     }
 
-    fun launchPackageInstaller(apkFile: File) {
-        val ctx = requireNotNull(context) { "Context required to launch package installer." }
-        if (!canRequestPackageInstallsProvider()) {
+    suspend fun launchPackageInstaller(apkFile: File) = withContext(Dispatchers.IO) {
+        operationMutex.withLock {
+            val ctx = context ?: return@withLock
             val current = _otaState.value
-            val manifest = when (current) {
-                is OtaState.ReadyToInstall -> current.manifest
-                is OtaState.NeedsUnknownSourcesPermission -> current.manifest
-                else -> null
-            }
-            if (manifest != null) {
-                _otaState.value = OtaState.NeedsUnknownSourcesPermission(manifest, apkFile, "")
-            }
-            return
-        }
-        val currentState = _otaState.value
-        val activeManifest = when (currentState) {
-            is OtaState.ReadyToInstall -> currentState.manifest
-            is OtaState.NeedsUnknownSourcesPermission -> currentState.manifest
-            else -> null
-        }
-        if (activeManifest != null) {
+            val manifest = current.pendingManifest ?: return@withLock
+            val store = pendingStore
+            // Never open an arbitrary file or an installer without a current verified candidate.
+            val expectedApk = store.apkFile(manifest.versionCode)
+            if (expectedApk != apkFile) return@withLock
             try {
-                verifyCandidateApkFile(apkFile, activeManifest)
-            } catch (_: Exception) {
-                runCatching { apkFile.delete() }
+                val cert = verifyCandidateApkFile(expectedApk, manifest)
+                if (isDownloadCancelled) {
+                    store.clear()
+                    return@withLock
+                }
+                if (!canRequestPackageInstallsProvider()) {
+                    _otaState.value = pendingInstallState(manifest, expectedApk, cert, false)
+                    return@withLock
+                }
+                _otaState.value = pendingInstallState(manifest, expectedApk, cert, true)
+                val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", expectedApk)
+                val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "application/vnd.android.package-archive")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                // Android's installer still requires explicit user confirmation.
+                withContext(Dispatchers.Main) main@{
+                    if (isDownloadCancelled) {
+                        _otaState.value = OtaState.Idle
+                        return@main
+                    }
+                    runCatching { ctx.startActivity(installIntent) }.onFailure {
+                        // Keep the candidate available for another installation attempt.
+                        _otaState.value = pendingInstallState(manifest, expectedApk, cert, canRequestPackageInstallsProvider())
+                    }
+                }
+                if (isDownloadCancelled) store.clear()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                store.clear()
                 _otaState.value = OtaState.Error(
                     title = "Update Could Not Be Verified",
-                    detail = "Verification failed before install. Please download the update again.",
-                    recoverableManifest = activeManifest
+                    detail = "Verification failed before install. Download the update again.",
+                    recoverableManifest = manifest
                 )
-                return
             }
-        }
-        val uri = FileProvider.getUriForFile(
-            ctx,
-            "${ctx.packageName}.fileprovider",
-            apkFile
-        )
-        val installIntent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/vnd.android.package-archive")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        runCatching { ctx.startActivity(installIntent) }.onFailure {
-            _otaState.value = OtaState.Error(
-                title = "Installer Unavailable",
-                detail = "Android's package installer could not be opened on this device.",
-                recoverableManifest = activeManifest
-            )
         }
     }
 
-    fun openUnknownSourcesSettings() {
-        val ctx = context ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val intent = Intent(
-                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                Uri.parse("package:${ctx.packageName}")
-            ).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            ctx.startActivity(intent)
-        }
+    fun unknownSourcesSettingsIntent(): Intent? {
+        val ctx = context ?: return null
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${ctx.packageName}"))
+        } else null
     }
 
     fun verifyCandidateApkFile(apkFile: File, manifest: UpdateManifest): String {

@@ -250,6 +250,63 @@ class OtaManifestTest {
         assertTrue(manager.otaState.value is OtaState.Idle)
     }
 
+    @Test
+    fun automaticChecksPromptOnlyForNewVersionsAndSupportLater() = runBlocking {
+        var version = 4
+        val manager = createTestOtaManager(installedVersionCode = 3L) { chain ->
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)
+                .code(200).message("OK")
+                .body(sampleValidManifestJson(versionCode = version, versionName = "2.0.$version")
+                    .toResponseBody("application/json".toMediaType()))
+                .build()
+        }
+        val first = manager.checkForUpdates(canonicalManifestUrl, isUserInitiated = false)
+        assertTrue((first as OtaState.UpdateAvailable).showPromptDialog)
+        manager.dismissUpdatePrompt()
+        assertFalse((manager.otaState.value as OtaState.UpdateAvailable).showPromptDialog)
+        val again = manager.checkForUpdates(canonicalManifestUrl, isUserInitiated = false)
+        assertFalse((again as OtaState.UpdateAvailable).showPromptDialog)
+        version = 5
+        val newRelease = manager.checkForUpdates(canonicalManifestUrl, isUserInitiated = false)
+        assertTrue((newRelease as OtaState.UpdateAvailable).showPromptDialog)
+    }
+
+    @Test
+    fun permissionTransitionKeepsSameVerifiedFileAndManifest() {
+        val manager = createTestOtaManager()
+        val manifest = manager.parseAndValidateManifest(sampleValidManifestJson(versionCode = 4))
+        val file = File(tempFolder.root, "candidate.apk")
+        val certificate = expectedCertSha256.replace(":", "").lowercase()
+        val needs = pendingInstallState(manifest, file, certificate, permissionGranted = false)
+            as OtaState.NeedsUnknownSourcesPermission
+        val ready = pendingInstallState(needs.manifest, needs.verifiedApkFile, certificate, permissionGranted = true)
+            as OtaState.ReadyToInstall
+        assertEquals(needs.verifiedApkFile, ready.verifiedApkFile)
+        assertEquals(needs.manifest, ready.manifest)
+        assertEquals(certificate, ready.signerCertificateSha256)
+        assertTrue(ready.isPendingInstallation)
+    }
+
+    @Test
+    fun pendingMetadataSurvivesRecreationButInvalidApkIsNeverRestoredAsReady() = runBlocking {
+        val directory = File(tempFolder.root, "ota_updates").apply { mkdirs() }
+        val manager = createTestOtaManager(installedVersionCode = 1L)
+        val bytes = "not an APK".toByteArray()
+        val manifest = manager.parseAndValidateManifest(
+            sampleValidManifestJson(versionCode = 4, sha256 = sha256Hex(bytes), sizeBytes = bytes.size.toLong())
+        )
+        val store = PendingOtaDownloadStore(directory)
+        store.apkFile(manifest.versionCode).writeBytes(bytes)
+        store.save(manifest)
+        val recreatedStore = PendingOtaDownloadStore(directory)
+        assertEquals(manifest, manager.parseAndValidateManifest(requireNotNull(recreatedStore.readManifestJson())))
+        val recreatedManager = createTestOtaManager(installedVersionCode = 1L)
+        val state = recreatedManager.recheckInstallPermissionAndVerifyCandidate()
+        assertTrue(state is OtaState.Error)
+        assertFalse(recreatedStore.apkFile(manifest.versionCode).exists())
+        assertEquals(null, recreatedStore.readManifestJson())
+    }
+
     private inline fun assertThrowsIllegal(block: () -> Unit) {
         try {
             block()
