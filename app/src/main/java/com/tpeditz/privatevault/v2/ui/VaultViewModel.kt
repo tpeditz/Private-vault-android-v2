@@ -87,6 +87,7 @@ class VaultViewModel(
     private var activeBackupJob: Job? = null
     private var loadItemsJob: Job? = null
     @Volatile private var cachedAutoLockTimeoutSeconds: Int = 0
+    @Volatile private var cachedLockOnScreenOff = true
     private var activeRestoreJob: Job? = null
     private var foregroundOtaJob: Job? = null
     private var installUpdateJob: Job? = null
@@ -189,6 +190,7 @@ class VaultViewModel(
         }
         viewModelScope.launch {
             preferencesRepository.lockOnScreenOff.collect { enabled ->
+                cachedLockOnScreenOff = enabled
                 _uiState.update { it.copy(lockOnScreenOff = enabled) }
             }
         }
@@ -338,11 +340,7 @@ class VaultViewModel(
     // ============================================================================================
 
     fun onScreenTurnedOff() {
-        viewModelScope.launch {
-            if (preferencesRepository.lockOnScreenOff.first()) {
-                lockVault()
-            }
-        }
+        if (cachedLockOnScreenOff) lockVault()
     }
 
     fun onAppBackgrounded() {
@@ -502,6 +500,7 @@ class VaultViewModel(
                 currentOta is OtaState.ReadyToInstall ||
                 currentOta is OtaState.NeedsUnknownSourcesPermission
 
+            val hasCloudRecoveryKey = real && AutoCloudBackupKeyStore.hasRecoveryPassword(context)
             val metrics = PrivacyHealthMetrics(
                 totalItemsCount = items.size,
                 averagePasswordScore = avgScore,
@@ -522,7 +521,7 @@ class VaultViewModel(
               _uiState.update {
                 it.copy(
                     isBiometricsConfigured = bio,
-                    autoCloudBackupKeyConfigured = real && AutoCloudBackupKeyStore.hasRecoveryPassword(context),
+                    autoCloudBackupKeyConfigured = hasCloudRecoveryKey,
                     notes = notes,
                     credentials = credentials,
                     media = media,
@@ -939,6 +938,7 @@ class VaultViewModel(
             val storedEmail = preferencesRepository.connectedGoogleAccount.first().trim()
             val hasRecoveryPwd = AutoCloudBackupKeyStore.hasRecoveryPassword(context)
             val autoEnabled = preferencesRepository.autoCloudBackupEnabled.first()
+            val lastCloudStatus = preferencesRepository.autoCloudBackupStatus.first()
             val legacyShort = withContext(Dispatchers.IO) { computeIsCloudRecoveryLegacyShort() }
             val currentOta = otaUpdateManager.otaState.value
             val updateAvailable = currentOta is OtaState.UpdateAvailable ||
@@ -951,6 +951,7 @@ class VaultViewModel(
                     autoCloudBackupKeyConfigured = hasRecoveryPwd && realSessionId() != null,
                     isCloudRecoveryPasswordLegacyShort = legacyShort && realSessionId() != null,
                     autoCloudBackupEnabled = realSessionId() != null && autoEnabled,
+                    lastCloudBackupStatusMessage = if (realSessionId() != null) lastCloudStatus.ifBlank { null } else null,
                     privacyMetrics = it.privacyMetrics.copy(
                         isAutofillActive = liveAutofill,
                         isBiometricEnabled = actualBio,

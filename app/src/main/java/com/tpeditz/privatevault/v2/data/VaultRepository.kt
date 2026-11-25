@@ -881,14 +881,15 @@ class VaultRepository(
         getAllItemsForActiveSlotWithAudit(expectedSessionId).items
     }
 
-    suspend fun saveItem(item: VaultItem): Unit = withContext(Dispatchers.IO) {
+    suspend fun saveItem(item: VaultItem, expectedSessionId: Long? = null): Unit = withContext(Dispatchers.IO) {
         vaultMutationMutex.withLock {
-            saveItemLocked(item)
+            saveItemLocked(item, expectedSessionId)
         }
     }
 
-    private suspend fun saveItemLocked(item: VaultItem) {
+    private suspend fun saveItemLocked(item: VaultItem, expectedSessionId: Long? = null) {
         val session = sessionManager.requireUnlockedSession()
+        require(expectedSessionId == null || session.sessionId == expectedSessionId) { "Vault session changed." }
         val dek = session.borrowDekCopy()
         try {
             // Check if password changed on credential to record encrypted password history

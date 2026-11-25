@@ -16,10 +16,11 @@ internal object VaultFileSafety {
         require(isWithin(base, target)) { "Asset path is outside the expected private directory." }
         return target
     }
-    fun checkedSizeTotal(parts: Iterable<Long>, maximum: Long): Long {
+    fun checkedSizeTotal(parts: Iterable<Long>, maximum: Long, limitDescription: String = "$maximum bytes"): Long {
         var sum = 0L
         for (part in parts) {
-            require(part >= 0 && part <= maximum - sum) { "Invalid or oversized backup payload." }
+            require(part >= 0) { "Invalid backup payload size." }
+            require(part <= maximum - sum) { "Backup container exceeds maximum supported size ($limitDescription)." }
             sum += part
         }
         return sum

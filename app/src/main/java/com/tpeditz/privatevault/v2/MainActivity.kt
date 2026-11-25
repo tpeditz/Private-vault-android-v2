@@ -237,7 +237,6 @@ class MainActivity : FragmentActivity() {
             }
 
             fun inspectLocalUriWithPassword(uri: Uri, passwordChars: CharArray) {
-                viewModel.clearFilePickerImmunity()
                 val ins = runCatching { contentResolver.openInputStream(uri) }.getOrNull()
                 if (ins != null) {
                     viewModel.inspectBackupForRestore(ins, passwordChars) { _, _ ->
@@ -281,7 +280,6 @@ class MainActivity : FragmentActivity() {
                 pendingBackupScope = null
                 pendingBackupPassword = null
                 if (uri != null && activeScope != null && activePwd != null) {
-                    viewModel.clearFilePickerImmunity()
                     val os = runCatching { contentResolver.openOutputStream(uri) }.getOrNull()
                     if (os != null) {
                         viewModel.exportStreamingBackup(
@@ -329,7 +327,6 @@ class MainActivity : FragmentActivity() {
                 contract = ActivityResultContracts.OpenDocument()
             ) { uri: Uri? ->
                 if (uri != null) {
-                    viewModel.clearFilePickerImmunity()
                     val ins = runCatching { contentResolver.openInputStream(uri) }.getOrNull()
                     if (ins != null) {
                         viewModel.importCsv(ins) { imported, skipped ->
@@ -345,7 +342,6 @@ class MainActivity : FragmentActivity() {
                 contract = ActivityResultContracts.PickMultipleVisualMedia()
             ) { uris: List<Uri> ->
                 if (uris.isNotEmpty()) {
-                    viewModel.clearFilePickerImmunity()
                     viewModel.importVisualMedia(uris) { imported, failed ->
                         scope.launch {
                             val msg = "Imported $imported media item(s)" + if (failed > 0) " ($failed failed)" else ""
@@ -359,7 +355,6 @@ class MainActivity : FragmentActivity() {
                 contract = ActivityResultContracts.OpenMultipleDocuments()
             ) { uris: List<Uri> ->
                 if (uris.isNotEmpty()) {
-                    viewModel.clearFilePickerImmunity()
                     viewModel.importDocuments(uris) { imported, failed ->
                         scope.launch {
                             val msg = "Imported $imported document(s)" + if (failed > 0) " ($failed failed)" else ""

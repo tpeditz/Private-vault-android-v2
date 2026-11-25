@@ -162,7 +162,8 @@ class PrivateVaultAutofillService : AutofillService() {
 
                 val cleanTarget = AutofillHelper.normalizeDomain(targetDomain)
                 val directMatches = credentials.filter {
-                    AutofillHelper.matchesTarget(it, cleanTarget, packageName, parsedFields.webScheme)
+                    (targetDomain.isBlank() || cleanTarget.isNotBlank()) &&
+                        AutofillHelper.matchesTarget(it, cleanTarget, packageName, parsedFields.webScheme)
                 }
 
                 if (directMatches.isEmpty()) {
@@ -188,14 +189,15 @@ class PrivateVaultAutofillService : AutofillService() {
                     val remoteViews = RemoteViews(this@PrivateVaultAutofillService.packageName, android.R.layout.simple_list_item_1).apply {
                         setTextViewText(android.R.id.text1, "Choose login from Private Vault")
                     }
-                    val anchorId = parsedFields.usernameId ?: parsedFields.passwordId!!
                     val requiredIds = listOfNotNull(parsedFields.usernameId, parsedFields.passwordId).toTypedArray()
                     val builder = FillResponse.Builder()
-                        .setAuthentication(arrayOf(anchorId), pendingIntent.intentSender, remoteViews)
+                        .setAuthentication(requiredIds, pendingIntent.intentSender, remoteViews)
                     if (requiredIds.isNotEmpty()) {
                         builder.setSaveInfo(SaveInfo.Builder(SaveInfo.SAVE_DATA_TYPE_PASSWORD, requiredIds).build())
                     }
-                    callback.onSuccess(builder.build())
+                    if (!app.sessionManager.runIfCurrentSession(expectedId) {
+                        if (!cancellationSignal.isCanceled) callback.onSuccess(builder.build())
+                    }) callback.onSuccess(null)
                     return@launch
                 }
 
@@ -237,7 +239,8 @@ class PrivateVaultAutofillService : AutofillService() {
         val usernameVal = parsed.extractedUsername?.trim().orEmpty()
         val passwordVal = parsed.extractedPassword.orEmpty()
 
-        if (passwordVal.isNotBlank()) {
+        val expectedId = app.sessionManager.getCurrentSessionId()
+        if (passwordVal.isNotBlank() && expectedId != null) {
             serviceScope.launch {
                 try {
                     val serviceName = parsed.webDomain?.let { normalizeDomain(it) }
@@ -251,7 +254,7 @@ class PrivateVaultAutofillService : AutofillService() {
                         websiteUrl = parsed.webDomain?.takeIf { it.isNotBlank() }
                             ?: "android://${structure.activityComponent.packageName}"
                     )
-                    app.repository.saveItem(newCred)
+                    app.repository.saveItem(newCred, expectedId)
                     SafeVaultLogger.i("Autofill", "Saved a credential")
                 } catch (e: Exception) {
                     SafeVaultLogger.w("Autofill", "Failed to save credential")

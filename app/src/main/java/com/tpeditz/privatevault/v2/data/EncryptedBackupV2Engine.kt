@@ -415,7 +415,7 @@ object EncryptedBackupV2Engine {
             val totalDeclaredPayloadBytes = VaultFileSafety.checkedSizeTotal(
                 listOf(HEADER_BYTES.toLong(), manifestLen.toLong()) +
                     mediaPayloadDescs.flatMap { listOf(it.mediaSizeBytes, it.thumbSizeBytes) } +
-                    docPayloadDescs.map { it.docSizeBytes }, MAX_SUPPORTED_BACKUP_BYTES
+                    docPayloadDescs.map { it.docSizeBytes }, MAX_SUPPORTED_BACKUP_BYTES, "2 GiB"
             )
             require(totalDeclaredPayloadBytes <= MAX_SUPPORTED_BACKUP_BYTES) {
                 "Backup container exceeds maximum supported size (2 GiB). Declared: $totalDeclaredPayloadBytes bytes."
@@ -445,7 +445,7 @@ object EncryptedBackupV2Engine {
 
             val totalExpectedPayloadBytes = VaultFileSafety.checkedSizeTotal(
                 listOf(HEADER_BYTES.toLong()) + details.mediaEntries.flatMap { listOf(it.mediaSizeBytes, it.thumbSizeBytes) } +
-                    details.docEntries.map { it.docSizeBytes }, MAX_SUPPORTED_BACKUP_BYTES
+                    details.docEntries.map { it.docSizeBytes }, MAX_SUPPORTED_BACKUP_BYTES, "2 GiB"
             )
 
             require(totalExpectedPayloadBytes <= MAX_SUPPORTED_BACKUP_BYTES) {

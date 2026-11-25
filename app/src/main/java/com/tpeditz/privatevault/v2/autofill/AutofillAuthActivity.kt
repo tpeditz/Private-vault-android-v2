@@ -152,7 +152,8 @@ class AutofillAuthActivity : ComponentActivity() {
                                             .filter { !it.isArchived && !it.isTrashed }
                                         val cleanTarget = AutofillHelper.normalizeDomain(rawDomain)
                                         val directMatches = creds.filter {
-                                            AutofillHelper.matchesTarget(it, cleanTarget, targetPackage, targetScheme.ifBlank { null })
+                                            (rawDomain.isBlank() || cleanTarget.isNotBlank()) &&
+                                                AutofillHelper.matchesTarget(it, cleanTarget, targetPackage, targetScheme.ifBlank { null })
                                         }
                                         if (directMatches.isNotEmpty()) {
                                             finishWithCredentials(directMatches, expectedId)
@@ -162,6 +163,19 @@ class AutofillAuthActivity : ComponentActivity() {
                                                 unlockedManualList = creds
                                             }
                                         }
+                                    }
+                                }
+                            }
+
+                            LaunchedEffect(pickerSessionId) {
+                                val expectedId = pickerSessionId ?: return@LaunchedEffect
+                                val manager = app?.sessionManager ?: return@LaunchedEffect
+                                manager.sessionState.collect {
+                                    if (manager.getCurrentSessionId() != expectedId) {
+                                        pendingCredential = null
+                                        unlockedManualList = null
+                                        setResult(Activity.RESULT_CANCELED)
+                                        finish()
                                     }
                                 }
                             }
@@ -323,7 +337,8 @@ class AutofillAuthActivity : ComponentActivity() {
 
                                                                 val cleanTarget = AutofillHelper.normalizeDomain(rawDomain)
                                                                 val directMatches = credentials.filter {
-                                                                    AutofillHelper.matchesTarget(it, cleanTarget, targetPackage, targetScheme.ifBlank { null })
+                                                                    (rawDomain.isBlank() || cleanTarget.isNotBlank()) &&
+                                                AutofillHelper.matchesTarget(it, cleanTarget, targetPackage, targetScheme.ifBlank { null })
                                                                 }
                                                                 if (directMatches.isNotEmpty()) {
                                                                     finishWithCredentials(directMatches, expectedId)
