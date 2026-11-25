@@ -1,0 +1,212 @@
+name: Build & Publish Production APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode: 'test' builds and verifies everything without publishing; 'publish' creates a public GitHub Release"
+        required: true
+        default: "test"
+        type: choice
+        options:
+          - test
+          - publish
+      release_notes:
+        description: "Plain-text release notes shown in GitHub Releases and in the app update prompt"
+        required: false
+        default: "Security, backup reliability, and stability improvements."
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build Signed Production APK & OTA Manifest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant execute permission for Gradle wrapper
+        run: chmod +x gradlew
+
+      - name: Verify Signing Secrets Configured
+        env:
+          HAS_KEYSTORE: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' }}
+          HAS_STORE_PWD: ${{ secrets.RELEASE_STORE_PASSWORD != '' }}
+          HAS_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS != '' }}
+          HAS_KEY_PWD: ${{ secrets.RELEASE_KEY_PASSWORD != '' }}
+        run: |
+          if [ "$HAS_KEYSTORE" != "true" ] || [ "$HAS_STORE_PWD" != "true" ] || [ "$HAS_ALIAS" != "true" ] || [ "$HAS_KEY_PWD" != "true" ]; then
+            echo "::error::Missing one or more required GitHub Actions secrets: RELEASE_KEYSTORE_BASE64, RELEASE_STORE_PASSWORD, RELEASE_KEY_ALIAS, RELEASE_KEY_PASSWORD."
+            exit 1
+          fi
+
+      - name: Decode Temporary Release Keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 --decode > "${RUNNER_TEMP}/release.jks"
+          chmod 600 "${RUNNER_TEMP}/release.jks"
+
+      - name: Run Pre-Release Unit Tests & Lint
+        run: ./gradlew :app:testDebugUnitTest :app:lintDebug
+
+      - name: Build Signed Release APK
+        env:
+          RELEASE_KEYSTORE_PATH: ${{ runner.temp }}/release.jks
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: ./gradlew :app:assembleRelease --stacktrace
+
+      - name: Verify APK Signature, Certificate & Metadata
+        id: verify_apk
+        run: |
+          mkdir -p release_artifacts
+          cp app/build/outputs/apk/release/app-release.apk release_artifacts/private-vault.apk
+
+          BUILD_TOOLS_DIR=$(find "${ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
+          if [ ! -x "$APKSIGNER" ]; then
+            echo "::error::apksigner not found in Android SDK build-tools."
+            exit 1
+          fi
+
+          VERIFY_OUT=$("$APKSIGNER" verify --verbose --print-certs release_artifacts/private-vault.apk)
+          echo "$VERIFY_OUT"
+
+          EXPECTED_SHA1="321954c381b4a79d76b890ff05a318d021fbadfc"
+          EXPECTED_SHA256="3beeff138b716168b2f166983d42496b9d24f629b75ee25bdafd16676f06a770"
+
+          if ! echo "$VERIFY_OUT" | tr '[:upper:]' '[:lower:]' | grep -q "$EXPECTED_SHA1"; then
+            echo "::error::APK SHA-1 certificate fingerprint does not match official Private Vault release key."
+            exit 1
+          fi
+          if ! echo "$VERIFY_OUT" | tr '[:upper:]' '[:lower:]' | grep -q "$EXPECTED_SHA256"; then
+            echo "::error::APK SHA-256 certificate fingerprint does not match official Private Vault release key."
+            exit 1
+          fi
+
+          APK_INFO=$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+          src = Path("app/build.gradle.kts").read_text(encoding="utf-8")
+          app_id = re.search(r'applicationId\s*=\s*"([^"]+)"', src).group(1)
+          v_code = int(re.search(r'versionCode\s*=\s*(\d+)', src).group(1))
+          v_name = re.search(r'versionName\s*=\s*"([^"]+)"', src).group(1)
+          print(f"{app_id}|{v_code}|{v_name}")
+          PY
+          )
+
+          IFS='|' read -r APP_ID VERSION_CODE VERSION_NAME <<< "$APK_INFO"
+          if [ "$APP_ID" != "com.tpeditz.privatevault.v2" ]; then
+            echo "::error::Unexpected applicationId: $APP_ID"
+            exit 1
+          fi
+
+          APKANALYZER=$(find "${ANDROID_HOME}/cmdline-tools" -name "apkanalyzer" -type f 2>/dev/null | head -n 1 || true)
+          if [ -n "$APKANALYZER" ] && [ -x "$APKANALYZER" ]; then
+            ANALYZER_APP_ID=$("$APKANALYZER" manifest application-id release_artifacts/private-vault.apk)
+            ANALYZER_VCODE=$("$APKANALYZER" manifest version-code release_artifacts/private-vault.apk)
+            ANALYZER_VNAME=$("$APKANALYZER" manifest version-name release_artifacts/private-vault.apk)
+            if [ "$ANALYZER_APP_ID" != "com.tpeditz.privatevault.v2" ] || [ "$ANALYZER_VCODE" != "$VERSION_CODE" ] || [ "$ANALYZER_VNAME" != "$VERSION_NAME" ]; then
+              echo "::error::Compiled APK metadata mismatch ($ANALYZER_APP_ID / $ANALYZER_VCODE / $ANALYZER_VNAME)."
+              exit 1
+            fi
+          fi
+
+          TAG_NAME="v${VERSION_NAME}"
+          echo "app_id=${APP_ID}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce Monotonic OTA Version & Generate update.json
+        env:
+          VERSION_CODE: ${{ steps.verify_apk.outputs.version_code }}
+          VERSION_NAME: ${{ steps.verify_apk.outputs.version_name }}
+          TAG_NAME: ${{ steps.verify_apk.outputs.tag_name }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          if [ "${{ inputs.mode }}" = "publish" ]; then
+            HTTP_CODE=$(curl -s -o /tmp/current_update.json -w "%{http_code}" -L "https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/update.json" || true)
+            if [ "$HTTP_CODE" = "200" ]; then
+              PREV_CODE=$(python3 -c "import json; print(json.load(open('/tmp/current_update.json'))['versionCode'])")
+              if [ "$VERSION_CODE" -le "$PREV_CODE" ]; then
+                echo "::error::Publish aborted: new versionCode (${VERSION_CODE}) must be strictly greater than currently published versionCode (${PREV_CODE}). Bump versionCode/versionName in app/build.gradle.kts first."
+                exit 1
+              fi
+            fi
+          fi
+
+          python3 scripts/generate_ota_manifest.py \
+            --apk release_artifacts/private-vault.apk \
+            --output release_artifacts/update.json \
+            --version-code "$VERSION_CODE" \
+            --version-name "$VERSION_NAME" \
+            --tag "$TAG_NAME" \
+            --release-notes "$RELEASE_NOTES"
+
+          cat release_artifacts/update.json
+
+      - name: Upload Staged Release Artifacts (Test & Publish Modes)
+        uses: actions/upload-artifact@v4
+        with:
+          name: private-vault-release-staging-${{ github.run_number }}
+          path: |
+            release_artifacts/private-vault.apk
+            release_artifacts/update.json
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.mode == 'publish' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ steps.verify_apk.outputs.tag_name }}
+          VERSION_NAME: ${{ steps.verify_apk.outputs.version_name }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "::error::Release ${TAG_NAME} already exists. Bump versionCode and versionName in app/build.gradle.kts before publishing a new release."
+            exit 1
+          fi
+
+          gh release create "$TAG_NAME" \
+            release_artifacts/private-vault.apk \
+            release_artifacts/update.json \
+            --title "Private Vault ${VERSION_NAME}" \
+            --notes "$RELEASE_NOTES"
+
+      - name: Verify Published OTA Endpoints
+        if: ${{ inputs.mode == 'publish' }}
+        run: |
+          sleep 3
+          curl -fsSL "https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/update.json" -o /tmp/live_update.json
+          curl -fsSLI "https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/private-vault.apk" >/dev/null
+          python3 - <<'PY'
+          import json
+          staged = json.load(open("release_artifacts/update.json"))
+          live = json.load(open("/tmp/live_update.json"))
+          assert staged["sha256"] == live["sha256"], "Published update.json SHA-256 mismatch"
+          assert staged["versionCode"] == live["versionCode"], "Published update.json versionCode mismatch"
+          print("Verified live update.json and private-vault.apk endpoints.")
+          PY
+
+      - name: Securely Shred Temporary Keystore
+        if: always()
+        run: |
+          if [ -f "${RUNNER_TEMP}/release.jks" ]; then
+            shred -u "${RUNNER_TEMP}/release.jks" || rm -f "${RUNNER_TEMP}/release.jks"
+          fi

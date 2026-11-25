@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <cache-path
+        name="ota_updates"
+        path="ota_updates/" />
+    <cache-path
+        name="temporary_exports"
+        path="temporary_exports/" />
+</paths>

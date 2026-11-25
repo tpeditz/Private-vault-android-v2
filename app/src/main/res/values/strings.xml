@@ -1,0 +1,29 @@
+<resources>
+    <string name="app_name">PRIVATE VAULT</string>
+    <string name="developer_name">Tp Editz</string>
+    <string name="developer_telegram">@Tp_Editz</string>
+    <string name="developer_telegram_url">https://t.me/Tp_Editz</string>
+    <string name="developer_instagram">@tp_ediitz</string>
+    <string name="developer_instagram_url">https://www.instagram.com/tp_ediitz/</string>
+
+    <!-- Navigation -->
+    <string name="nav_home">Home</string>
+    <string name="nav_notes">Notes</string>
+    <string name="nav_passwords">Passwords</string>
+    <string name="nav_media">Media</string>
+    <string name="nav_settings">Settings</string>
+    <string name="nav_tools">Tools</string>
+    <string name="nav_authenticator">Authenticator</string>
+
+    <!-- Actions -->
+    <string name="action_lock_vault">Lock Vault</string>
+    <string name="action_unlock_vault">Unlock Vault</string>
+    <string name="action_backup_now">Back Up Now</string>
+    <string name="action_restore_backup">Restore Backup</string>
+    <string name="action_settings">Settings</string>
+
+    <!-- Autofill -->
+    <string name="autofill_service_name">Private Vault Autofill</string>
+    <string name="autofill_unlock_prompt">Unlock Private Vault to Autofill</string>
+    <string name="autofill_save_prompt">Save to Private Vault?</string>
+</resources>

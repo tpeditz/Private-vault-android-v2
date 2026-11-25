@@ -1,0 +1,58 @@
+# Built application files
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java class files
+*.class
+
+# Generated files
+bin/
+gen/
+out/
+build/
+.gradle/
+
+# Android Studio / IntelliJ IDEA
+.idea/
+.idea/caches/
+.idea/libraries/
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+*.iml
+*.ipr
+*.iws
+
+# Keystores and private keys
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+*.pk8
+release_keystore.base64
+my-upload-key.jks
+debug.keystore
+
+# Local configuration and credentials
+local.properties
+.env
+.env.local
+secrets.properties
+google-services.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log and temp files
+*.log
+captures/
+.externalNativeBuild/
+.cxx/
