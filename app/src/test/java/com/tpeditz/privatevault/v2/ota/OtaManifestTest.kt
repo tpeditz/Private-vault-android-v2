@@ -208,7 +208,7 @@ class OtaManifestTest {
         hijackManager.startDownload(redirectHijackManifest)
         val hijackState = hijackManager.otaState.value
         assertTrue(hijackState is OtaState.Error)
-        assertTrue((hijackState as OtaState.Error).detail.contains("Untrusted download host"))
+        assertTrue((hijackState as OtaState.Error).detail.contains("host could not be verified", ignoreCase = true))
 
         val fakeApkBytes = "corrupted-apk-bytes".toByteArray()
         val validManifestForFakeBytes = createTestOtaManager().parseAndValidateManifest(
@@ -236,6 +236,18 @@ class OtaManifestTest {
             "Failed candidate APK must be deleted cleanly",
             cachedApks.any { it.name.endsWith(".apk") && it.exists() }
         )
+    }
+
+    @Test
+    fun testManifestRejectsOversizedPayloadAndDownloadCancelResetsToIdle() = runBlocking {
+        val giantManifest = JSONObject(sampleValidManifestJson(versionCode = 3)).apply {
+            put("sizeBytes", 300L * 1024L * 1024L)
+        }.toString()
+        val manager = createTestOtaManager()
+        assertThrowsIllegal { manager.parseAndValidateManifest(giantManifest) }
+
+        manager.cancelActiveDownload()
+        assertTrue(manager.otaState.value is OtaState.Idle)
     }
 
     private inline fun assertThrowsIllegal(block: () -> Unit) {

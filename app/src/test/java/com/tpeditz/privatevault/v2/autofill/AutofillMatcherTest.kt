@@ -89,39 +89,72 @@ class AutofillMatcherTest {
 
     @Test
     fun testCredentialMatchingByPackageNameStrict() {
-        val cred = CredentialRecord(
+        val explicitAndroidCred = CredentialRecord(
             serviceName = "Spotify",
             username = "fixture-user@example.test",
             password = "TEST_ONLY_PASSWORD",
-            websiteUrl = ""
+            websiteUrl = "android://com.spotify.music"
         )
 
         assertTrue(
             AutofillHelper.matchesTarget(
-                cred,
+                explicitAndroidCred,
                 cleanTargetDomain = "",
                 packageName = "com.spotify.music"
             )
         )
         assertFalse(
             AutofillHelper.matchesTarget(
-                cred,
+                explicitAndroidCred,
                 cleanTargetDomain = "",
                 packageName = "com.netflix.mediaclient"
             )
         )
 
-        val genericCred = CredentialRecord(
-            serviceName = "app",
+        val noUrlCred = CredentialRecord(
+            serviceName = "Spotify",
             username = "fixture-user@example.test",
             password = "TEST_ONLY_PASSWORD",
             websiteUrl = ""
         )
         assertFalse(
+            "Credentials without an explicit android:// association must never guess-match apps by serviceName",
             AutofillHelper.matchesTarget(
-                genericCred,
+                noUrlCred,
                 cleanTargetDomain = "",
-                packageName = "com.spotify.app"
+                packageName = "com.spotify.music"
+            )
+        )
+
+        val webOnlyCred = CredentialRecord(
+            serviceName = "GitHub",
+            username = "fixture-user@example.test",
+            password = "TEST_ONLY_PASSWORD",
+            websiteUrl = "https://github.com"
+        )
+        assertFalse(
+            "An impostor native app must not receive a web credential via package-token guessing",
+            AutofillHelper.matchesTarget(
+                webOnlyCred,
+                cleanTargetDomain = "",
+                packageName = "com.fake.github"
+            )
+        )
+        assertFalse(
+            "HTTPS-configured web credential must not auto-fill over explicit http:// scheme",
+            AutofillHelper.matchesTarget(
+                webOnlyCred,
+                cleanTargetDomain = "github.com",
+                packageName = "",
+                targetScheme = "http"
+            )
+        )
+        assertTrue(
+            AutofillHelper.matchesTarget(
+                webOnlyCred,
+                cleanTargetDomain = "github.com",
+                packageName = "",
+                targetScheme = "https"
             )
         )
     }

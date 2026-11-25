@@ -2,7 +2,6 @@ package com.tpeditz.privatevault.v2.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -21,9 +20,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SystemUpdate
-import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -37,18 +34,22 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tpeditz.privatevault.v2.BuildConfig
 import com.tpeditz.privatevault.v2.ota.OtaState
 import com.tpeditz.privatevault.v2.ota.OtaUpdateManager
-import com.tpeditz.privatevault.v2.ui.VaultUiState
-import java.io.File
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -59,6 +60,25 @@ fun OtaUpdatesScreen(
     onBack: () -> Unit
 ) {
     val otaState by otaUpdateManager.otaState.collectAsStateWithLifecycle()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val scope = rememberCoroutineScope()
+
+    // Re-evaluate Install Permission cleanly when returning from Android Settings
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                if (otaUpdateManager.otaState.value is OtaState.NeedsUnknownSourcesPermission) {
+                    scope.launch {
+                        otaUpdateManager.recheckInstallPermissionAndVerifyCandidate()
+                    }
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -106,10 +126,12 @@ fun OtaUpdatesScreen(
                         Button(
                             onClick = onCheckForUpdates,
                             modifier = Modifier.fillMaxWidth(),
-                            enabled = otaState !is OtaState.Checking && otaState !is OtaState.Downloading
+                            enabled = otaState !is OtaState.Checking && otaState !is OtaState.Downloading && otaState !is OtaState.Verifying
                         ) {
                             if (otaState is OtaState.Checking) {
                                 CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Checking...")
                             } else {
                                 Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(modifier = Modifier.width(8.dp))
@@ -198,6 +220,19 @@ fun OtaUpdatesScreen(
                         }
                     }
 
+                    is OtaState.Verifying -> {
+                        OutlinedCard(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Row(modifier = Modifier.padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Text("Verifying update checksum and signature...", style = MaterialTheme.typography.bodyMedium)
+                            }
+                        }
+                    }
+
                     is OtaState.ReadyToInstall -> {
                         OutlinedCard(
                             modifier = Modifier.fillMaxWidth(),
@@ -205,12 +240,20 @@ fun OtaUpdatesScreen(
                         ) {
                             Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                                 Text("Update Verified & Ready", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                                Text("Cryptographic signature and checksum verified successfully against permanent release certificate.")
-                                Button(
-                                    onClick = { otaUpdateManager.launchPackageInstaller(state.verifiedApkFile) },
-                                    modifier = Modifier.fillMaxWidth()
+                                Text("Private Vault v${state.manifest.versionName} passed checksum and signature verification.", style = MaterialTheme.typography.bodySmall)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
-                                    Text("Install Now")
+                                    Button(
+                                        onClick = { otaUpdateManager.launchPackageInstaller(state.verifiedApkFile) },
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text("Install Now")
+                                    }
+                                    OutlinedButton(onClick = { otaUpdateManager.cancelActiveDownload() }) {
+                                        Text("Cancel")
+                                    }
                                 }
                             }
                         }
@@ -222,26 +265,63 @@ fun OtaUpdatesScreen(
                             shape = RoundedCornerShape(16.dp)
                         ) {
                             Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                                Text("Permission Required", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
-                                Text("Android requires permission to install apps from Private Vault. Tap below to enable 'Install unknown apps'.")
-                                Button(
-                                    onClick = { otaUpdateManager.openUnknownSourcesSettings() },
-                                    modifier = Modifier.fillMaxWidth()
+                                Text("Permission Needed to Install", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                                Text(
+                                    "Android needs permission to let Private Vault open the update installer. Tap Open Settings, allow installs from this source, then press Back to continue.",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
-                                    Text("Open Settings")
+                                    Button(
+                                        onClick = { otaUpdateManager.openUnknownSourcesSettings() },
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text("Open Settings")
+                                    }
+                                    OutlinedButton(onClick = { otaUpdateManager.cancelActiveDownload() }) {
+                                        Text("Cancel")
+                                    }
                                 }
                             }
                         }
                     }
 
                     is OtaState.Error -> {
+                        val isNeutralNoRelease = state.title == "No Release Published Yet"
                         OutlinedCard(
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(16.dp)
                         ) {
                             Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text(state.title, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+                                Text(
+                                    state.title,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (isNeutralNoRelease) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.error
+                                )
                                 Text(state.detail, style = MaterialTheme.typography.bodySmall)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    val retryManifest = state.recoverableManifest
+                                    if (retryManifest != null) {
+                                        Button(
+                                            onClick = { onDownloadUpdate(retryManifest) },
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Text("Try Again")
+                                        }
+                                        OutlinedButton(onClick = { otaUpdateManager.cancelActiveDownload() }) {
+                                            Text("Cancel")
+                                        }
+                                    } else {
+                                        OutlinedButton(onClick = onCheckForUpdates, modifier = Modifier.weight(1f)) {
+                                            Text("Check Again")
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

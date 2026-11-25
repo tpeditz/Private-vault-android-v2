@@ -1,5 +1,6 @@
 package com.tpeditz.privatevault.v2.ui
 
+import android.app.PendingIntent
 import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.ViewModel
@@ -32,6 +33,7 @@ import com.tpeditz.privatevault.v2.ota.OtaUpdateManager
 import com.tpeditz.privatevault.v2.security.BiometricKeystoreManager
 import com.tpeditz.privatevault.v2.security.OfflinePasswordStrengthEstimator
 import com.tpeditz.privatevault.v2.security.PasswordGeneratorEngine
+import com.tpeditz.privatevault.v2.security.PasswordPolicy
 import com.tpeditz.privatevault.v2.security.SafeVaultLogger
 import com.tpeditz.privatevault.v2.security.SensitiveClipboardManager
 import com.tpeditz.privatevault.v2.security.StreamingMediaCryptoEngine
@@ -129,7 +131,8 @@ class VaultViewModel(
                                 authenticators = emptyList(),
                                 searchQuery = "",
                                 currentSecondary = SecondaryDestination.None,
-                                pendingRestorePayload = null
+                                pendingRestorePayload = null,
+                                pendingRestoreError = null
                             )
                         }
                     }
@@ -206,12 +209,13 @@ class VaultViewModel(
         }
         viewModelScope.launch {
             preferencesRepository.connectedGoogleAccount.collect { storedEmail ->
-                val activeAccountEmail = GoogleDriveAuthHelper.getLastSignedInAccount(context)?.email.orEmpty()
-                val resolvedEmail = activeAccountEmail.ifBlank { storedEmail }
+                val hasRecoveryPwd = AutoCloudBackupKeyStore.hasRecoveryPassword(context)
+                val legacyShort = computeIsCloudRecoveryLegacyShort()
                 _uiState.update {
                     it.copy(
-                        connectedGoogleEmail = resolvedEmail,
-                        autoCloudBackupKeyConfigured = AutoCloudBackupKeyStore.hasRecoveryPassword(context)
+                        connectedGoogleEmail = storedEmail.trim(),
+                        autoCloudBackupKeyConfigured = hasRecoveryPwd,
+                        isCloudRecoveryPasswordLegacyShort = legacyShort
                     )
                 }
             }
@@ -327,7 +331,8 @@ class VaultViewModel(
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             val res = repository.createInitialVault(passwordChars)
-            _uiState.update { it.copy(isLoading = false, isVaultInitialized = true) }
+            val nowInitialized = res is AuthResult.Success || repository.isVaultInitialized()
+            _uiState.update { it.copy(isLoading = false, isVaultInitialized = nowInitialized) }
             when (res) {
                 is AuthResult.Success -> onResult(true, null)
                 is AuthResult.Error -> onResult(false, res.message)
@@ -617,6 +622,111 @@ class VaultViewModel(
         }
     }
 
+    fun setPendingSharedText(rawText: String?) {
+        val sanitized = rawText?.trim()?.take(100_000).orEmpty()
+        if (sanitized.isNotBlank()) {
+            _uiState.update { it.copy(pendingSharedText = sanitized) }
+        }
+    }
+
+    fun clearPendingSharedText() {
+        _uiState.update { it.copy(pendingSharedText = null) }
+    }
+
+    fun saveSharedTextAsNote(
+        title: String,
+        body: String,
+        onComplete: (Boolean, String?) -> Unit = { _, _ -> }
+    ) {
+        val expectedSessionId = sessionManager.getCurrentSessionId() ?: run {
+            onComplete(false, "Your vault is locked. Unlock it and try again.")
+            return
+        }
+        viewModelScope.launch {
+            try {
+                if (sessionManager.getCurrentSessionId() != expectedSessionId) {
+                    onComplete(false, "Your vault was locked. Unlock it and try again.")
+                    return@launch
+                }
+                val cleanBody = body.trim().take(100_000)
+                if (cleanBody.isBlank()) {
+                    onComplete(false, "Cannot save an empty shared item.")
+                    return@launch
+                }
+                val resolvedTitle = title.trim().ifBlank {
+                    cleanBody.lineSequence().firstOrNull { it.isNotBlank() }?.take(60) ?: "Shared Note"
+                }
+                val now = System.currentTimeMillis()
+                repository.saveItem(
+                    NoteRecord(
+                        title = resolvedTitle,
+                        body = cleanBody,
+                        category = "Shared",
+                        createdAtEpochMs = now,
+                        updatedAtEpochMs = now
+                    )
+                )
+                loadActiveVaultItems()
+                _uiState.update {
+                    it.copy(
+                        pendingSharedText = null,
+                        activeSnackbarMessage = "Saved shared text as note"
+                    )
+                }
+                onComplete(true, null)
+            } catch (e: Exception) {
+                onComplete(false, VaultErrorMapper.mapVaultActionError(e))
+            }
+        }
+    }
+
+    fun saveSharedTextAsLink(
+        title: String,
+        url: String,
+        onComplete: (Boolean, String?) -> Unit = { _, _ -> }
+    ) {
+        val expectedSessionId = sessionManager.getCurrentSessionId() ?: run {
+            onComplete(false, "Your vault is locked. Unlock it and try again.")
+            return
+        }
+        viewModelScope.launch {
+            try {
+                if (sessionManager.getCurrentSessionId() != expectedSessionId) {
+                    onComplete(false, "Your vault was locked. Unlock it and try again.")
+                    return@launch
+                }
+                val cleanUrl = url.trim().take(4_096)
+                if (cleanUrl.isBlank()) {
+                    onComplete(false, "Please enter a valid link or URL.")
+                    return@launch
+                }
+                val resolvedTitle = title.trim().ifBlank {
+                    runCatching { android.net.Uri.parse(cleanUrl).host }.getOrNull()?.takeIf { !it.isNullOrBlank() }
+                        ?: "Shared Link"
+                }
+                val now = System.currentTimeMillis()
+                repository.saveItem(
+                    SecureLinkRecord(
+                        title = resolvedTitle,
+                        url = cleanUrl,
+                        createdAtEpochMs = now,
+                        updatedAtEpochMs = now
+                    )
+                )
+                loadActiveVaultItems()
+                _uiState.update {
+                    it.copy(
+                        pendingSharedText = null,
+                        activeSnackbarMessage = "Saved shared link to vault"
+                    )
+                }
+                onComplete(true, null)
+            } catch (e: Exception) {
+                onComplete(false, VaultErrorMapper.mapVaultActionError(e))
+            }
+        }
+    }
+
     fun deleteDocument(id: String) {
         viewModelScope.launch {
             repository.deleteItem(id)
@@ -750,16 +860,24 @@ class VaultViewModel(
         }
     }
 
+    private fun computeIsCloudRecoveryLegacyShort(): Boolean {
+        val chars = AutoCloudBackupKeyStore.readRecoveryPasswordOrNull(context) ?: return false
+        return try {
+            PasswordPolicy.isShortLegacyPassword(chars)
+        } finally {
+            Arrays.fill(chars, '\u0000')
+        }
+    }
+
     fun refreshSystemSecurityStatus() {
         viewModelScope.launch {
             val liveAutofill = AutofillHelper.isAutofillServiceEnabled(context)
             runCatching { preferencesRepository.setAutofillEnabled(liveAutofill) }
             val bioPref = preferencesRepository.biometricUnlockEnabled.first()
             val actualBio = bioPref && BiometricKeystoreManager.hasKeystoreKey()
-            val storedEmail = preferencesRepository.connectedGoogleAccount.first()
-            val signedInEmail = GoogleDriveAuthHelper.getLastSignedInAccount(context)?.email.orEmpty()
-            val resolvedEmail = signedInEmail.ifBlank { storedEmail }
+            val storedEmail = preferencesRepository.connectedGoogleAccount.first().trim()
             val hasRecoveryPwd = AutoCloudBackupKeyStore.hasRecoveryPassword(context)
+            val legacyShort = withContext(Dispatchers.IO) { computeIsCloudRecoveryLegacyShort() }
             val currentOta = otaUpdateManager.otaState.value
             val updateAvailable = currentOta is OtaState.UpdateAvailable ||
                 currentOta is OtaState.ReadyToInstall ||
@@ -767,8 +885,9 @@ class VaultViewModel(
             _uiState.update {
                 it.copy(
                     isBiometricsConfigured = actualBio,
-                    connectedGoogleEmail = resolvedEmail,
+                    connectedGoogleEmail = storedEmail,
                     autoCloudBackupKeyConfigured = hasRecoveryPwd,
+                    isCloudRecoveryPasswordLegacyShort = legacyShort,
                     privacyMetrics = it.privacyMetrics.copy(
                         isAutofillActive = liveAutofill,
                         isBiometricEnabled = actualBio,
@@ -797,9 +916,9 @@ class VaultViewModel(
             try {
                 val ok = repository.provisionDecoyVault(primaryPasswordChars, decoyPasswordChars)
                 loadActiveVaultItems()
-                withContext(Dispatchers.Main) { onComplete?.invoke(ok, if (ok) null else "Decoy creation failed") }
+                withContext(Dispatchers.Main) { onComplete?.invoke(ok, if (ok) null else "Check your primary password and use at least 12 characters for your decoy password.") }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { onComplete?.invoke(false, e.message) }
+                withContext(Dispatchers.Main) { onComplete?.invoke(false, VaultErrorMapper.mapVaultActionError(e)) }
             }
         }
     }
@@ -829,11 +948,24 @@ class VaultViewModel(
 
     private var pendingAutoPrepareJob: Job? = null
 
+    fun authorizeGoogleDrive(
+        email: String? = null,
+        onResult: (GoogleDriveAuthHelper.DriveAuthState) -> Unit
+    ) {
+        viewModelScope.launch {
+            val targetEmail = email?.trim()?.takeIf { it.isNotBlank() }
+                ?: preferencesRepository.connectedGoogleAccount.first().trim()
+            val authState = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, targetEmail)
+            onResult(authState)
+        }
+    }
+
     fun onGoogleAccountConnected(email: String, onComplete: ((Boolean) -> Unit)? = null) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                preferencesRepository.setConnectedGoogleAccount(email)
-                preferencesRepository.setAutoCloudBackupStatus("Connected to $email")
+                val cleanEmail = email.trim()
+                preferencesRepository.setConnectedGoogleAccount(cleanEmail)
+                preferencesRepository.setAutoCloudBackupStatus("Connected to $cleanEmail")
                 val autoEnabled = preferencesRepository.autoCloudBackupEnabled.first()
                 if (autoEnabled && AutoCloudBackupKeyStore.hasRecoveryPassword(context)) {
                     val freq = preferencesRepository.cloudBackupFrequency.first()
@@ -844,8 +976,8 @@ class VaultViewModel(
                 withContext(Dispatchers.Main) {
                     _uiState.update {
                         it.copy(
-                            connectedGoogleEmail = email,
-                            lastCloudBackupStatusMessage = "Connected to $email"
+                            connectedGoogleEmail = cleanEmail,
+                            lastCloudBackupStatusMessage = "Connected to $cleanEmail"
                         )
                     }
                     onComplete?.invoke(true)
@@ -861,7 +993,7 @@ class VaultViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 CloudBackupScheduler.cancelAllCloudWork(context)
-                CloudBackupScheduler.clearPendingSnapshot(context)
+                CloudBackupScheduler.clearPendingSnapshots(context)
                 AutoCloudBackupKeyStore.clearRecoveryPassword(context)
                 preferencesRepository.setAutoCloudBackupEnabled(false)
                 preferencesRepository.setConnectedGoogleAccount("")
@@ -873,6 +1005,7 @@ class VaultViewModel(
                             connectedGoogleEmail = "",
                             autoCloudBackupEnabled = false,
                             autoCloudBackupKeyConfigured = false,
+                            isCloudRecoveryPasswordLegacyShort = false,
                             lastCloudBackupStatusMessage = "Not connected",
                             privacyMetrics = it.privacyMetrics.copy(isAutoBackupEnabled = false)
                         )
@@ -880,7 +1013,7 @@ class VaultViewModel(
                     onComplete(true, null)
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { onComplete(false, e.message ?: "Failed to disconnect") }
+                withContext(Dispatchers.Main) { onComplete(false, VaultErrorMapper.mapCloudError(e)) }
             }
         }
     }
@@ -888,30 +1021,45 @@ class VaultViewModel(
     fun configureAutomaticCloudBackup(
         enabled: Boolean,
         recoveryPasswordChars: CharArray?,
+        onConsentRequired: ((PendingIntent) -> Unit)? = null,
         onComplete: (Boolean, String?) -> Unit
     ) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 if (enabled) {
-                    val account = GoogleDriveAuthHelper.getLastSignedInAccount(context)
-                        ?: return@launch withContext(Dispatchers.Main) {
+                    val connectedEmail = preferencesRepository.connectedGoogleAccount.first().trim()
+                    if (connectedEmail.isBlank()) {
+                        return@launch withContext(Dispatchers.Main) {
                             onComplete(false, "Connect a Google account first.")
                         }
-                    if (!GoogleDriveAuthHelper.hasPermissions(context)) {
-                        return@launch withContext(Dispatchers.Main) {
-                            onComplete(false, "Google Drive permission is missing. Reconnect your account.")
-                        }
                     }
-                    if (recoveryPasswordChars != null) {
-                        if (recoveryPasswordChars.size < 8) {
+                    when (val authState = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, connectedEmail)) {
+                        is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent -> {
+                            withContext(Dispatchers.Main) {
+                                onConsentRequired?.invoke(authState.pendingIntent)
+                                onComplete(false, "Approve Google Drive permission to finish setup.")
+                            }
+                            return@launch
+                        }
+                        is GoogleDriveAuthHelper.DriveAuthState.Failed -> {
                             return@launch withContext(Dispatchers.Main) {
-                                onComplete(false, "Recovery password must be at least 8 characters.")
+                                onComplete(false, authState.userMessage)
+                            }
+                        }
+                        is GoogleDriveAuthHelper.DriveAuthState.Authorized -> Unit
+                    }
+
+                    if (recoveryPasswordChars != null) {
+                        val policy = PasswordPolicy.validateNewPassword(recoveryPasswordChars, "Recovery password")
+                        if (!policy.isValid) {
+                            return@launch withContext(Dispatchers.Main) {
+                                onComplete(false, policy.errorMessage ?: "Use at least ${PasswordPolicy.MIN_NEW_PASSWORD_LENGTH} characters.")
                             }
                         }
                         val stored = AutoCloudBackupKeyStore.storeRecoveryPassword(context, recoveryPasswordChars)
                         if (!stored) {
                             return@launch withContext(Dispatchers.Main) {
-                                onComplete(false, "Could not protect recovery password in Android Keystore.")
+                                onComplete(false, "Could not protect recovery password on this device.")
                             }
                         }
                     } else if (!AutoCloudBackupKeyStore.hasRecoveryPassword(context)) {
@@ -921,7 +1069,8 @@ class VaultViewModel(
                     }
                     val freq = preferencesRepository.cloudBackupFrequency.first()
                     val wifiOnly = preferencesRepository.cloudBackupWifiOnly.first()
-                    preferencesRepository.setConnectedGoogleAccount(account.email.orEmpty())
+                    val legacyShort = computeIsCloudRecoveryLegacyShort()
+                    preferencesRepository.setConnectedGoogleAccount(connectedEmail)
                     preferencesRepository.setAutoCloudBackupEnabled(true)
                     preferencesRepository.setAutoCloudBackupStatus("Automatic backup scheduled")
                     CloudBackupScheduler.schedulePeriodicBackup(context, freq, wifiOnly)
@@ -930,6 +1079,7 @@ class VaultViewModel(
                             it.copy(
                                 autoCloudBackupEnabled = true,
                                 autoCloudBackupKeyConfigured = true,
+                                isCloudRecoveryPasswordLegacyShort = legacyShort,
                                 lastCloudBackupStatusMessage = "Automatic backup scheduled",
                                 privacyMetrics = it.privacyMetrics.copy(isAutoBackupEnabled = true)
                             )
@@ -939,7 +1089,7 @@ class VaultViewModel(
                     preparePendingAutoCloudBackupIfNeeded(forceImmediateTrigger = true)
                 } else {
                     CloudBackupScheduler.cancelAllCloudWork(context)
-                    CloudBackupScheduler.clearPendingSnapshot(context)
+                    CloudBackupScheduler.clearPendingSnapshots(context)
                     AutoCloudBackupKeyStore.clearRecoveryPassword(context)
                     preferencesRepository.setAutoCloudBackupEnabled(false)
                     preferencesRepository.setAutoCloudBackupStatus("Automatic backup turned off")
@@ -948,6 +1098,7 @@ class VaultViewModel(
                             it.copy(
                                 autoCloudBackupEnabled = false,
                                 autoCloudBackupKeyConfigured = false,
+                                isCloudRecoveryPasswordLegacyShort = false,
                                 lastCloudBackupStatusMessage = "Automatic backup turned off",
                                 privacyMetrics = it.privacyMetrics.copy(isAutoBackupEnabled = false)
                             )
@@ -956,7 +1107,7 @@ class VaultViewModel(
                     }
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { onComplete(false, e.message ?: "Failed to update automatic backup") }
+                withContext(Dispatchers.Main) { onComplete(false, VaultErrorMapper.mapCloudError(e)) }
             } finally {
                 if (recoveryPasswordChars != null) {
                     Arrays.fill(recoveryPasswordChars, '\u0000')
@@ -997,33 +1148,18 @@ class VaultViewModel(
             val session = sessionManager.getActiveSession() ?: return@launch
             if (session.slotId != VaultSessionManager.REAL_SLOT || session.isWiped) return@launch
             if (!preferencesRepository.autoCloudBackupEnabled.first()) return@launch
-            val account = GoogleDriveAuthHelper.getLastSignedInAccount(context) ?: return@launch
-            val email = account.email.orEmpty()
+            val email = preferencesRepository.connectedGoogleAccount.first().trim()
             if (email.isBlank()) return@launch
             val recoveryPwd = AutoCloudBackupKeyStore.readRecoveryPasswordOrNull(context) ?: return@launch
             try {
                 val items = repository.getAllItemsForActiveSlot()
-                val pendingFile = CloudBackupScheduler.pendingSnapshotFile(context)
-                val tmpFile = File(pendingFile.parentFile, "auto_snapshot.tmp")
-                FileOutputStream(tmpFile).use { fos ->
+                CloudBackupScheduler.stageEncryptedSnapshot(context, email) { fos ->
                     repository.createAuthoritativeStreamingBackup(
                         items = items,
                         backupPasswordChars = recoveryPwd,
                         outputStream = fos
                     )
-                    fos.flush()
-                    fos.fd.sync()
                 }
-                if (pendingFile.exists()) pendingFile.delete()
-                tmpFile.renameTo(pendingFile)
-                CloudBackupScheduler.writePendingSnapshotMeta(
-                    context,
-                    CloudBackupScheduler.PendingSnapshotMeta(
-                        accountEmail = email,
-                        preparedAtEpochMs = System.currentTimeMillis(),
-                        sizeBytes = pendingFile.length()
-                    )
-                )
                 val wifiOnly = preferencesRepository.cloudBackupWifiOnly.first()
                 val freq = preferencesRepository.cloudBackupFrequency.first()
                 val lastCloudMs = preferencesRepository.lastCloudBackupEpochMs.first()
@@ -1043,13 +1179,23 @@ class VaultViewModel(
         }
     }
 
-    fun uploadCloudBackup(backupPasswordChars: CharArray?, onComplete: (Boolean, String?) -> Unit) {
+    fun uploadCloudBackup(
+        backupPasswordChars: CharArray?,
+        onConsentRequired: ((PendingIntent) -> Unit)? = null,
+        onComplete: (Boolean, String?) -> Unit
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
             val tempBackupFile = File(context.cacheDir, "cloud_snapshot_${System.currentTimeMillis()}.pvault")
             var resolvedChars: CharArray? = null
             var ownsResolvedChars = false
             try {
                 val activePwd = if (backupPasswordChars != null && backupPasswordChars.isNotEmpty()) {
+                    val policy = PasswordPolicy.validateNewPassword(backupPasswordChars, "Cloud backup password")
+                    if (!policy.isValid) {
+                        return@launch withContext(Dispatchers.Main) {
+                            onComplete(false, policy.errorMessage ?: "Use at least ${PasswordPolicy.MIN_NEW_PASSWORD_LENGTH} characters.")
+                        }
+                    }
                     resolvedChars = backupPasswordChars
                     backupPasswordChars
                 } else {
@@ -1062,12 +1208,28 @@ class VaultViewModel(
                     unwrapped
                 }
 
-                val account = GoogleDriveAuthHelper.getLastSignedInAccount(context)
-                    ?: throw IllegalStateException("Google Drive account is not connected.")
-                if (!GoogleDriveAuthHelper.hasPermissions(context)) {
-                    throw IllegalStateException("Google Drive permission was revoked. Please reconnect your account.")
+                val email = preferencesRepository.connectedGoogleAccount.first().trim()
+                if (email.isBlank()) {
+                    return@launch withContext(Dispatchers.Main) {
+                        onComplete(false, "Connect a Google account first.")
+                    }
                 }
-                var token = GoogleDriveAuthHelper.getAccessToken(context, account).getOrThrow()
+
+                var token = when (val authState = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)) {
+                    is GoogleDriveAuthHelper.DriveAuthState.Authorized -> authState.accessToken
+                    is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent -> {
+                        withContext(Dispatchers.Main) {
+                            onConsentRequired?.invoke(authState.pendingIntent)
+                            onComplete(false, "Approve Google Drive permission and try again.")
+                        }
+                        return@launch
+                    }
+                    is GoogleDriveAuthHelper.DriveAuthState.Failed -> {
+                        return@launch withContext(Dispatchers.Main) {
+                            onComplete(false, authState.userMessage)
+                        }
+                    }
+                }
 
                 val allItems = repository.getAllItemsForActiveSlot()
                 FileOutputStream(tempBackupFile).use { fos ->
@@ -1081,10 +1243,16 @@ class VaultViewModel(
                 }
                 var res = googleDriveSyncManager.uploadBackupSnapshotFile(token, tempBackupFile)
                 if (res is GoogleDriveSyncManager.SyncResult.Error && res.isAuthError) {
-                    val refreshed = GoogleDriveAuthHelper.refreshAccessToken(context, account, token).getOrNull()
-                    if (refreshed != null) {
-                        token = refreshed
+                    val refreshed = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)
+                    if (refreshed is GoogleDriveAuthHelper.DriveAuthState.Authorized) {
+                        token = refreshed.accessToken
                         res = googleDriveSyncManager.uploadBackupSnapshotFile(token, tempBackupFile)
+                    } else if (refreshed is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent) {
+                        withContext(Dispatchers.Main) {
+                            onConsentRequired?.invoke(refreshed.pendingIntent)
+                            onComplete(false, "Approve Google Drive permission and try again.")
+                        }
+                        return@launch
                     }
                 }
                 when (res) {
@@ -1095,12 +1263,17 @@ class VaultViewModel(
                         withContext(Dispatchers.Main) { onComplete(true, null) }
                     }
                     is GoogleDriveSyncManager.SyncResult.Error -> {
-                        preferencesRepository.setAutoCloudBackupStatus("Last upload failed: ${res.message}")
-                        withContext(Dispatchers.Main) { onComplete(false, res.message) }
+                        val friendly = if (res.isAuthError) {
+                            "Reconnect your Google account to continue."
+                        } else {
+                            res.message
+                        }
+                        preferencesRepository.setAutoCloudBackupStatus("Last upload failed: $friendly")
+                        withContext(Dispatchers.Main) { onComplete(false, friendly) }
                     }
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { onComplete(false, e.message ?: "Cloud upload failed") }
+                withContext(Dispatchers.Main) { onComplete(false, VaultErrorMapper.mapCloudError(e)) }
             } finally {
                 tempBackupFile.delete()
                 if (ownsResolvedChars && resolvedChars != null) {
@@ -1110,20 +1283,48 @@ class VaultViewModel(
         }
     }
 
-    fun downloadCloudSnapshot(fileId: String, onDownloaded: (File?, String?) -> Unit) {
+    fun downloadCloudSnapshot(
+        fileId: String,
+        onConsentRequired: ((PendingIntent) -> Unit)? = null,
+        onDownloaded: (File?, String?) -> Unit
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
             val targetFile = File(context.cacheDir, "cloud_download_${fileId.take(8)}_${System.currentTimeMillis()}.pvault")
             try {
-                val account = GoogleDriveAuthHelper.getLastSignedInAccount(context)
-                    ?: throw IllegalStateException("Google Drive account is not connected.")
-                var token = GoogleDriveAuthHelper.getAccessToken(context, account).getOrThrow()
+                val email = preferencesRepository.connectedGoogleAccount.first().trim()
+                if (email.isBlank()) {
+                    return@launch withContext(Dispatchers.Main) {
+                        onDownloaded(null, "Connect a Google account first.")
+                    }
+                }
+                var token = when (val authState = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)) {
+                    is GoogleDriveAuthHelper.DriveAuthState.Authorized -> authState.accessToken
+                    is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent -> {
+                        withContext(Dispatchers.Main) {
+                            onConsentRequired?.invoke(authState.pendingIntent)
+                            onDownloaded(null, "Approve Google Drive permission and try again.")
+                        }
+                        return@launch
+                    }
+                    is GoogleDriveAuthHelper.DriveAuthState.Failed -> {
+                        return@launch withContext(Dispatchers.Main) {
+                            onDownloaded(null, authState.userMessage)
+                        }
+                    }
+                }
 
                 var res = googleDriveSyncManager.downloadBackupSnapshotToFile(token, fileId, targetFile)
                 if (res is GoogleDriveSyncManager.SyncResult.Error && res.isAuthError) {
-                    val refreshed = GoogleDriveAuthHelper.refreshAccessToken(context, account, token).getOrNull()
-                    if (refreshed != null) {
-                        token = refreshed
+                    val refreshed = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)
+                    if (refreshed is GoogleDriveAuthHelper.DriveAuthState.Authorized) {
+                        token = refreshed.accessToken
                         res = googleDriveSyncManager.downloadBackupSnapshotToFile(token, fileId, targetFile)
+                    } else if (refreshed is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent) {
+                        withContext(Dispatchers.Main) {
+                            onConsentRequired?.invoke(refreshed.pendingIntent)
+                            onDownloaded(null, "Approve Google Drive permission and try again.")
+                        }
+                        return@launch
                     }
                 }
                 when (res) {
@@ -1131,37 +1332,54 @@ class VaultViewModel(
                         withContext(Dispatchers.Main) { onDownloaded(res.data, null) }
                     }
                     is GoogleDriveSyncManager.SyncResult.Error -> {
+                        runCatching { targetFile.delete() }
                         withContext(Dispatchers.Main) { onDownloaded(null, res.message) }
                     }
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { onDownloaded(null, e.message ?: "Failed to download snapshot") }
+                runCatching { targetFile.delete() }
+                withContext(Dispatchers.Main) { onDownloaded(null, VaultErrorMapper.mapCloudError(e)) }
             }
         }
     }
 
-    fun queryCloudSnapshots(onResult: (List<GoogleDriveSyncManager.CloudBackupMetadata>, String?) -> Unit) {
+    fun queryCloudSnapshots(
+        onConsentRequired: ((PendingIntent) -> Unit)? = null,
+        onResult: (List<GoogleDriveSyncManager.CloudBackupMetadata>, String?) -> Unit
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val account = GoogleDriveAuthHelper.getLastSignedInAccount(context)
-                if (account == null) {
-                    withContext(Dispatchers.Main) { onResult(emptyList(), "Google account is not connected.") }
+                val email = preferencesRepository.connectedGoogleAccount.first().trim()
+                if (email.isBlank()) {
+                    withContext(Dispatchers.Main) { onResult(emptyList(), "Connect a Google account first.") }
                     return@launch
                 }
-                if (!GoogleDriveAuthHelper.hasPermissions(context)) {
-                    withContext(Dispatchers.Main) { onResult(emptyList(), "Google Drive access was revoked. Reconnect your account.") }
-                    return@launch
-                }
-                var token = GoogleDriveAuthHelper.getAccessToken(context, account).getOrElse { err ->
-                    withContext(Dispatchers.Main) { onResult(emptyList(), err.message ?: "Could not access Google Drive.") }
-                    return@launch
+                var token = when (val authState = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)) {
+                    is GoogleDriveAuthHelper.DriveAuthState.Authorized -> authState.accessToken
+                    is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent -> {
+                        withContext(Dispatchers.Main) {
+                            onConsentRequired?.invoke(authState.pendingIntent)
+                            onResult(emptyList(), "Approve Google Drive permission to list cloud backups.")
+                        }
+                        return@launch
+                    }
+                    is GoogleDriveAuthHelper.DriveAuthState.Failed -> {
+                        withContext(Dispatchers.Main) { onResult(emptyList(), authState.userMessage) }
+                        return@launch
+                    }
                 }
                 var res = googleDriveSyncManager.queryCloudBackups(token)
                 if (res is GoogleDriveSyncManager.SyncResult.Error && res.isAuthError) {
-                    val refreshed = GoogleDriveAuthHelper.refreshAccessToken(context, account, token).getOrNull()
-                    if (refreshed != null) {
-                        token = refreshed
+                    val refreshed = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)
+                    if (refreshed is GoogleDriveAuthHelper.DriveAuthState.Authorized) {
+                        token = refreshed.accessToken
                         res = googleDriveSyncManager.queryCloudBackups(token)
+                    } else if (refreshed is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent) {
+                        withContext(Dispatchers.Main) {
+                            onConsentRequired?.invoke(refreshed.pendingIntent)
+                            onResult(emptyList(), "Approve Google Drive permission to list cloud backups.")
+                        }
+                        return@launch
                     }
                 }
                 when (res) {
@@ -1173,7 +1391,7 @@ class VaultViewModel(
                     }
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { onResult(emptyList(), e.message ?: "Could not load backups") }
+                withContext(Dispatchers.Main) { onResult(emptyList(), VaultErrorMapper.mapCloudError(e)) }
             }
         }
     }
@@ -1181,14 +1399,19 @@ class VaultViewModel(
     fun deleteCloudSnapshot(fileId: String, onComplete: (Boolean) -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val account = GoogleDriveAuthHelper.getLastSignedInAccount(context)
-                var token = account?.let { GoogleDriveAuthHelper.getAccessToken(context, it).getOrNull() }
+                val email = preferencesRepository.connectedGoogleAccount.first().trim()
+                if (email.isBlank()) {
+                    withContext(Dispatchers.Main) { onComplete(false) }
+                    return@launch
+                }
+                val authState = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)
+                var token = (authState as? GoogleDriveAuthHelper.DriveAuthState.Authorized)?.accessToken
                 if (token != null) {
                     var res = googleDriveSyncManager.deleteCloudBackup(token, fileId)
-                    if (res is GoogleDriveSyncManager.SyncResult.Error && res.isAuthError && account != null) {
-                        val refreshed = GoogleDriveAuthHelper.refreshAccessToken(context, account, token).getOrNull()
-                        if (refreshed != null) {
-                            token = refreshed
+                    if (res is GoogleDriveSyncManager.SyncResult.Error && res.isAuthError) {
+                        val refreshed = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)
+                        if (refreshed is GoogleDriveAuthHelper.DriveAuthState.Authorized) {
+                            token = refreshed.accessToken
                             res = googleDriveSyncManager.deleteCloudBackup(token, fileId)
                         }
                     }
@@ -1261,6 +1484,10 @@ class VaultViewModel(
         _uiState.update { it.copy(isLoading = false, backupProgressRatio = null, backupStatusMessage = null) }
     }
 
+    fun dismissRestoreError() {
+        _uiState.update { it.copy(pendingRestoreError = null) }
+    }
+
     fun exportStreamingBackup(
         scope: BackupExportScope,
         passwordChars: CharArray,
@@ -1268,6 +1495,14 @@ class VaultViewModel(
         onProgress: (Long, Long) -> Unit = { _, _ -> },
         onComplete: (Boolean, String?) -> Unit
     ) {
+        val pwdValidation = PasswordPolicy.validateNewPassword(passwordChars, "Backup password")
+        if (!pwdValidation.isValid) {
+            runCatching { outputStream.close() }
+            val msg = pwdValidation.errorMessage ?: "Use at least ${PasswordPolicy.MIN_NEW_PASSWORD_LENGTH} characters for your new backup password."
+            _uiState.update { it.copy(isLoading = false, backupProgressRatio = null, backupStatusMessage = null, activeErrorMessage = msg) }
+            onComplete(false, msg)
+            return
+        }
         activeBackupJob?.cancel()
         _uiState.update { it.copy(isLoading = true, backupProgressRatio = 0f, backupStatusMessage = "Preparing backup...") }
         activeBackupJob = viewModelScope.launch(Dispatchers.IO) {
@@ -1321,16 +1556,17 @@ class VaultViewModel(
                 }
             } catch (e: Exception) {
                 SafeVaultLogger.e("Backup", "Export failed", e)
+                val friendly = VaultErrorMapper.mapBackupExportError(e)
                 withContext(Dispatchers.Main) {
                     _uiState.update {
                         it.copy(
                             isLoading = false,
                             backupProgressRatio = null,
                             backupStatusMessage = null,
-                            activeErrorMessage = e.message ?: "Backup failed"
+                            activeErrorMessage = friendly
                         )
                     }
-                    onComplete(false, e.message)
+                    onComplete(false, friendly)
                 }
             } finally {
                 activeBackupJob = null
@@ -1345,16 +1581,36 @@ class VaultViewModel(
         onResult: (BackupPayload?, String?) -> Unit
     ) {
         activeRestoreJob?.cancel()
-        _uiState.update { it.copy(isLoading = true, backupProgressRatio = null, backupStatusMessage = "Reading and verifying backup...") }
+        _uiState.update {
+            it.copy(
+                isLoading = true,
+                backupProgressRatio = null,
+                backupStatusMessage = "Reading and verifying backup...",
+                pendingRestoreError = null
+            )
+        }
+        val initialSessionId = sessionManager.getCurrentSessionId()
         val stagingDir = File(context.cacheDir, "restore_staging_${System.currentTimeMillis()}").apply { mkdirs() }
         val bis = BufferedInputStream(inputStream)
         activeRestoreJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 ensureActive()
+                val hadInitializedVault = repository.isVaultInitialized()
+                if (hadInitializedVault && initialSessionId == null) {
+                    throw IllegalStateException("Vault is locked. Unlock before inspecting a backup.")
+                }
                 val headerBuf = ByteArray(8)
                 bis.mark(16)
-                bis.read(headerBuf)
+                var headerBytesRead = 0
+                while (headerBytesRead < headerBuf.size) {
+                    val r = bis.read(headerBuf, headerBytesRead, headerBuf.size - headerBytesRead)
+                    if (r <= 0) break
+                    headerBytesRead += r
+                }
                 bis.reset()
+                if (headerBytesRead < 4) {
+                    throw IllegalArgumentException("Unrecognized backup file header.")
+                }
 
                 val staged = if (EncryptedBackupV2Engine.isV2Backup(headerBuf)) {
                     EncryptedBackupV2Engine.inspectAndStageBackup(bis, passwordChars, stagingDir)
@@ -1364,6 +1620,9 @@ class VaultViewModel(
                     throw IllegalArgumentException("Unrecognized backup file header.")
                 }
                 ensureActive()
+                if (hadInitializedVault && sessionManager.getCurrentSessionId() != initialSessionId) {
+                    throw IllegalStateException("Session changed before backup staging completed.")
+                }
 
                 currentStagedRestore = staged
                 withContext(Dispatchers.Main) {
@@ -1372,7 +1631,8 @@ class VaultViewModel(
                             isLoading = false,
                             backupProgressRatio = null,
                             backupStatusMessage = null,
-                            pendingRestorePayload = staged.payload
+                            pendingRestorePayload = staged.payload,
+                            pendingRestoreError = null
                         )
                     }
                     onResult(staged.payload, null)
@@ -1387,16 +1647,17 @@ class VaultViewModel(
             } catch (e: Exception) {
                 SafeVaultLogger.w("Restore", "Failed to decrypt backup: ${e.message}")
                 stagingDir.deleteRecursively()
+                val friendly = VaultErrorMapper.mapRestoreError(e)
                 withContext(Dispatchers.Main) {
                     _uiState.update {
                         it.copy(
                             isLoading = false,
                             backupProgressRatio = null,
                             backupStatusMessage = null,
-                            activeErrorMessage = e.message ?: "Failed to inspect backup"
+                            pendingRestoreError = friendly
                         )
                     }
-                    onResult(null, e.message)
+                    onResult(null, friendly.message)
                 }
             } finally {
                 activeRestoreJob = null
@@ -1406,16 +1667,26 @@ class VaultViewModel(
     }
 
     fun confirmRestore(mode: RestoreMode, onComplete: (Boolean) -> Unit) {
+        val expectedSessionId = sessionManager.getCurrentSessionId() ?: run {
+            _uiState.update {
+                it.copy(pendingRestoreError = VaultErrorMapper.mapRestoreError(IllegalStateException("Vault is locked.")))
+            }
+            onComplete(false)
+            return
+        }
         val staged = currentStagedRestore ?: run {
             val payload = _uiState.value.pendingRestorePayload ?: return
             StagedBackupRestore(payload, File(context.cacheDir, "empty_staging").apply { mkdirs() })
         }
         activeRestoreJob?.cancel()
-        _uiState.update { it.copy(isLoading = true, backupProgressRatio = null, backupStatusMessage = "Restoring vault items...") }
+        _uiState.update { it.copy(isLoading = true, backupProgressRatio = null, backupStatusMessage = "Restoring vault items...", pendingRestoreError = null) }
         activeRestoreJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 ensureActive()
-                repository.commitRestore(staged, mode, isCancelled = { !isActive })
+                if (sessionManager.getCurrentSessionId() != expectedSessionId) {
+                    throw IllegalStateException("Session changed during restore.")
+                }
+                repository.commitRestore(staged, mode, isCancelled = { !isActive || sessionManager.getCurrentSessionId() != expectedSessionId })
                 currentStagedRestore = null
                 loadActiveVaultItems()
                 withContext(Dispatchers.Main) {
@@ -1425,6 +1696,7 @@ class VaultViewModel(
                             backupProgressRatio = null,
                             backupStatusMessage = null,
                             pendingRestorePayload = null,
+                            pendingRestoreError = null,
                             activeSnackbarMessage = "Vault restored successfully"
                         )
                     }
@@ -1438,13 +1710,14 @@ class VaultViewModel(
                 }
             } catch (e: Exception) {
                 SafeVaultLogger.e("Restore", "Restore commit failed", e)
+                val friendly = VaultErrorMapper.mapRestoreError(e)
                 withContext(Dispatchers.Main) {
                     _uiState.update {
                         it.copy(
                             isLoading = false,
                             backupProgressRatio = null,
                             backupStatusMessage = null,
-                            activeErrorMessage = e.message ?: "Restore commit failed"
+                            pendingRestoreError = friendly
                         )
                     }
                     onComplete(false)
@@ -1464,16 +1737,22 @@ class VaultViewModel(
             onComplete(false, "No backup loaded for restore.")
             return
         }
+        val pwdPolicy = PasswordPolicy.validateNewPassword(masterPasswordChars, "Master password")
+        if (!pwdPolicy.isValid) {
+            onComplete(false, pwdPolicy.errorMessage ?: "Use at least ${PasswordPolicy.MIN_NEW_PASSWORD_LENGTH} characters for your new master password.")
+            return
+        }
         activeRestoreJob?.cancel()
-        _uiState.update { it.copy(isLoading = true, backupProgressRatio = null, backupStatusMessage = "Initializing vault and restoring data...") }
+        _uiState.update { it.copy(isLoading = true, backupProgressRatio = null, backupStatusMessage = "Initializing vault and restoring data...", pendingRestoreError = null) }
         activeRestoreJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 ensureActive()
                 val res = repository.createInitialVault(masterPasswordChars)
                 if (res !is AuthResult.Success) {
+                    val errMsg = (res as? AuthResult.Error)?.message ?: "Failed to initialize vault."
                     withContext(Dispatchers.Main) {
                         _uiState.update { it.copy(isLoading = false, backupStatusMessage = null) }
-                        onComplete(false, "Failed to initialize vault envelope.")
+                        onComplete(false, errMsg)
                     }
                     return@launch
                 }
@@ -1489,6 +1768,7 @@ class VaultViewModel(
                             isUnlocked = true,
                             activeSlotId = 0,
                             pendingRestorePayload = null,
+                            pendingRestoreError = null,
                             isLoading = false,
                             backupProgressRatio = null,
                             backupStatusMessage = null,
@@ -1506,16 +1786,17 @@ class VaultViewModel(
                 }
             } catch (e: Exception) {
                 SafeVaultLogger.e("Restore", "Create vault and restore failed", e)
+                val friendly = VaultErrorMapper.mapRestoreError(e)
                 withContext(Dispatchers.Main) {
                     _uiState.update {
                         it.copy(
                             isLoading = false,
                             backupProgressRatio = null,
                             backupStatusMessage = null,
-                            activeErrorMessage = e.message ?: "Restore failed"
+                            pendingRestoreError = friendly
                         )
                     }
-                    onComplete(false, e.message ?: "Restore failed")
+                    onComplete(false, friendly.message)
                 }
             } finally {
                 activeRestoreJob = null
@@ -1529,6 +1810,7 @@ class VaultViewModel(
         _uiState.update {
             it.copy(
                 pendingRestorePayload = null,
+                pendingRestoreError = null,
                 backupProgressRatio = null,
                 backupStatusMessage = null
             )
@@ -1540,6 +1822,11 @@ class VaultViewModel(
         newPasswordChars: CharArray,
         onComplete: (Boolean, String?) -> Unit
     ) {
+        val policy = PasswordPolicy.validateNewPassword(newPasswordChars, "Master password")
+        if (!policy.isValid) {
+            onComplete(false, policy.errorMessage ?: "Use at least ${PasswordPolicy.MIN_NEW_PASSWORD_LENGTH} characters.")
+            return
+        }
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val success = repository.changeMasterPassword(currentPasswordChars, newPasswordChars)
@@ -1548,11 +1835,11 @@ class VaultViewModel(
                         _uiState.update { it.copy(isBiometricsConfigured = false) }
                         onComplete(true, null)
                     } else {
-                        onComplete(false, "Current password incorrect.")
+                        onComplete(false, "Current password is incorrect.")
                     }
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { onComplete(false, e.message ?: "Failed to change password") }
+                withContext(Dispatchers.Main) { onComplete(false, VaultErrorMapper.mapVaultActionError(e)) }
             }
         }
     }

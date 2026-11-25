@@ -194,6 +194,40 @@ fun AboutScreen(
                 }
             }
 
+            // Website & Legal Links
+            item {
+                Text("Website & Legal", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.height(6.dp))
+
+                OutlinedCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Column {
+                        ContactRow(
+                            label = "Official Website",
+                            value = "Private Vault Home",
+                            onCopy = { onCopyText("Official Website", "https://tpeditz.github.io/Private-vault-android-v2/") },
+                            onOpen = { openExternalLink("https://tpeditz.github.io/Private-vault-android-v2/") }
+                        )
+                        HorizontalDivider()
+                        ContactRow(
+                            label = "Privacy Policy",
+                            value = "How Private Vault protects your data",
+                            onCopy = { onCopyText("Privacy Policy", "https://tpeditz.github.io/Private-vault-android-v2/privacy.html") },
+                            onOpen = { openExternalLink("https://tpeditz.github.io/Private-vault-android-v2/privacy.html") }
+                        )
+                        HorizontalDivider()
+                        ContactRow(
+                            label = "Terms of Use",
+                            value = "Read service and licensing terms",
+                            onCopy = { onCopyText("Terms of Use", "https://tpeditz.github.io/Private-vault-android-v2/terms.html") },
+                            onOpen = { openExternalLink("https://tpeditz.github.io/Private-vault-android-v2/terms.html") }
+                        )
+                    }
+                }
+            }
+
             // Clear Privacy & Data Statement
             item {
                 OutlinedCard(

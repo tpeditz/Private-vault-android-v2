@@ -1,14 +1,15 @@
 # PRIVATE VAULT V2 - STAGE 1.1 DEFECT RESOLUTION REPORT
 
-> **Product:** Private Vault V2 (`2.0.0`, version code: `1`)  
+> **Product:** Private Vault V2 (`2.0.1`, version code: `2`)  
 > **Production Application ID:** `com.tpeditz.privatevault.v2`  
 > **Debug Application ID:** `com.tpeditz.privatevault.v2.debug`  
 > **Developer:** Developed by Tp Editz  
 > **Telegram:** [@Tp_Editz](https://t.me/Tp_Editz)  
 > **Instagram:** [@tp_ediitz](https://www.instagram.com/tp_ediitz/)  
+> **Official Website:** [https://tpeditz.github.io/Private-vault-android-v2/](https://tpeditz.github.io/Private-vault-android-v2/)  
 > **Official Repository:** [https://github.com/tpeditz/Private-vault-android-v2](https://github.com/tpeditz/Private-vault-android-v2)  
 > **Date:** November 2026  
-> **Phase:** Stage 1.1 Source-Code Correction, Feature Completion, Security, and Verification  
+> **Phase:** V2.0.1 (`versionCode = 2`) Security, Crash-Safety, UX, Auth & CI/CD Hardening  
 
 ---
 
@@ -382,4 +383,51 @@ TOTAL                                                                        77 
 - **Android Lint (`./gradlew.bat :app:lintDebug`):** `BUILD SUCCESSFUL` (**0 errors**, 70 warnings)
 - **Debug APK (`./gradlew.bat :app:assembleDebug`):** `BUILD SUCCESSFUL` (`app-debug.apk`: **25,451,314 bytes**)
 - **Release APK (`./gradlew.bat :app:assembleRelease`):** `BUILD SUCCESSFUL` (`app-release-unsigned.apk`: **6,308,411 bytes**, R8 minified)
+
+---
+
+## Stage 3: V2.0.1 (`versionCode = 2`) Security, Crash-Safety, Modern Auth, Autofill, OTA & Build Hardening
+
+### Defect 27: Recovery Rollback DB-Failure Safety, Repository Mutation Serialization & Post-Commit Boundary
+- **Root Cause:** `VaultRepository.executeRecoveryRollback()` used `runCatching { ... }.getOrNull() ?: emptySet()`, risking over-broad cleanup if Room DB queries failed mid-recovery; key/item mutations lacked uniform serialization under `vaultMutationMutex`; and `commitRestore()` needed an explicit `dbCommitted` boundary so post-commit file cleanup errors never trigger false rollback exceptions.
+- **Files Modified:** `VaultRepository.kt`, `VaultRepositorySafetyHardeningTest.kt` (new)
+- **Resolution:**
+  1. Failed-closed `executeRecoveryRollback()` so any DB lookup exception aborts recovery returning `false` while preserving both valid files and the recovery journal intact.
+  2. Wrapped vault creation, decoy provisioning/disabling, master password rotation/change, item/CSV/media/document mutations inside `vaultMutationMutex.withLock`.
+  3. Added explicit `dbCommitted` commit tracking, checked journal persistence, and `fd.sync()` on encrypted thumbnails.
+- **Verification:** Passed in `VaultRepositorySafetyHardeningTest` (2/2) and `VaultRepositoryRestoreRegressionTest` (10/10).
+
+### Defect 28: Raw Cipher Errors on Backup Restore & New 12+ Character Password Policy (With Legacy Compatibility)
+- **Root Cause:** Wrong backup passwords and cipher failures exposed raw internal exception text (`AEADBadTagException`, `BAD_DECRYPT`) and forced re-picking files on retry; new passwords allowed `< 12` characters.
+- **Files Modified:** `VaultErrorMapper.kt` (new), `PasswordPolicy.kt` (new), `VaultUiState.kt`, `VaultViewModel.kt`, `MainActivity.kt`, `SetupAndUnlockScreens.kt`, `BackupRestoreScreen.kt`, `SecuritySettingsScreen.kt`, `CloudBackupScreen.kt`, `DocumentViewerScreen.kt`, `MediaViewerScreen.kt`, `VaultErrorMapperTest.kt` (new), `PasswordPolicyTest.kt` (new)
+- **Resolution:**
+  1. Implemented `VaultErrorMapper` translating AEAD/cipher/`bad_decrypt`, missing assets, truncated/corrupt files, storage exhaustion, session locks, and cloud auth errors to plain-English dialogs.
+  2. Remembered the selected backup `Uri` / temp download so wrong-password retries open directly without re-picking files, and bound `inspectBackupForRestore`/`confirmRestore` to the authorized vault session.
+  3. Implemented `PasswordPolicy` (`12+` chars allowing spaces/Unicode) for NEW vault/decoy/master-change/backup/cloud passwords while keeping full compatibility for `< 12`-char legacy vaults, legacy `.pvault` backups, and existing cloud schedules (with an optional upgrade action in `CloudBackupScreen` and an unencrypted-copy warning in `DocumentViewerScreen`).
+- **Verification:** Passed in `PasswordPolicyTest` (2/2) and `VaultErrorMapperTest` (2/2).
+
+### Defect 29: Deprecated Google Sign-In Migration & Cloud Snapshot Overwrite Race
+- **Root Cause:** `GoogleDriveAuthHelper` relied on deprecated `GoogleSignIn`/`GoogleAuthUtil`; `CloudBackupScheduler` reused mutable snapshot filenames risking concurrent prepare/upload overwrite races.
+- **Files Modified:** `gradle/libs.versions.toml`, `app/build.gradle.kts`, `GoogleDriveAuthHelper.kt`, `CloudBackupScheduler.kt`, `CloudBackupWorker.kt`, `GoogleDriveSyncManager.kt`, `VaultViewModel.kt`, `MainActivity.kt`, `CloudBackupSchedulerAndSyncTest.kt`
+- **Resolution:**
+  1. Upgraded to AndroidX Credential Manager (`credentials:1.5.0`, `googleid:1.1.1`) and GIS `AuthorizationClient` (`DriveAuthState.Authorized` / `NeedsConsent(pendingIntent)` / `Failed`) wired through `driveConsentLauncher`.
+  2. Refactored `CloudBackupScheduler` to UUID-keyed immutable `snap_<id>.pvault` + atomic `.meta.json` (`sizeBytes`, `sha256Hex`, `STATE_READY`) guarded by `snapshotCoordinatorMutex` and `activeUploadingSnapshotId`, plus `protectedFileId` retention protection in `GoogleDriveSyncManager`.
+- **Verification:** Passed in `CloudBackupSchedulerAndSyncTest` (3/3).
+
+### Defect 30: Autofill Package Guessing, OTA Permission Resume Flow, Share-to-Vault, Website Links & Proguard Bloat
+- **Root Cause:** `AutofillHelper` matched native apps heuristically using `serviceName` and split package tokens; `OtaUpdatesScreen` required manual re-check after granting Unknown Sources and `OtaUpdateManager` needed `FLAG_DEBUGGABLE` rejection and size bounds; `ACTION_SEND` `text/plain` in `MainActivity` had an empty stub; `proguard-rules.pro` kept entire `org.bouncycastle.**` and `com.android.apksig.**` trees; `publish-production-apk.yml` could skip `apkanalyzer` if absent and didn't stage draft releases before public promotion.
+- **Files Modified:** `AutofillHelper.kt`, `PrivateVaultAutofillService.kt`, `AutofillAuthActivity.kt`, `OtaUpdateManager.kt`, `OtaUpdatesScreen.kt`, `MainActivity.kt`, `AboutScreen.kt`, `app/res/xml/file_paths.xml`, `app/proguard-rules.pro`, `.github/workflows/publish-production-apk.yml`, `AutofillMatcherTest.kt`, `OtaManifestTest.kt`, `ShareToVaultAndScreensAndroidTest.kt` (new)
+- **Resolution:**
+  1. Restricted `AutofillHelper` strictly to explicit domain/parent hosts, `https`/`http` scheme isolation, and explicit `android://<packageName>` / `<packageName>`, offering a neutral vault picker when unassociated.
+  2. Hardened `OtaUpdateManager` (`<= 1 MiB` manifest, `<= 250 MiB` APK, `FLAG_DEBUGGABLE` rejection, `fd.sync()`, pre-installer re-verification, `recheckInstallPermissionAndVerifyCandidate()` on `ON_RESUME`) and removed unused `temporary_exports` from `file_paths.xml`.
+  3. Completed `ACTION_SEND` (`text/plain`) staging + `onNewIntent` Share-to-Vault Save/Cancel dialog (Note vs Secure Link) and added Website & Legal links on `AboutScreen` (`https://tpeditz.github.io/Private-vault-android-v2/`).
+  4. Narrowed R8 ProGuard keeps (`app-release-unsigned.apk` shrank from `6,308,411` bytes / `54,981` method refs to **`4,351,005` bytes / `26,045` method refs**, single DEX) and hardened `.github/workflows/publish-production-apk.yml` (unconditional `aapt2`/`apkanalyzer` `debuggable=false` + metadata check, `404` vs API error handling, draft-staged promotion, and full live APK byte/SHA-256/`apksigner` verification).
+
+## Final Verification Results (V2.0.1 Ready)
+- **JVM Unit & Integration Tests (`./gradlew.bat :app:testDebugUnitTest`):** `BUILD SUCCESSFUL` — **89 tests across 16 suites passed, 0 failed, 0 skipped, 0 errors (5.701s)**
+- **Instrumentation Test Compile (`./gradlew.bat :app:compileDebugAndroidTestKotlin`):** `BUILD SUCCESSFUL` (4 `androidTest` suites compiled; device execution pending attached hardware/emulator)
+- **Android Lint (`./gradlew.bat :app:lintDebug`):** `BUILD SUCCESSFUL` (**0 errors**, 74 warnings)
+- **Debug APK (`./gradlew.bat :app:assembleDebug`):** `BUILD SUCCESSFUL` (`app-debug.apk`: **25,601,201 bytes**)
+- **Release APK (`./gradlew.bat :app:assembleRelease`):** `BUILD SUCCESSFUL` (`app-release-unsigned.apk`: **4,351,005 bytes**, `26,045` method refs, `classes.dex`, `debuggable = false`)
+
 

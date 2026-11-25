@@ -47,8 +47,8 @@ To enable Google Sign-In and Drive cloud backup in your build of Private Vault V
 6. Under **Test Users**, click **Add Users** and add your own Google email address (the account you will use on your test Android device).
 7. Click **Save and Continue** and complete the consent screen configuration.
 
-### Step 4: Create OAuth 2.0 Client IDs
-Private Vault uses Google Play Services Auth. You will create two client IDs:
+### Step 4: Configure OAuth 2.0 Client IDs
+Private Vault uses **AndroidX Credential Manager** (`GetSignInWithGoogleOption` / `GoogleIdTokenCredential`) for Google identity selection and **Google Identity Services `AuthorizationClient`** (`Identity.getAuthorizationClient`) for `drive.appdata` OAuth consent. You will configure two OAuth client IDs in Google Cloud Console:
 
 #### A. Web Client ID (Required in code)
 1. Go to **APIs & Services** > **Credentials**.

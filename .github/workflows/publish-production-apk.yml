@@ -79,8 +79,9 @@ jobs:
 
           BUILD_TOOLS_DIR=$(find "${ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
           APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
-          if [ ! -x "$APKSIGNER" ]; then
-            echo "::error::apksigner not found in Android SDK build-tools."
+          AAPT2="${BUILD_TOOLS_DIR}/aapt2"
+          if [ ! -x "$APKSIGNER" ] || [ ! -x "$AAPT2" ]; then
+            echo "::error::apksigner or aapt2 not found in Android SDK build-tools ($BUILD_TOOLS_DIR)."
             exit 1
           fi
 
@@ -116,17 +117,32 @@ jobs:
             exit 1
           fi
 
+          BADGING_OUT=$("$AAPT2" dump badging release_artifacts/private-vault.apk)
+          if ! echo "$BADGING_OUT" | grep -q "package: name='${APP_ID}' versionCode='${VERSION_CODE}' versionName='${VERSION_NAME}'"; then
+            echo "::error::aapt2 package metadata mismatch in compiled APK."
+            echo "$BADGING_OUT" | head -n 5
+            exit 1
+          fi
+
+          MANIFEST_XML_DUMP=$("$AAPT2" dump xmltree --file AndroidManifest.xml release_artifacts/private-vault.apk)
+          if echo "$MANIFEST_XML_DUMP" | grep -E -q "debuggable.*=true|debuggable.*\(0xffffffff\)|android:debuggable\(0x0101000f\)=true"; then
+            echo "::error::Release APK must NOT have android:debuggable=true."
+            exit 1
+          fi
+
           APKANALYZER=$(find "${ANDROID_HOME}/cmdline-tools" -name "apkanalyzer" -type f 2>/dev/null | head -n 1 || true)
           if [ -n "$APKANALYZER" ] && [ -x "$APKANALYZER" ]; then
             ANALYZER_APP_ID=$("$APKANALYZER" manifest application-id release_artifacts/private-vault.apk)
             ANALYZER_VCODE=$("$APKANALYZER" manifest version-code release_artifacts/private-vault.apk)
             ANALYZER_VNAME=$("$APKANALYZER" manifest version-name release_artifacts/private-vault.apk)
-            if [ "$ANALYZER_APP_ID" != "com.tpeditz.privatevault.v2" ] || [ "$ANALYZER_VCODE" != "$VERSION_CODE" ] || [ "$ANALYZER_VNAME" != "$VERSION_NAME" ]; then
-              echo "::error::Compiled APK metadata mismatch ($ANALYZER_APP_ID / $ANALYZER_VCODE / $ANALYZER_VNAME)."
+            ANALYZER_DEBUGGABLE=$("$APKANALYZER" manifest debuggable release_artifacts/private-vault.apk)
+            if [ "$ANALYZER_APP_ID" != "$APP_ID" ] || [ "$ANALYZER_VCODE" != "$VERSION_CODE" ] || [ "$ANALYZER_VNAME" != "$VERSION_NAME" ] || [ "$ANALYZER_DEBUGGABLE" != "false" ]; then
+              echo "::error::Compiled APK metadata/debuggable mismatch ($ANALYZER_APP_ID / $ANALYZER_VCODE / $ANALYZER_VNAME / debuggable=$ANALYZER_DEBUGGABLE)."
               exit 1
             fi
           fi
 
+          echo "apksigner_path=${APKSIGNER}" >> "$GITHUB_OUTPUT"
           TAG_NAME="v${VERSION_NAME}"
           echo "app_id=${APP_ID}" >> "$GITHUB_OUTPUT"
           echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
@@ -135,19 +151,30 @@ jobs:
 
       - name: Enforce Monotonic OTA Version & Generate update.json
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION_CODE: ${{ steps.verify_apk.outputs.version_code }}
           VERSION_NAME: ${{ steps.verify_apk.outputs.version_name }}
           TAG_NAME: ${{ steps.verify_apk.outputs.tag_name }}
           RELEASE_NOTES: ${{ inputs.release_notes }}
         run: |
           if [ "${{ inputs.mode }}" = "publish" ]; then
-            HTTP_CODE=$(curl -s -o /tmp/current_update.json -w "%{http_code}" -L "https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/update.json" || true)
+            HTTP_CODE=$(curl -sS -o /tmp/current_update.json -w "%{http_code}" -L "https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/update.json" || echo "000")
             if [ "$HTTP_CODE" = "200" ]; then
               PREV_CODE=$(python3 -c "import json; print(json.load(open('/tmp/current_update.json'))['versionCode'])")
               if [ "$VERSION_CODE" -le "$PREV_CODE" ]; then
                 echo "::error::Publish aborted: new versionCode (${VERSION_CODE}) must be strictly greater than currently published versionCode (${PREV_CODE}). Bump versionCode/versionName in app/build.gradle.kts first."
                 exit 1
               fi
+            elif [ "$HTTP_CODE" = "404" ]; then
+              EXISTING_RELEASES=$(gh release list --limit 1 --json tagName --jq 'length')
+              if [ "${EXISTING_RELEASES:-0}" -gt 0 ]; then
+                echo "::error::Published releases exist, yet latest/download/update.json returned HTTP 404. Check existing release assets before publishing."
+                exit 1
+              fi
+              echo "No prior GitHub Releases found; allowing initial release publish."
+            else
+              echo "::error::Failed to verify current published OTA version (HTTP ${HTTP_CODE}). Aborting publish rather than risking a downgrade."
+              exit 1
             fi
           fi
 
@@ -170,7 +197,7 @@ jobs:
             release_artifacts/update.json
           retention-days: 30
 
-      - name: Publish GitHub Release
+      - name: Stage Draft GitHub Release & Promote
         if: ${{ inputs.mode == 'publish' }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -186,23 +213,47 @@ jobs:
           gh release create "$TAG_NAME" \
             release_artifacts/private-vault.apk \
             release_artifacts/update.json \
+            --draft \
             --title "Private Vault ${VERSION_NAME}" \
             --notes "$RELEASE_NOTES"
 
+          ASSET_COUNT=$(gh release view "$TAG_NAME" --json assets --jq '.assets | map(select(.name == "private-vault.apk" or .name == "update.json")) | length')
+          if [ "$ASSET_COUNT" != "2" ]; then
+            echo "::error::Draft release ${TAG_NAME} missing expected assets (found ${ASSET_COUNT}); leaving as draft."
+            exit 1
+          fi
+
+          gh release edit "$TAG_NAME" --draft=false
+
       - name: Verify Published OTA Endpoints
         if: ${{ inputs.mode == 'publish' }}
+        env:
+          APKSIGNER: ${{ steps.verify_apk.outputs.apksigner_path }}
         run: |
-          sleep 3
+          sleep 5
           curl -fsSL "https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/update.json" -o /tmp/live_update.json
-          curl -fsSLI "https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/private-vault.apk" >/dev/null
+          curl -fsSL "https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/private-vault.apk" -o /tmp/live_private-vault.apk
           python3 - <<'PY'
-          import json
+          import hashlib, json
+          from pathlib import Path
+
           staged = json.load(open("release_artifacts/update.json"))
           live = json.load(open("/tmp/live_update.json"))
           assert staged["sha256"] == live["sha256"], "Published update.json SHA-256 mismatch"
           assert staged["versionCode"] == live["versionCode"], "Published update.json versionCode mismatch"
-          print("Verified live update.json and private-vault.apk endpoints.")
+
+          apk_bytes = Path("/tmp/live_private-vault.apk").read_bytes()
+          actual_sha256 = hashlib.sha256(apk_bytes).hexdigest().lower()
+          assert len(apk_bytes) == live["sizeBytes"], f"Live APK size mismatch: {len(apk_bytes)} vs {live['sizeBytes']}"
+          assert actual_sha256 == live["sha256"], f"Live APK SHA-256 mismatch: {actual_sha256} vs {live['sha256']}"
+          print("Verified live update.json and full private-vault.apk download bytes/SHA-256.")
           PY
+
+          LIVE_VERIFY=$("$APKSIGNER" verify --verbose --print-certs /tmp/live_private-vault.apk)
+          if ! echo "$LIVE_VERIFY" | tr '[:upper:]' '[:lower:]' | grep -q "3beeff138b716168b2f166983d42496b9d24f629b75ee25bdafd16676f06a770"; then
+            echo "::error::Downloaded live APK certificate pin check failed."
+            exit 1
+          fi
 
       - name: Securely Shred Temporary Keystore
         if: always()

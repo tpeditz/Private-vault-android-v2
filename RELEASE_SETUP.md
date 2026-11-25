@@ -68,8 +68,24 @@ Before publishing, the workflow automatically refuses to proceed if any check fa
 - The signed APK (`private-vault.apk`) is verified using `apksigner` and checked against your permanent official signing certificate fingerprints:
   - **SHA-1:** `32:19:54:C3:81:B4:A7:9D:76:B8:90:FF:05:A3:18:D0:21:FB:AD:FC`
   - **SHA-256:** `3B:EE:FF:13:8B:71:61:68:B2:F1:66:98:3D:42:49:6B:9D:24:F6:29:B7:5E:E2:5B:DA:FD:16:67:6F:06:A7:70`
-- Package metadata is checked using `apkanalyzer` (`com.tpeditz.privatevault.v2`, exact `versionCode`, and `versionName`).
+- **APK Build & Signature Checks:** `apksigner` verifies both the permanent SHA-1 (`32:19:54:...`) and SHA-256 (`3B:EE:FF:...`) release signing certificates.
+- **Metadata & Non-Debuggable Enforcement:** `aapt2` and `apkanalyzer` unconditionally verify `applicationId = com.tpeditz.privatevault.v2`, exact `versionCode`/`versionName`, and **`debuggable == false`**.
+- **Monotonic Release Guard:** Distinguishes initial `404` (when zero GitHub Releases exist) from API/network errors, refusing to publish if `versionCode` is not strictly higher than the currently live release.
+- **Draft-Staged Promotion & Live Verification:** Uploads `private-vault.apk` and `update.json` to a draft release first, verifies both assets exist, promotes the release publicly, downloads the live full APK + `update.json`, and verifies exact byte length, SHA-256, and `apksigner` certificate pinning.
 - Your temporary decoded keystore file is wiped cleanly from the runner before the job ends (`if: always()`).
+
+> [!NOTE]
+> **Play Store vs. GitHub Direct OTA Notice:** Self-updating `REQUEST_INSTALL_PACKAGES` OTA behavior applies strictly to direct APK distribution via GitHub Releases (`tpeditz/Private-vault-android-v2`). Any future Google Play Store track must ship a Play flavor omitting `REQUEST_INSTALL_PACKAGES` and GitHub self-update prompts per Google Play policies.
+
+### Ready-to-Paste V2.0.1 Release Notes
+```text
+Private Vault 2.0.1
+- Crash-safe backup & restore hardening with fail-closed recovery and friendly retry dialogs
+- 12+ character passphrase guidance for new passwords (full backward compatibility kept for existing vaults and backups)
+- Upgraded Google Drive sign-in (Credential Manager + AuthorizationClient) and safer automatic snapshot staging
+- Stricter Autofill domain/app matching with manual vault picker fallback
+- Share-to-Vault support for saving text/links, smoother OTA permission resume flow, and 31% smaller release APK
+```
 
 ---
 

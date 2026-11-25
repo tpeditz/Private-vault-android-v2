@@ -46,6 +46,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.tpeditz.privatevault.v2.security.OfflinePasswordStrengthEstimator
+import com.tpeditz.privatevault.v2.security.PasswordPolicy
 
 @Composable
 fun SetupVaultScreen(
@@ -163,7 +164,19 @@ fun SetupVaultScreen(
                             else -> MaterialTheme.colorScheme.primary
                         }
                     )
+                    Text(
+                        text = "${password.length}/12+ chars",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (password.length >= PasswordPolicy.MIN_NEW_PASSWORD_LENGTH) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
+            } else {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Use 12+ characters (14+ or a passphrase with spaces recommended).",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
 
             Spacer(modifier = Modifier.height(14.dp))
@@ -193,22 +206,21 @@ fun SetupVaultScreen(
 
             Button(
                 onClick = {
-                    if (password.length < 6) {
-                        errorMessage = "Password should be at least 6 characters"
-                    } else if (password != confirmPassword) {
-                        errorMessage = "Passwords do not match"
+                    val policy = PasswordPolicy.validateNewPassword(password, confirmPassword, "Master password")
+                    if (!policy.isValid) {
+                        errorMessage = policy.errorMessage
                     } else {
                         val chars = password.toCharArray()
                         if (pendingRestorePayload != null) {
                             onCreateVaultWithRestore(chars) { success, err ->
                                 if (!success) {
-                                    errorMessage = err ?: "Failed to restore backup"
+                                    errorMessage = err ?: "Could not initialize vault and restore backup."
                                 }
                             }
                         } else {
                             onCreateVault(chars) { success, err ->
                                 if (!success) {
-                                    errorMessage = err ?: "Failed to initialize vault"
+                                    errorMessage = err ?: "Could not initialize vault."
                                 }
                             }
                         }

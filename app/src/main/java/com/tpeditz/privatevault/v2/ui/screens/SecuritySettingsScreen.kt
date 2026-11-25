@@ -45,6 +45,8 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import com.tpeditz.privatevault.v2.security.OfflinePasswordStrengthEstimator
+import com.tpeditz.privatevault.v2.security.PasswordPolicy
 import com.tpeditz.privatevault.v2.ui.VaultUiState
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
@@ -381,17 +383,20 @@ fun SecuritySettingsScreen(
                 }
             },
             confirmButton = {
-                Button(
+                    Button(
                     onClick = {
-                        if (primaryPwdForDecoy.isEmpty() || decoyPwd.isEmpty()) {
-                            decoyError = "Fields cannot be empty"
-                        } else if (decoyPwd != confirmDecoyPwd) {
-                            decoyError = "Decoy passwords do not match"
-                        } else if (primaryPwdForDecoy == decoyPwd) {
-                            decoyError = "Decoy password must differ from primary password"
+                        if (primaryPwdForDecoy.isEmpty()) {
+                            decoyError = "Enter your current primary vault password."
                         } else {
-                            onProvisionDecoy(primaryPwdForDecoy.toCharArray(), decoyPwd.toCharArray())
-                            showDecoyDialog = false
+                            val decoyValidation = PasswordPolicy.validateNewPassword(decoyPwd, confirmDecoyPwd, "Decoy password")
+                            if (!decoyValidation.isValid) {
+                                decoyError = decoyValidation.errorMessage
+                            } else if (primaryPwdForDecoy == decoyPwd) {
+                                decoyError = "Decoy password must differ from primary password"
+                            } else {
+                                onProvisionDecoy(primaryPwdForDecoy.toCharArray(), decoyPwd.toCharArray())
+                                showDecoyDialog = false
+                            }
                         }
                     }
                 ) {
@@ -467,6 +472,14 @@ fun SecuritySettingsScreen(
                         value = newMasterPwd,
                         onValueChange = { newMasterPwd = it; changePwdError = null },
                         label = { Text("New Master Password") },
+                        supportingText = {
+                            if (newMasterPwd.isNotBlank()) {
+                                val report = OfflinePasswordStrengthEstimator.evaluate(newMasterPwd)
+                                Text("Strength: ${report.band.label} (${newMasterPwd.length}/12+ chars)")
+                            } else {
+                                Text("12+ characters recommended (spaces allowed)")
+                            }
+                        },
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier.fillMaxWidth()
@@ -485,20 +498,23 @@ fun SecuritySettingsScreen(
                 }
             },
             confirmButton = {
-                Button(
+                    Button(
                     onClick = {
-                        if (currentMasterPwd.isEmpty() || newMasterPwd.isEmpty()) {
-                            changePwdError = "Passwords cannot be empty"
-                        } else if (newMasterPwd != confirmNewMasterPwd) {
-                            changePwdError = "New passwords do not match"
-                        } else if (currentMasterPwd == newMasterPwd) {
-                            changePwdError = "New password must be different"
+                        if (currentMasterPwd.isEmpty()) {
+                            changePwdError = "Enter your current password."
                         } else {
-                            onChangeMasterPassword(currentMasterPwd.toCharArray(), newMasterPwd.toCharArray()) { success, err ->
-                                if (success) {
-                                    showChangePasswordDialog = false
-                                } else {
-                                    changePwdError = err ?: "Incorrect current password"
+                            val validation = PasswordPolicy.validateNewPassword(newMasterPwd, confirmNewMasterPwd, "New master password")
+                            if (!validation.isValid) {
+                                changePwdError = validation.errorMessage
+                            } else if (currentMasterPwd == newMasterPwd) {
+                                changePwdError = "New password must be different."
+                            } else {
+                                onChangeMasterPassword(currentMasterPwd.toCharArray(), newMasterPwd.toCharArray()) { success, err ->
+                                    if (success) {
+                                        showChangePasswordDialog = false
+                                    } else {
+                                        changePwdError = err ?: "Incorrect current password."
+                                    }
                                 }
                             }
                         }

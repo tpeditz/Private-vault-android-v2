@@ -62,6 +62,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.tpeditz.privatevault.v2.data.CloudBackupFrequency
+import com.tpeditz.privatevault.v2.security.OfflinePasswordStrengthEstimator
+import com.tpeditz.privatevault.v2.security.PasswordPolicy
 import com.tpeditz.privatevault.v2.sync.GoogleDriveSyncManager
 import com.tpeditz.privatevault.v2.ui.VaultUiState
 import java.text.SimpleDateFormat
@@ -329,6 +331,25 @@ fun CloudBackupScreen(
                                     Text(nextText, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
                                 }
 
+                                if (uiState.isCloudRecoveryPasswordLegacyShort) {
+                                    Text(
+                                        "Your current automatic backup password is shorter than 12 characters. Existing schedules still work, or you can upgrade to a stronger 12+ character password below.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.secondary
+                                    )
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        autoPwd = ""
+                                        autoPwdConfirm = ""
+                                        autoSetupError = null
+                                        showAutoSetupDialog = true
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Change automatic backup password")
+                                }
+
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -464,6 +485,14 @@ fun CloudBackupScreen(
                         value = autoPwd,
                         onValueChange = { autoPwd = it; autoSetupError = null },
                         label = { Text("Backup Password") },
+                        supportingText = {
+                            if (autoPwd.isNotBlank()) {
+                                val report = OfflinePasswordStrengthEstimator.evaluate(autoPwd)
+                                Text("Strength: ${report.band.label} (${autoPwd.length}/12+ chars)")
+                            } else {
+                                Text("Use 12+ characters (14+ or passphrase with spaces recommended)")
+                            }
+                        },
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier.fillMaxWidth()
@@ -484,10 +513,9 @@ fun CloudBackupScreen(
             confirmButton = {
                 Button(
                     onClick = {
-                        if (autoPwd.length < 6) {
-                            autoSetupError = "Use at least 6 characters for your backup password."
-                        } else if (autoPwd != autoPwdConfirm) {
-                            autoSetupError = "Passwords do not match."
+                        val validation = PasswordPolicy.validateNewPassword(autoPwd, autoPwdConfirm, "Backup password")
+                        if (!validation.isValid) {
+                            autoSetupError = validation.errorMessage
                         } else {
                             val chars = autoPwd.toCharArray()
                             autoPwd = ""

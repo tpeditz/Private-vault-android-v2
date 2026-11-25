@@ -1,6 +1,6 @@
 # PRIVATE VAULT V2 - CRYPTOGRAPHIC SPECIFICATION & DATA FORMAT
 
-> **Product:** Private Vault V2 (`2.0.0`)  
+> **Product:** Private Vault V2 (`2.0.1`, Version Code `2`)  
 > **Application ID:** `com.tpeditz.privatevault.v2`  
 > **Developer:** Developed by Tp Editz (@Tp_Editz / @tp_ediitz)  
 > **Repository:** `tpeditz/Private-vault-android-v2`
@@ -21,6 +21,10 @@ All password-based key derivation in Private Vault V2 uses **Argon2id v1.3** (RF
 | **Parallelism ($p$)**| $2$ | $2$ | $[1 \dots 4]$ |
 | **Salt Length** | $16\text{ bytes}$ ($128\text{ bits}$) | $16\text{ bytes}$ | CSPRNG `SecureRandom` |
 | **Derived Key Length** | $32\text{ bytes}$ ($256\text{ bits}$) | $32\text{ bytes}$ | Single 256-bit AES Master KEK |
+
+### Password Strength & Legacy Compatibility Policy (`PasswordPolicy`)
+- **Minimum New Password Length:** All newly created vault master passwords, decoy passwords, password changes, local backup passwords, and automatic cloud recovery passwords require **12+ characters** (allowing spaces/passphrases and Unicode characters, with 14+ recommended).
+- **Zero-Breakage Legacy Support:** Pre-existing `2.0.0` vaults unlocked with shorter legacy passwords, existing `.pvault` backups encrypted with shorter passwords, and previously saved Keystore automatic cloud recovery passwords continue to unlock, restore, and run normally (with an optional upgrade option inside Cloud Backup Settings).
 
 ### Unicode NFC Normalization & Legacy Fallback
 - Standard derivation automatically normalizes passwords into Unicode **NFC** (Normalization Form Canonical Composition) prior to UTF-8 encoding.

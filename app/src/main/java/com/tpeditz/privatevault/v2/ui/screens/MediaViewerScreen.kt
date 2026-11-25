@@ -184,7 +184,7 @@ private fun PhotoViewerContent(
         try {
             photoBytes = viewModel.loadDecryptedPhotoBytes(mediaRecord)
         } catch (e: Exception) {
-            loadError = "Failed to decrypt photo: ${e.message}"
+            loadError = "Unable to open this encrypted photo. Check that the vault is unlocked and try again."
         }
     }
 
@@ -277,7 +277,7 @@ private fun VideoPlayerContent(
         try {
             dataSource = viewModel.openEncryptedVideoDataSource(mediaRecord)
         } catch (e: Exception) {
-            playerError = "Could not open encrypted video stream: ${e.message}"
+            playerError = "Unable to open this encrypted video. Check that the vault is unlocked and try again."
         }
     }
 

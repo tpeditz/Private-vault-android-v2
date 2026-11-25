@@ -59,6 +59,8 @@ import androidx.compose.ui.unit.dp
 import com.tpeditz.privatevault.v2.data.BackupExportScope
 import com.tpeditz.privatevault.v2.data.BackupPayload
 import com.tpeditz.privatevault.v2.data.RestoreMode
+import com.tpeditz.privatevault.v2.security.OfflinePasswordStrengthEstimator
+import com.tpeditz.privatevault.v2.security.PasswordPolicy
 import com.tpeditz.privatevault.v2.ui.VaultUiState
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -190,11 +192,19 @@ fun BackupRestoreScreen(
                                 exportError = null
                             },
                             label = { Text("Set Backup Password") },
+                            supportingText = {
+                                if (backupPassword.isNotBlank()) {
+                                    val report = OfflinePasswordStrengthEstimator.evaluate(backupPassword)
+                                    Text("Strength: ${report.band.label} (${backupPassword.length}/12+ chars)")
+                                } else {
+                                    Text("Use 12+ characters (14+ or a passphrase with spaces recommended)")
+                                }
+                            },
                             singleLine = true,
                             visualTransformation = if (isBackupPwdVisible) VisualTransformation.None else PasswordVisualTransformation(),
                             trailingIcon = {
                                 IconButton(onClick = { isBackupPwdVisible = !isBackupPwdVisible }) {
-                                    Icon(if (isBackupPwdVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility, contentDescription = null)
+                                    Icon(if (isBackupPwdVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility, contentDescription = "Toggle password visibility")
                                 }
                             },
                             modifier = Modifier.fillMaxWidth()
@@ -218,10 +228,9 @@ fun BackupRestoreScreen(
 
                         Button(
                             onClick = {
-                                if (backupPassword.isEmpty()) {
-                                    exportError = "Backup password cannot be empty"
-                                } else if (backupPassword != confirmBackupPassword) {
-                                    exportError = "Passwords do not match"
+                                val validation = PasswordPolicy.validateNewPassword(backupPassword, confirmBackupPassword, "Backup password")
+                                if (!validation.isValid) {
+                                    exportError = validation.errorMessage
                                 } else {
                                     onTriggerCreateBackupDocument(selectedScope, backupPassword.toCharArray())
                                 }

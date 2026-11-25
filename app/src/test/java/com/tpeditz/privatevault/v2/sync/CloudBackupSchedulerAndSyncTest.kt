@@ -100,4 +100,37 @@ class CloudBackupSchedulerAndSyncTest {
         assertTrue(err.isAuthError)
         assertFalse(err.message.isBlank())
     }
+
+    @Test
+    fun testImmutableSnapshotsDoNotOverwriteActiveUploadAndProtectPruneTarget() = runBlocking {
+        val stageDir = tempFolder.newFolder("immutable_snapshots")
+        val meta1 = CloudBackupScheduler.stageSnapshotToDir(stageDir, "user@example.test") { fos ->
+            fos.write("SNAPSHOT_PAYLOAD_ONE".toByteArray())
+        }
+        val acquired1 = CloudBackupScheduler.acquireLatestReadySnapshotFromDir(stageDir, "user@example.test")
+        requireNotNull(acquired1)
+        assertEquals(meta1.snapshotId, acquired1.meta.snapshotId)
+        assertTrue(acquired1.file.exists())
+
+        // While snapshot 1 is actively uploading, staging snapshot 2 must NOT delete snapshot 1!
+        val meta2 = CloudBackupScheduler.stageSnapshotToDir(stageDir, "user@example.test") { fos ->
+            fos.write("SNAPSHOT_PAYLOAD_TWO".toByteArray())
+        }
+        assertTrue(meta1.snapshotId != meta2.snapshotId)
+        assertTrue("Active uploading snapshot must remain intact", acquired1.file.exists())
+        assertTrue(
+            "Newly prepared snapshot must exist alongside active upload",
+            CloudBackupScheduler.snapshotFile(stageDir, meta2.snapshotId).exists()
+        )
+
+        // Finishing upload 1 deletes ONLY snapshot 1, preserving snapshot 2 for the next upload cycle
+        CloudBackupScheduler.completeUploadedSnapshotInDir(stageDir, meta1.snapshotId)
+        assertFalse(acquired1.file.exists())
+        assertTrue(CloudBackupScheduler.snapshotFile(stageDir, meta2.snapshotId).exists())
+
+        val acquired2 = CloudBackupScheduler.acquireLatestReadySnapshotFromDir(stageDir, "user@example.test")
+        requireNotNull(acquired2)
+        assertEquals(meta2.snapshotId, acquired2.meta.snapshotId)
+        CloudBackupScheduler.completeUploadedSnapshotInDir(stageDir, meta2.snapshotId)
+    }
 }

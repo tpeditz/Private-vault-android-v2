@@ -12,18 +12,23 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.biometric.BiometricPrompt
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
@@ -32,13 +37,14 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationRail
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -48,6 +54,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import java.io.File
 import java.io.FileInputStream
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -69,6 +76,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tpeditz.privatevault.v2.data.BackupExportScope
 import com.tpeditz.privatevault.v2.data.RestoreMode
 import com.tpeditz.privatevault.v2.security.BiometricKeystoreManager
+import com.tpeditz.privatevault.v2.security.OfflinePasswordStrengthEstimator
+import com.tpeditz.privatevault.v2.security.PasswordPolicy
 import com.tpeditz.privatevault.v2.sync.GoogleDriveAuthHelper
 import com.tpeditz.privatevault.v2.ui.PrimaryTab
 import com.tpeditz.privatevault.v2.ui.SecondaryDestination
@@ -134,12 +143,7 @@ class MainActivity : FragmentActivity() {
         )
 
         // Handle Share-In intent if present
-        if (intent?.action == Intent.ACTION_SEND && intent.type == "text/plain") {
-            val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty()
-            if (sharedText.isNotBlank()) {
-                // Staged for saving when vault unlocks
-            }
-        }
+        handleIncomingSendIntent(intent)
 
         setContent {
             val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -179,54 +183,111 @@ class MainActivity : FragmentActivity() {
                 }
             }
 
-            // SAF Launchers
+            // SAF Launchers & Dialog State
             var pendingBackupScope by remember { mutableStateOf<BackupExportScope?>(null) }
             var pendingBackupPassword by remember { mutableStateOf<CharArray?>(null) }
             var pendingRestorePassword by remember { mutableStateOf<CharArray?>(null) }
+            var lastRestoreBackupUri by remember { mutableStateOf<Uri?>(null) }
+            var lastRestoreCloudFile by remember { mutableStateOf<File?>(null) }
 
             var showFirstLaunchRestoreDialog by remember { mutableStateOf(false) }
             var firstLaunchRestorePassword by remember { mutableStateOf("") }
+            var showRetryRestorePasswordDialog by remember { mutableStateOf(false) }
+            var retryRestorePassword by remember { mutableStateOf("") }
             var showCloudBackupPasswordDialog by remember { mutableStateOf(false) }
             var cloudBackupPassword by remember { mutableStateOf("") }
+            var confirmCloudBackupPassword by remember { mutableStateOf("") }
             var showCloudRestorePasswordDialog by remember { mutableStateOf(false) }
             var cloudRestorePassword by remember { mutableStateOf("") }
             var pendingDownloadSnapFileId by remember { mutableStateOf<String?>(null) }
+            var pendingConnectedEmailForConsent by remember { mutableStateOf("") }
+
+            fun inspectLocalUriWithPassword(uri: Uri, passwordChars: CharArray) {
+                viewModel.grantFilePickerImmunity()
+                val ins = runCatching { contentResolver.openInputStream(uri) }.getOrNull()
+                if (ins != null) {
+                    viewModel.inspectBackupForRestore(ins, passwordChars) { _, _ ->
+                        java.util.Arrays.fill(passwordChars, '\u0000')
+                    }
+                } else {
+                    java.util.Arrays.fill(passwordChars, '\u0000')
+                    scope.launch {
+                        snackbarHostState.showSnackbar("Private Vault couldn't open that file. Choose the backup again.")
+                    }
+                }
+            }
+
+            fun inspectCloudFileWithPassword(file: File, passwordChars: CharArray) {
+                try {
+                    val ins = FileInputStream(file)
+                    viewModel.inspectBackupForRestore(ins, passwordChars) { payload, _ ->
+                        java.util.Arrays.fill(passwordChars, '\u0000')
+                        runCatching { ins.close() }
+                        if (payload != null) {
+                            runCatching { file.delete() }
+                            if (lastRestoreCloudFile == file) {
+                                lastRestoreCloudFile = null
+                            }
+                            viewModel.navigateToSecondary(SecondaryDestination.BackupAndRestore)
+                        }
+                    }
+                } catch (_: Exception) {
+                    java.util.Arrays.fill(passwordChars, '\u0000')
+                    scope.launch {
+                        snackbarHostState.showSnackbar("Private Vault couldn't open the downloaded backup.")
+                    }
+                }
+            }
 
             val createBackupLauncher = rememberLauncherForActivityResult(
                 contract = ActivityResultContracts.CreateDocument("application/octet-stream")
             ) { uri: Uri? ->
-                if (uri != null && pendingBackupScope != null && pendingBackupPassword != null) {
+                val activeScope = pendingBackupScope
+                val activePwd = pendingBackupPassword
+                pendingBackupScope = null
+                pendingBackupPassword = null
+                if (uri != null && activeScope != null && activePwd != null) {
                     viewModel.grantFilePickerImmunity()
-                    val os = contentResolver.openOutputStream(uri)
+                    val os = runCatching { contentResolver.openOutputStream(uri) }.getOrNull()
                     if (os != null) {
                         viewModel.exportStreamingBackup(
-                            scope = pendingBackupScope!!,
-                            passwordChars = pendingBackupPassword!!,
+                            scope = activeScope,
+                            passwordChars = activePwd,
                             outputStream = os,
                             onProgress = { _, _ -> },
                             onComplete = { success, err ->
+                                java.util.Arrays.fill(activePwd, '\u0000')
                                 scope.launch {
-                                    snackbarHostState.showSnackbar(if (success) "Backup saved successfully" else "Backup failed: $err")
+                                    snackbarHostState.showSnackbar(
+                                        if (success) "Backup saved successfully"
+                                        else err ?: "Could not create backup."
+                                    )
                                 }
                             }
                         )
+                    } else {
+                        java.util.Arrays.fill(activePwd, '\u0000')
+                        scope.launch {
+                            snackbarHostState.showSnackbar("Private Vault couldn't write to the chosen file.")
+                        }
                     }
+                } else if (activePwd != null) {
+                    java.util.Arrays.fill(activePwd, '\u0000')
                 }
             }
 
             val openBackupLauncher = rememberLauncherForActivityResult(
                 contract = ActivityResultContracts.OpenDocument()
             ) { uri: Uri? ->
-                if (uri != null && pendingRestorePassword != null) {
-                    viewModel.grantFilePickerImmunity()
-                    val ins = contentResolver.openInputStream(uri)
-                    if (ins != null) {
-                        viewModel.inspectBackupForRestore(ins, pendingRestorePassword!!) { payload, err ->
-                            if (payload == null) {
-                                scope.launch { snackbarHostState.showSnackbar("Restore error: $err") }
-                            }
-                        }
-                    }
+                val activePwd = pendingRestorePassword
+                pendingRestorePassword = null
+                if (uri != null && activePwd != null) {
+                    lastRestoreCloudFile?.let { runCatching { it.delete() } }
+                    lastRestoreCloudFile = null
+                    lastRestoreBackupUri = uri
+                    inspectLocalUriWithPassword(uri, activePwd)
+                } else if (activePwd != null) {
+                    java.util.Arrays.fill(activePwd, '\u0000')
                 }
             }
 
@@ -274,23 +335,22 @@ class MainActivity : FragmentActivity() {
                 }
             }
 
-            val googleSignInLauncher = rememberLauncherForActivityResult(
-                contract = ActivityResultContracts.StartActivityForResult()
+            val driveConsentLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.StartIntentSenderForResult()
             ) { result ->
-                val accountResult = GoogleDriveAuthHelper.parseSignInResult(result.data)
-                accountResult.onSuccess { account ->
-                    val email = account.email.orEmpty()
-                    viewModel.onGoogleAccountConnected(email)
-                    scope.launch {
-                        snackbarHostState.showSnackbar(
-                            if (email.isNotBlank()) "Connected Google account: $email"
-                            else "Connected Google account"
-                        )
+                val resolvedEmail = pendingConnectedEmailForConsent.ifBlank { uiState.connectedGoogleEmail }
+                when (val authState = GoogleDriveAuthHelper.parseAuthorizationConsentResult(this@MainActivity, result.data, resolvedEmail)) {
+                    is GoogleDriveAuthHelper.DriveAuthState.Authorized -> {
+                        scope.launch {
+                            snackbarHostState.showSnackbar("Google Drive access connected")
+                        }
                     }
-                }.onFailure { err ->
-                    scope.launch {
-                        snackbarHostState.showSnackbar("Google Sign-In: ${err.message}")
+                    is GoogleDriveAuthHelper.DriveAuthState.Failed -> {
+                        scope.launch {
+                            snackbarHostState.showSnackbar(authState.userMessage)
+                        }
                     }
+                    is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent -> Unit
                 }
             }
 
@@ -504,6 +564,11 @@ class MainActivity : FragmentActivity() {
                                         )
                                     }
                                     is SecondaryDestination.CloudBackup -> {
+                                        val consentCallback: (android.app.PendingIntent) -> Unit = { pi ->
+                                            viewModel.grantFilePickerImmunity()
+                                            pendingConnectedEmailForConsent = uiState.connectedGoogleEmail
+                                            driveConsentLauncher.launch(IntentSenderRequest.Builder(pi).build())
+                                        }
                                         CloudBackupScreen(
                                             uiState = uiState,
                                             isDriveConfigured = GoogleDriveAuthHelper.isGoogleDriveConfigured(),
@@ -514,8 +579,35 @@ class MainActivity : FragmentActivity() {
                                                     }
                                                 } else {
                                                     viewModel.grantFilePickerImmunity()
-                                                    val signInIntent = GoogleDriveAuthHelper.getClient(this@MainActivity).signInIntent
-                                                    googleSignInLauncher.launch(signInIntent)
+                                                    scope.launch {
+                                                        val signInRes = GoogleDriveAuthHelper.signInWithCredentialManager(this@MainActivity)
+                                                        signInRes.onSuccess { email ->
+                                                            pendingConnectedEmailForConsent = email
+                                                            viewModel.onGoogleAccountConnected(email)
+                                                            viewModel.authorizeGoogleDrive(email) { authState ->
+                                                                when (authState) {
+                                                                    is GoogleDriveAuthHelper.DriveAuthState.Authorized -> {
+                                                                        scope.launch {
+                                                                            snackbarHostState.showSnackbar("Connected Google account: $email")
+                                                                        }
+                                                                    }
+                                                                    is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent -> {
+                                                                        viewModel.grantFilePickerImmunity()
+                                                                        driveConsentLauncher.launch(IntentSenderRequest.Builder(authState.pendingIntent).build())
+                                                                    }
+                                                                    is GoogleDriveAuthHelper.DriveAuthState.Failed -> {
+                                                                        scope.launch {
+                                                                            snackbarHostState.showSnackbar(authState.userMessage)
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }.onFailure { err ->
+                                                            scope.launch {
+                                                                snackbarHostState.showSnackbar(err.message ?: "Google Sign-In failed.")
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             },
                                             onDisconnectGoogle = {
@@ -523,28 +615,36 @@ class MainActivity : FragmentActivity() {
                                                     scope.launch {
                                                         snackbarHostState.showSnackbar(
                                                             if (ok) "Disconnected Google Drive"
-                                                            else "Disconnect failed: $err"
+                                                            else err ?: "Could not disconnect Google Drive"
                                                         )
                                                     }
                                                 }
                                             },
                                             onUploadCloudBackup = { pwdChars ->
                                                 if (pwdChars != null && pwdChars.isNotEmpty()) {
-                                                    viewModel.uploadCloudBackup(pwdChars) { success, err ->
+                                                    viewModel.uploadCloudBackup(
+                                                        backupPasswordChars = pwdChars,
+                                                        onConsentRequired = consentCallback
+                                                    ) { success, err ->
                                                         scope.launch {
                                                             snackbarHostState.showSnackbar(
                                                                 if (success) "Cloud backup uploaded successfully"
-                                                                else "Cloud upload failed: $err"
+                                                                else err ?: "Could not upload cloud backup."
                                                             )
                                                         }
                                                     }
                                                 } else {
                                                     cloudBackupPassword = ""
+                                                    confirmCloudBackupPassword = ""
                                                     showCloudBackupPasswordDialog = true
                                                 }
                                             },
                                             onConfigureAutoBackup = { enabled, recoveryPwd ->
-                                                viewModel.configureAutomaticCloudBackup(enabled, recoveryPwd) { ok, err ->
+                                                viewModel.configureAutomaticCloudBackup(
+                                                    enabled = enabled,
+                                                    recoveryPasswordChars = recoveryPwd,
+                                                    onConsentRequired = consentCallback
+                                                ) { ok, err ->
                                                     scope.launch {
                                                         val msg = when {
                                                             ok && enabled -> "Automatic backup enabled"
@@ -558,7 +658,7 @@ class MainActivity : FragmentActivity() {
                                             onSetCloudFrequency = { viewModel.setCloudBackupFrequency(it) },
                                             onSetCloudWifiOnly = { viewModel.setCloudBackupWifiOnly(it) },
                                             onQuerySnapshots = { callback ->
-                                                viewModel.queryCloudSnapshots { list, err ->
+                                                viewModel.queryCloudSnapshots(onConsentRequired = consentCallback) { list, err ->
                                                     callback(list, err)
                                                 }
                                             },
@@ -752,20 +852,45 @@ class MainActivity : FragmentActivity() {
 
                         if (showCloudBackupPasswordDialog) {
                             var cloudPwdError by remember { mutableStateOf<String?>(null) }
+                            val strengthReport = remember(cloudBackupPassword) {
+                                if (cloudBackupPassword.isNotEmpty()) OfflinePasswordStrengthEstimator.evaluate(cloudBackupPassword) else null
+                            }
                             AlertDialog(
-                                onDismissRequest = { showCloudBackupPasswordDialog = false },
+                                onDismissRequest = {
+                                    cloudBackupPassword = ""
+                                    confirmCloudBackupPassword = ""
+                                    showCloudBackupPasswordDialog = false
+                                },
                                 title = { Text("Zero-Knowledge Cloud Backup") },
                                 text = {
-                                    androidx.compose.foundation.layout.Column(verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(10.dp)) {
-                                        Text("Set an encryption password for this cloud snapshot. You will need this password to restore from Google Drive:", style = MaterialTheme.typography.bodySmall)
+                                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                        Text(
+                                            "Set a strong password (at least ${PasswordPolicy.MIN_NEW_PASSWORD_LENGTH} characters) to encrypt this cloud snapshot. You will need it to restore from Google Drive.",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
                                         OutlinedTextField(
                                             value = cloudBackupPassword,
                                             onValueChange = { cloudBackupPassword = it; cloudPwdError = null },
-                                            label = { Text("Cloud Backup Password") },
+                                            label = { Text("Cloud Backup Password (${PasswordPolicy.MIN_NEW_PASSWORD_LENGTH}+ chars)") },
                                             singleLine = true,
                                             visualTransformation = PasswordVisualTransformation(),
                                             modifier = Modifier.fillMaxWidth()
                                         )
+                                        OutlinedTextField(
+                                            value = confirmCloudBackupPassword,
+                                            onValueChange = { confirmCloudBackupPassword = it; cloudPwdError = null },
+                                            label = { Text("Confirm Cloud Backup Password") },
+                                            singleLine = true,
+                                            visualTransformation = PasswordVisualTransformation(),
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                        if (strengthReport != null) {
+                                            Text(
+                                                "Strength: ${strengthReport.band.label} (${strengthReport.estimatedEntropyBits} bits)",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
                                         if (cloudPwdError != null) {
                                             Text(cloudPwdError!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                                         }
@@ -774,16 +899,32 @@ class MainActivity : FragmentActivity() {
                                 confirmButton = {
                                     Button(
                                         onClick = {
-                                            if (cloudBackupPassword.isEmpty()) {
-                                                cloudPwdError = "Password cannot be empty"
+                                            val validation = PasswordPolicy.validateNewPassword(
+                                                cloudBackupPassword,
+                                                confirmCloudBackupPassword,
+                                                "Cloud backup password"
+                                            )
+                                            if (!validation.isValid) {
+                                                cloudPwdError = validation.errorMessage
                                             } else {
                                                 val pwdChars = cloudBackupPassword.toCharArray()
                                                 cloudBackupPassword = ""
+                                                confirmCloudBackupPassword = ""
                                                 showCloudBackupPasswordDialog = false
-                                                viewModel.uploadCloudBackup(pwdChars) { success, err ->
+                                                viewModel.uploadCloudBackup(
+                                                    backupPasswordChars = pwdChars,
+                                                    onConsentRequired = { pi ->
+                                                        viewModel.grantFilePickerImmunity()
+                                                        pendingConnectedEmailForConsent = uiState.connectedGoogleEmail
+                                                        driveConsentLauncher.launch(IntentSenderRequest.Builder(pi).build())
+                                                    }
+                                                ) { success, err ->
                                                     java.util.Arrays.fill(pwdChars, '\u0000')
                                                     scope.launch {
-                                                        snackbarHostState.showSnackbar(if (success) "Cloud backup uploaded successfully" else "Cloud upload failed: $err")
+                                                        snackbarHostState.showSnackbar(
+                                                            if (success) "Cloud backup uploaded successfully"
+                                                            else err ?: "Could not upload cloud backup."
+                                                        )
                                                     }
                                                 }
                                             }
@@ -793,7 +934,13 @@ class MainActivity : FragmentActivity() {
                                     }
                                 },
                                 dismissButton = {
-                                    TextButton(onClick = { showCloudBackupPasswordDialog = false }) {
+                                    TextButton(
+                                        onClick = {
+                                            cloudBackupPassword = ""
+                                            confirmCloudBackupPassword = ""
+                                            showCloudBackupPasswordDialog = false
+                                        }
+                                    ) {
                                         Text("Cancel")
                                     }
                                 }
@@ -803,10 +950,13 @@ class MainActivity : FragmentActivity() {
                         if (showCloudRestorePasswordDialog) {
                             var restorePwdError by remember { mutableStateOf<String?>(null) }
                             AlertDialog(
-                                onDismissRequest = { showCloudRestorePasswordDialog = false },
+                                onDismissRequest = {
+                                    cloudRestorePassword = ""
+                                    showCloudRestorePasswordDialog = false
+                                },
                                 title = { Text("Restore Cloud Snapshot") },
                                 text = {
-                                    androidx.compose.foundation.layout.Column(verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(10.dp)) {
+                                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                                         Text("Enter the password that was used to encrypt this cloud snapshot:", style = MaterialTheme.typography.bodySmall)
                                         OutlinedTextField(
                                             value = cloudRestorePassword,
@@ -832,28 +982,22 @@ class MainActivity : FragmentActivity() {
                                                 cloudRestorePassword = ""
                                                 showCloudRestorePasswordDialog = false
                                                 scope.launch { snackbarHostState.showSnackbar("Downloading cloud snapshot...") }
-                                                viewModel.downloadCloudSnapshot(snapId) { file, err ->
+                                                viewModel.downloadCloudSnapshot(
+                                                    fileId = snapId,
+                                                    onConsentRequired = { pi ->
+                                                        viewModel.grantFilePickerImmunity()
+                                                        pendingConnectedEmailForConsent = uiState.connectedGoogleEmail
+                                                        driveConsentLauncher.launch(IntentSenderRequest.Builder(pi).build())
+                                                    }
+                                                ) { file, err ->
                                                     if (file != null) {
-                                                        try {
-                                                            val ins = FileInputStream(file)
-                                                            viewModel.inspectBackupForRestore(ins, pwd) { payload, inspectErr ->
-                                                                java.util.Arrays.fill(pwd, '\u0000')
-                                                                runCatching { ins.close() }
-                                                                runCatching { file.delete() }
-                                                                if (payload != null) {
-                                                                    viewModel.navigateToSecondary(SecondaryDestination.BackupAndRestore)
-                                                                } else {
-                                                                    scope.launch { snackbarHostState.showSnackbar("Failed to decrypt snapshot: $inspectErr") }
-                                                                }
-                                                            }
-                                                        } catch (e: Exception) {
-                                                            java.util.Arrays.fill(pwd, '\u0000')
-                                                            runCatching { file.delete() }
-                                                            scope.launch { snackbarHostState.showSnackbar("Failed to open snapshot: ${e.message}") }
-                                                        }
+                                                        lastRestoreCloudFile?.let { runCatching { it.delete() } }
+                                                        lastRestoreCloudFile = file
+                                                        lastRestoreBackupUri = null
+                                                        inspectCloudFileWithPassword(file, pwd)
                                                     } else {
                                                         java.util.Arrays.fill(pwd, '\u0000')
-                                                        scope.launch { snackbarHostState.showSnackbar("Download failed: $err") }
+                                                        scope.launch { snackbarHostState.showSnackbar(err ?: "Could not download backup.") }
                                                     }
                                                 }
                                             }
@@ -863,7 +1007,208 @@ class MainActivity : FragmentActivity() {
                                     }
                                 },
                                 dismissButton = {
-                                    TextButton(onClick = { showCloudRestorePasswordDialog = false }) {
+                                    TextButton(
+                                        onClick = {
+                                            cloudRestorePassword = ""
+                                            showCloudRestorePasswordDialog = false
+                                        }
+                                    ) {
+                                        Text("Cancel")
+                                    }
+                                }
+                            )
+                        }
+
+                        val friendlyRestoreError = uiState.pendingRestoreError
+                        if (friendlyRestoreError != null) {
+                            val canRetrySameSource = friendlyRestoreError.canRetryPassword &&
+                                (lastRestoreCloudFile != null || lastRestoreBackupUri != null)
+                            AlertDialog(
+                                onDismissRequest = {
+                                    viewModel.dismissRestoreError()
+                                },
+                                title = { Text(friendlyRestoreError.title) },
+                                text = { Text(friendlyRestoreError.message, style = MaterialTheme.typography.bodyMedium) },
+                                confirmButton = {
+                                    if (canRetrySameSource) {
+                                        Button(
+                                            onClick = {
+                                                viewModel.dismissRestoreError()
+                                                retryRestorePassword = ""
+                                                showRetryRestorePasswordDialog = true
+                                            }
+                                        ) {
+                                            Text("Try again")
+                                        }
+                                    } else {
+                                        Button(
+                                            onClick = {
+                                                viewModel.dismissRestoreError()
+                                                lastRestoreCloudFile?.let { runCatching { it.delete() } }
+                                                lastRestoreCloudFile = null
+                                            }
+                                        ) {
+                                            Text("OK")
+                                        }
+                                    }
+                                },
+                                dismissButton = {
+                                    if (canRetrySameSource) {
+                                        TextButton(
+                                            onClick = {
+                                                viewModel.dismissRestoreError()
+                                                lastRestoreCloudFile?.let { runCatching { it.delete() } }
+                                                lastRestoreCloudFile = null
+                                                lastRestoreBackupUri = null
+                                            }
+                                        ) {
+                                            Text(if (friendlyRestoreError.canChooseAnotherFile) "Choose another backup" else "Cancel")
+                                        }
+                                    }
+                                }
+                            )
+                        }
+
+                        if (showRetryRestorePasswordDialog) {
+                            var retryError by remember { mutableStateOf<String?>(null) }
+                            AlertDialog(
+                                onDismissRequest = {
+                                    retryRestorePassword = ""
+                                    showRetryRestorePasswordDialog = false
+                                },
+                                title = { Text("Enter Backup Password") },
+                                text = {
+                                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                        Text(
+                                            "Re-enter the password for the selected backup file:",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                        OutlinedTextField(
+                                            value = retryRestorePassword,
+                                            onValueChange = { retryRestorePassword = it; retryError = null },
+                                            label = { Text("Backup Password") },
+                                            singleLine = true,
+                                            visualTransformation = PasswordVisualTransformation(),
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                        if (retryError != null) {
+                                            Text(retryError!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                                        }
+                                    }
+                                },
+                                confirmButton = {
+                                    Button(
+                                        onClick = {
+                                            if (retryRestorePassword.isEmpty()) {
+                                                retryError = "Password cannot be empty."
+                                            } else {
+                                                val pwdChars = retryRestorePassword.toCharArray()
+                                                retryRestorePassword = ""
+                                                showRetryRestorePasswordDialog = false
+                                                val cloudFile = lastRestoreCloudFile
+                                                val localUri = lastRestoreBackupUri
+                                                when {
+                                                    cloudFile != null && cloudFile.exists() -> inspectCloudFileWithPassword(cloudFile, pwdChars)
+                                                    localUri != null -> inspectLocalUriWithPassword(localUri, pwdChars)
+                                                    else -> {
+                                                        java.util.Arrays.fill(pwdChars, '\u0000')
+                                                        scope.launch { snackbarHostState.showSnackbar("Choose the backup file again.") }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    ) {
+                                        Text("Unlock Backup")
+                                    }
+                                },
+                                dismissButton = {
+                                    TextButton(
+                                        onClick = {
+                                            retryRestorePassword = ""
+                                            showRetryRestorePasswordDialog = false
+                                        }
+                                    ) {
+                                        Text("Cancel")
+                                    }
+                                }
+                            )
+                        }
+
+                        val incomingShared = uiState.pendingSharedText
+                        if (uiState.isVaultInitialized && uiState.isUnlocked && incomingShared != null) {
+                            val trimmedShared = incomingShared.trim()
+                            val looksLikeUrl = remember(trimmedShared) {
+                                trimmedShared.startsWith("https://", ignoreCase = true) ||
+                                    trimmedShared.startsWith("http://", ignoreCase = true)
+                            }
+                            var saveAsLink by remember(incomingShared) { mutableStateOf(looksLikeUrl) }
+                            var shareTitle by remember(incomingShared) {
+                                mutableStateOf(
+                                    if (looksLikeUrl) {
+                                        runCatching { Uri.parse(trimmedShared).host }.getOrNull().orEmpty().ifBlank { "Shared Link" }
+                                    } else {
+                                        trimmedShared.lineSequence().firstOrNull { it.isNotBlank() }?.take(50) ?: "Shared Note"
+                                    }
+                                )
+                            }
+                            var shareContent by remember(incomingShared) { mutableStateOf(trimmedShared) }
+                            var shareError by remember { mutableStateOf<String?>(null) }
+
+                            AlertDialog(
+                                onDismissRequest = { viewModel.clearPendingSharedText() },
+                                title = { Text("Save to Private Vault") },
+                                text = {
+                                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            FilterChip(
+                                                selected = !saveAsLink,
+                                                onClick = { saveAsLink = false; shareError = null },
+                                                label = { Text("Note") }
+                                            )
+                                            FilterChip(
+                                                selected = saveAsLink,
+                                                onClick = { saveAsLink = true; shareError = null },
+                                                label = { Text("Secure Link") }
+                                            )
+                                        }
+                                        OutlinedTextField(
+                                            value = shareTitle,
+                                            onValueChange = { shareTitle = it; shareError = null },
+                                            label = { Text("Title") },
+                                            singleLine = true,
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                        OutlinedTextField(
+                                            value = shareContent,
+                                            onValueChange = { shareContent = it; shareError = null },
+                                            label = { Text(if (saveAsLink) "URL" else "Note Content") },
+                                            maxLines = 5,
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                        if (shareError != null) {
+                                            Text(shareError!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                                        }
+                                    }
+                                },
+                                confirmButton = {
+                                    Button(
+                                        onClick = {
+                                            if (saveAsLink) {
+                                                viewModel.saveSharedTextAsLink(shareTitle, shareContent) { ok, err ->
+                                                    if (!ok) shareError = err
+                                                }
+                                            } else {
+                                                viewModel.saveSharedTextAsNote(shareTitle, shareContent) { ok, err ->
+                                                    if (!ok) shareError = err
+                                                }
+                                            }
+                                        }
+                                    ) {
+                                        Text("Save")
+                                    }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { viewModel.clearPendingSharedText() }) {
                                         Text("Cancel")
                                     }
                                 }
@@ -871,6 +1216,21 @@ class MainActivity : FragmentActivity() {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingSendIntent(intent)
+    }
+
+    private fun handleIncomingSendIntent(intent: Intent?) {
+        if (intent?.action == Intent.ACTION_SEND && intent.type == "text/plain") {
+            val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty()
+            if (sharedText.isNotBlank()) {
+                viewModel.setPendingSharedText(sharedText)
             }
         }
     }

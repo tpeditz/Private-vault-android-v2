@@ -105,7 +105,7 @@ fun DocumentViewerScreen(
         try {
             decryptedBytes = viewModel.loadDecryptedDocumentBytes(document)
         } catch (e: Exception) {
-            loadError = "Failed to decrypt document: ${e.message}"
+            loadError = "Unable to open this encrypted document. Try unlocking your vault again."
         } finally {
             isLoading = false
         }
@@ -128,11 +128,11 @@ fun DocumentViewerScreen(
                         os.write(decryptedBytes!!)
                     }
                     withContext(Dispatchers.Main) {
-                        snackbarHostState.showSnackbar("Document exported successfully")
+                        snackbarHostState.showSnackbar("Document saved to chosen location (unencrypted copy)")
                     }
                 } catch (e: Exception) {
                     withContext(Dispatchers.Main) {
-                        snackbarHostState.showSnackbar("Export failed: ${e.message}")
+                        snackbarHostState.showSnackbar(com.tpeditz.privatevault.v2.ui.VaultErrorMapper.mapFileExportError(e))
                     }
                 }
             }
@@ -273,6 +273,11 @@ fun DocumentViewerScreen(
                 Spacer(modifier = Modifier.width(8.dp))
                 Text("Export Decrypted Document")
             }
+            Text(
+                text = "Note: Exported copies are unencrypted and saved outside Private Vault's protected storage.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
 
             // Content Preview Section
             Text(

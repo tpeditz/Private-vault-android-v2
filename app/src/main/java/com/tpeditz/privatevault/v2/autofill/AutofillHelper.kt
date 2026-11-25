@@ -7,15 +7,16 @@ import com.tpeditz.privatevault.v2.data.CredentialRecord
 import java.net.URI
 
 /**
- * API 24-safe helper for checking Android Autofill availability and performing strict
- * domain/package matching without exposing API 26-only service companion symbols.
+ * API 24-safe Autofill helper enforcing strict explicit site/app association rules.
+ *
+ * Security Model:
+ * - Never matches credentials using ambiguous `serviceName` labels or package-token splitting
+ *   (e.g., `com.fake.github` never automatically receives `https://github.com` credentials).
+ * - Web targets require an explicit `websiteUrl` matching the exact host or parent domain.
+ * - HTTPS-configured credentials are not auto-suggested on explicit `http://` pages.
+ * - Native Android app targets require explicit `android://<packageName>` or `<packageName>` in `websiteUrl`.
  */
 object AutofillHelper {
-
-    private val PACKAGE_NOISE_TOKENS = setOf(
-        "com", "org", "net", "io", "co", "app", "android", "mobile",
-        "client", "login", "auth", "lite", "pro", "free", "beta", "dev", "official", "v2"
-    )
 
     fun isAutofillServiceEnabled(context: Context): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
@@ -24,17 +25,21 @@ object AutofillHelper {
     }
 
     fun normalizeDomain(url: String): String {
-        if (url.isBlank()) return ""
+        val trimmed = url.trim()
+        if (trimmed.isBlank()) return ""
+        if (trimmed.startsWith("android://", ignoreCase = true)) return ""
         return try {
-            val fullUrl = if (!url.startsWith("http://") && !url.startsWith("https://")) {
-                "https://$url"
+            val fullUrl = if (!trimmed.startsWith("http://", ignoreCase = true) &&
+                !trimmed.startsWith("https://", ignoreCase = true)
+            ) {
+                "https://$trimmed"
             } else {
-                url
+                trimmed
             }
             val host = URI(fullUrl).host?.lowercase() ?: ""
             host.removePrefix("www.")
         } catch (_: Exception) {
-            url.trim().lowercase().removePrefix("www.")
+            trimmed.lowercase().removePrefix("www.")
         }
     }
 
@@ -49,42 +54,23 @@ object AutofillHelper {
     fun matchesTarget(
         cred: CredentialRecord,
         cleanTargetDomain: String,
-        packageName: String
+        packageName: String,
+        targetScheme: String? = null
     ): Boolean {
         val rawWeb = cred.websiteUrl.trim().lowercase()
-        val cleanWeb = normalizeDomain(cred.websiteUrl)
-        val cleanService = cred.serviceName.trim().lowercase()
         val cleanPkg = packageName.trim().lowercase()
 
         if (cleanTargetDomain.isNotBlank()) {
-            if (cleanWeb.isNotBlank()) {
-                return isHostOrSubdomainMatch(cleanTargetDomain, cleanWeb)
+            val cleanWeb = normalizeDomain(cred.websiteUrl)
+            if (cleanWeb.isBlank()) return false
+            // Do not auto-fill explicitly HTTPS credentials on explicit plaintext HTTP pages
+            if (targetScheme.equals("http", ignoreCase = true) && rawWeb.startsWith("https://")) {
+                return false
             }
-            if (cleanService.contains('.')) {
-                return isHostOrSubdomainMatch(cleanTargetDomain, normalizeDomain(cleanService))
-            }
-            if (cleanService.length >= 3) {
-                val hostLabels = cleanTargetDomain.split('.').dropLast(1)
-                return hostLabels.any { it == cleanService }
-            }
-            return false
+            return isHostOrSubdomainMatch(cleanTargetDomain, cleanWeb)
         }
 
         if (cleanPkg.isBlank()) return false
-        if (rawWeb == cleanPkg || rawWeb == "android://$cleanPkg" || cleanWeb == cleanPkg) {
-            return true
-        }
-        val pkgTokens = cleanPkg.split('.').filter { it.length >= 3 && it !in PACKAGE_NOISE_TOKENS }
-        if (pkgTokens.isEmpty()) return false
-
-        if (cleanWeb.isNotBlank()) {
-            val primaryWebLabel = cleanWeb.split('.').dropLast(1).firstOrNull { it.length >= 3 }
-            if (primaryWebLabel != null && pkgTokens.contains(primaryWebLabel)) {
-                return true
-            }
-            return false
-        }
-
-        return cleanService.length >= 3 && pkgTokens.contains(cleanService)
+        return rawWeb == "android://$cleanPkg" || rawWeb == cleanPkg
     }
 }

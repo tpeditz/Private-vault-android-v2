@@ -66,9 +66,15 @@ Before handing any downloaded APK to Android's `PackageInstaller`, `OtaUpdateMan
 
 1. **Trusted HTTPS Transport & Host Pinning:** Rejects HTTP, URL credentials, non-GitHub hosts, and redirect loops (> 3 hops on manifest / > 4 hops on download). Graceful handling of `404` before the first release is published (`"No Release Published Yet"`) and network errors.
 2. **File Length & SHA-256 Digest:** Verifies `sizeBytes` (if > 0) and exact SHA-256 match against `manifest.sha256`.
-3. **APK Signature (`ApkVerifier`):** Verifies Android v1/v2/v3 APK signatures and checks that the signer certificate SHA-256 matches both `manifest.signingCertSha256` and the trusted Private Vault certificate (plus installed signer certificates).
-4. **Package Metadata & Anti-Rollback:** Uses `PackageManager` archive parsing to verify `packageName == com.tpeditz.privatevault.v2`, `apkVersionCode == manifest.versionCode`, matching `versionName`, and `apkVersionCode > installedVersionCode`.
-5. **Install Permission (Android 8.0+):** Checks `canRequestPackageInstalls()` and guides the user cleanly via `Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES` if not yet permitted.
+3. **APK Signature (`ApkVerifier`):** Verifies Android v1/v2/v3 APK signatures and checks that the signer certificate SHA-256 matches both `manifest.signingCertSha256` and the trusted Private Vault certificate (plus installed signer certificates). Rejects oversized payloads (> 250 MiB) and any APK flagged with `ApplicationInfo.FLAG_DEBUGGABLE`.
+4. **Package Metadata & Anti-Rollback:** Uses `PackageManager` archive parsing to verify `packageName == com.tpeditz.privatevault.v2`, `apkVersionCode == manifest.versionCode`, matching `versionName`, and `apkVersionCode > installedVersionCode`, re-validating the candidate APK right before launching Android's installer.
+5. **Install Permission (Android 8.0+):** Checks `canRequestPackageInstalls()`, opens `Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES` when needed, and automatically re-verifies on `ON_RESUME` so users immediately land on **Ready to Install**.
+
+### V2.0.0 -> V2.0.1 OTA End-to-End Verification Checklist (Device)
+1. Install signed `2.0.0` (`versionCode = 1`) built from commit `b6b032cc`.
+2. Verify **App Updates** displays `No Release Published Yet` before publication.
+3. Run `.github/workflows/publish-production-apk.yml` in `test` mode first, inspect staged `private-vault.apk` and `update.json`, then publish `v2.0.1` (`versionCode = 2`) in `publish` mode.
+4. Tap **Check for Updates** in `2.0.0` -> verify `2.0.1` release notes appear -> download -> verify SHA-256 + `ApkVerifier` -> grant Unknown Sources if prompted -> confirm seamless install preserving existing encrypted vault records & media.
 
 ---
 

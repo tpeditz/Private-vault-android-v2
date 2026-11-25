@@ -78,16 +78,21 @@ data class VaultUiState(
     val cloudBackupFrequency: CloudBackupFrequency = CloudBackupFrequency.WEEKLY,
     val cloudBackupWifiOnly: Boolean = true,
     val autoCloudBackupKeyConfigured: Boolean = false,
+    val isCloudRecoveryPasswordLegacyShort: Boolean = false,
     val lastCloudBackupStatusMessage: String? = null,
     val lastCloudBackupEpochMs: Long = 0L,
 
     // OTA State
     val lastOtaCheckEpochMs: Long = 0L,
 
+    // Incoming Share-to-Vault State
+    val pendingSharedText: String? = null,
+
     // Dialogs and feedback
     val activeSnackbarMessage: String? = null,
     val activeErrorMessage: String? = null,
     val pendingRestorePayload: BackupPayload? = null,
+    val pendingRestoreError: VaultErrorMapper.FriendlyRestoreError? = null,
     val isLoading: Boolean = false,
     val backupProgressRatio: Float? = null,
     val backupStatusMessage: String? = null

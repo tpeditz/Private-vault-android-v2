@@ -1,9 +1,10 @@
 # PRIVATE VAULT V2 (Android)
 
 > **Zero-Knowledge, Offline-First Cryptographic Vault & Password Manager for Android**  
-> **Version:** `2.0.0` (Version Code: `1`)  
+> **Version:** `2.0.1` (Version Code: `2`)  
 > **Application ID:** `com.tpeditz.privatevault.v2`  
 > **Developed by:** **Tp Editz**  
+> **Official Website:** [https://tpeditz.github.io/Private-vault-android-v2/](https://tpeditz.github.io/Private-vault-android-v2/)  
 > **Official Contact:** Telegram [@Tp_Editz](https://t.me/Tp_Editz) | Instagram [@tp_ediitz](https://www.instagram.com/tp_ediitz/)  
 > **Official GitHub Repository:** [https://github.com/tpeditz/Private-vault-android-v2](https://github.com/tpeditz/Private-vault-android-v2) (Branch: `main`)
 
@@ -18,12 +19,13 @@
 - **Argon2id v1.3 (RFC 9106) Key Derivation:** Memory-hard password hashing (`32 MiB` standard / `16 MiB` constrained) via BouncyCastle, with Unicode NFC normalization and legacy fallback.
 - **Unified 72-Byte Key Envelopes (`PVE1`):** Slot 0 (Real Vault) and Slot 1 (Decoy Vault) share an identical 72-byte ciphertext footprint in SQLite with zero plaintext flags, guaranteeing plausible deniability.
 - **Streaming Media & Document Encryption (`PVM1` / `PVT1`):** Chunked 256 KiB AES-256-GCM encryption for photos, videos, thumbnails, and documents, with a custom seekable `MediaDataSource` that streams plaintext directly in memory.
-- **PVAULTB2 Streaming Backup & Crash-Safe Restore:** Supports up to 2 GiB containers with bounded streaming I/O, per-file SHA-256 + `thumbSha256` verification, file-first durable disk writes (`fd.sync()`), atomic Room transactions, and cross-slot crash recovery.
+- **PVAULTB2 Streaming Backup & Crash-Safe Restore:** Supports up to 2 GiB containers with bounded streaming I/O, per-file SHA-256 + `thumbSha256` verification, file-first durable disk writes (`fd.sync()`), atomic Room transactions, `vaultMutationMutex` serialization, fail-closed recovery journal rollback, and friendly retryable error UX (`VaultErrorMapper`).
+- **New Password Strength Policy (`PasswordPolicy`):** Enforces a 12-character minimum (with multi-word spaces and Unicode support) on newly created vault/master/backup/cloud passwords while keeping full backward compatibility for existing `<12`-character vaults, backups, and automatic cloud schedules.
 - **Legacy V1 Backward Compatibility:** `LegacyV1BackupReader` restores original `PVAULTB1` containers, legacy Unicode passwords, and embedded media payloads.
-- **Strict Android Autofill Service:** Native `AutofillService` with strict exact/subdomain host matching and noise-filtered package token matching (`AutofillHelper`), zero fallback to unrelated credentials, and API 24+ graceful handling.
-- **Encrypted Cloud Backup (Optional):** Zero-knowledge Google Drive `appDataFolder` sync (`multipart/related`), hardware AndroidKeyStore-protected recovery passwords (`AutoCloudBackupKeyStore`) for WorkManager scheduling, and plain-English controls.
-- **Local Authenticator (2FA TOTP) & Password Audit:** RFC 6238 / RFC 4226 TOTP engine with 30-second countdown, offline QR scanning, CSPRNG password/passphrase generator, and offline reuse/strength auditing.
-- **Cryptographic OTA Updates & CI/CD:** Checks `https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/update.json`, verifying SHA-256 checksums, version monotonicity, `ApkVerifier` v1/v2/v3 signing certificates, and automated signed releases via `.github/workflows/`.
+- **Strict Android Autofill Service:** Native `AutofillService` with strict exact/parent host matching, HTTPS/HTTP isolation, explicit `android://<packageName>` native app matching (`AutofillHelper`), neutral vault picker fallback when unassociated, and zero service-name or package-token guessing.
+- **Encrypted Cloud Backup (Optional):** Modern Credential Manager + GIS `AuthorizationClient` (`drive.appdata`), UUID-keyed immutable staged snapshots (`CloudBackupScheduler`), Keystore-protected recovery passwords (`AutoCloudBackupKeyStore`), and `multipart/related` Drive sync.
+- **Share-to-Vault (`ACTION_SEND`):** Receives shared text/URLs when unlocked to save cleanly as encrypted Notes or Secure Links.
+- **Cryptographic OTA Updates & CI/CD:** Checks `https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/update.json`, enforcing `FLAG_DEBUGGABLE == false`, SHA-256 checksums, version monotonicity, `ApkVerifier` v1/v2/v3 signing certificates, `ON_RESUME` Unknown Sources re-verification, and hardened draft-staged `.github/workflows/`.
 
 ---
 
@@ -101,7 +103,7 @@ Private-vault-android-v2/
 │       │   │       └── theme/
 │       │   └── res/
 │       ├── androidTest/java/com/tpeditz/privatevault/v2/  # Room, DataStore & Compose instrumentation tests
-│       └── test/java/com/tpeditz/privatevault/v2/         # 13 JVM unit & regression test suites (81 tests)
+│       └── test/java/com/tpeditz/privatevault/v2/         # 16 JVM unit & regression test suites (89 tests)
 ├── gradle/
 │   ├── libs.versions.toml
 │   └── wrapper/
@@ -119,7 +121,7 @@ Private-vault-android-v2/
 ## 4. Build & Verification Commands
 
 ```bash
-# Run all 13 unit & repository regression suites (81 tests)
+# Run all 16 unit & repository regression suites (89 tests)
 ./gradlew :app:testDebugUnitTest
 
 # Run Android Lint verification (0 errors)

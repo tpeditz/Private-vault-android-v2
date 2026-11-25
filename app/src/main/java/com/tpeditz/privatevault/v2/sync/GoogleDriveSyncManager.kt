@@ -166,7 +166,7 @@ class GoogleDriveSyncManager(
                 val uploadedMetadata = CloudBackupMetadata(newId, name, size, modTime)
 
                 // Clean older snapshots exceeding retention (keep latest 3, never delete before verified replacement)
-                pruneOldSnapshots(accessToken)
+                pruneOldSnapshots(accessToken, protectedFileId = newId)
 
                 SyncResult.Success(uploadedMetadata, "Cloud backup uploaded successfully.")
             }
@@ -254,7 +254,7 @@ class GoogleDriveSyncManager(
                 val modTime = parseRfc3339(respJson.optString("modifiedTime", ""))
 
                 val uploadedMetadata = CloudBackupMetadata(newId, name, size, modTime)
-                pruneOldSnapshots(accessToken)
+                runCatching { pruneOldSnapshots(accessToken, protectedFileId = newId) }
                 SyncResult.Success(uploadedMetadata, "Cloud backup uploaded successfully.")
             }
         } catch (e: Exception) {
@@ -325,12 +325,13 @@ class GoogleDriveSyncManager(
         }
     }
 
-    private suspend fun pruneOldSnapshots(accessToken: String) {
+    private suspend fun pruneOldSnapshots(accessToken: String, protectedFileId: String) {
         val queryRes = queryCloudBackups(accessToken)
         if (queryRes is SyncResult.Success) {
             val all = queryRes.data
             if (all.size > MAX_RETAINED_SNAPSHOTS) {
                 val toDelete = all.subList(MAX_RETAINED_SNAPSHOTS, all.size)
+                    .filter { it.fileId != protectedFileId }
                 for (oldFile in toDelete) {
                     deleteCloudBackup(accessToken, oldFile.fileId)
                 }

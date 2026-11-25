@@ -1,26 +1,43 @@
 package com.tpeditz.privatevault.v2.sync
 
+import android.accounts.Account
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import com.google.android.gms.auth.GoogleAuthUtil
-import com.google.android.gms.auth.api.signin.GoogleSignIn
-import com.google.android.gms.auth.api.signin.GoogleSignInAccount
-import com.google.android.gms.auth.api.signin.GoogleSignInClient
-import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import androidx.credentials.ClearCredentialStateRequest
+import androidx.credentials.CredentialManager
+import androidx.credentials.CustomCredential
+import androidx.credentials.GetCredentialRequest
+import androidx.credentials.exceptions.GetCredentialCancellationException
+import androidx.credentials.exceptions.GetCredentialException
+import androidx.credentials.exceptions.NoCredentialException
+import com.google.android.gms.auth.api.identity.AuthorizationRequest
+import com.google.android.gms.auth.api.identity.Identity
 import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.GoogleApiAvailability
 import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.common.api.Scope
 import com.google.android.gms.tasks.Tasks
+import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
+import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.tpeditz.privatevault.v2.BuildConfig
+import com.tpeditz.privatevault.v2.security.SafeVaultLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * Helper class for Google Sign-In and OAuth2 Token resolution for PRIVATE VAULT V2.
- * Uses minimal `drive.appdata` scope and public `GOOGLE_WEB_CLIENT_ID` from BuildConfig.
+ * Modern Google Identity & Drive Authorization helper for PRIVATE VAULT V2.0.1:
+ * - Authentication (account selection & identity) uses AndroidX Credential Manager (`GoogleIdTokenCredential`).
+ * - OAuth2 `drive.appdata` permission & token issuance uses Google Identity Services `AuthorizationClient`.
+ * - Account connection never unlocks the local vault and uses minimal `drive.appdata` scope only.
  */
 object GoogleDriveAuthHelper {
+
+    sealed interface DriveAuthState {
+        data class Authorized(val accessToken: String, val accountEmail: String) : DriveAuthState
+        data class NeedsConsent(val pendingIntent: PendingIntent) : DriveAuthState
+        data class Failed(val userMessage: String, val requiresReconnect: Boolean = false) : DriveAuthState
+    }
 
     fun isGoogleDriveConfigured(): Boolean {
         return BuildConfig.GOOGLE_WEB_CLIENT_ID.isNotBlank() &&
@@ -33,90 +50,113 @@ object GoogleDriveAuthHelper {
         }.getOrDefault(false)
     }
 
-    private fun getGoogleSignInOptions(): GoogleSignInOptions {
-        val builder = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-            .requestEmail()
-            .requestScopes(
-                Scope(GoogleDriveSyncManager.SCOPE_DRIVE_APPDATA)
-            )
-
-        if (isGoogleDriveConfigured()) {
-            builder.requestIdToken(BuildConfig.GOOGLE_WEB_CLIENT_ID)
+    suspend fun signInWithCredentialManager(activityContext: Context): Result<String> {
+        if (!isGoogleDriveConfigured()) {
+            return Result.failure(IllegalStateException("Google Drive backup is not enabled in this build."))
         }
-        return builder.build()
-    }
-
-    fun getClient(context: Context): GoogleSignInClient {
-        return GoogleSignIn.getClient(context, getGoogleSignInOptions())
-    }
-
-    fun getLastSignedInAccount(context: Context): GoogleSignInAccount? {
-        return runCatching { GoogleSignIn.getLastSignedInAccount(context) }.getOrNull()
-    }
-
-    fun hasPermissions(context: Context): Boolean {
-        val account = getLastSignedInAccount(context) ?: return false
-        val options = getGoogleSignInOptions()
-        return runCatching { GoogleSignIn.hasPermissions(account, *options.scopeArray) }.getOrDefault(false)
-    }
-
-    fun parseSignInResult(data: Intent?): Result<GoogleSignInAccount> {
+        if (!isPlayServicesAvailable(activityContext)) {
+            return Result.failure(IllegalStateException("Google Play Services is unavailable on this device."))
+        }
         return try {
-            val task = GoogleSignIn.getSignedInAccountFromIntent(data)
-            val account = task.getResult(ApiException::class.java)
-            if (account != null) {
-                Result.success(account)
+            val option = GetSignInWithGoogleOption.Builder(BuildConfig.GOOGLE_WEB_CLIENT_ID).build()
+            val request = GetCredentialRequest.Builder()
+                .addCredentialOption(option)
+                .build()
+            val credentialManager = CredentialManager.create(activityContext)
+            val result = credentialManager.getCredential(activityContext, request)
+            val cred = result.credential
+            if (cred is CustomCredential && cred.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
+                val googleCred = GoogleIdTokenCredential.createFrom(cred.data)
+                val email = googleCred.id.trim()
+                if (email.isNotBlank()) {
+                    Result.success(email)
+                } else {
+                    Result.failure(Exception("Google sign-in returned no account email."))
+                }
             } else {
-                Result.failure(Exception("Google sign-in returned no account."))
+                Result.failure(Exception("Unsupported Google sign-in response. Try again."))
+            }
+        } catch (_: GetCredentialCancellationException) {
+            Result.failure(Exception("Google sign-in was cancelled."))
+        } catch (_: NoCredentialException) {
+            Result.failure(Exception("No Google account found on this device. Add a Google account in Android Settings and try again."))
+        } catch (e: GetCredentialException) {
+            SafeVaultLogger.w("GoogleAuth", "Credential Manager sign-in unavailable: ${e.type}")
+            Result.failure(Exception("Could not sign in with Google right now. Check your connection and try again."))
+        } catch (e: Exception) {
+            SafeVaultLogger.w("GoogleAuth", "Unexpected Credential Manager failure", e)
+            Result.failure(Exception("Could not connect to Google. Try again later."))
+        }
+    }
+
+    suspend fun requestOrFetchDriveAccessToken(
+        context: Context,
+        accountEmail: String
+    ): DriveAuthState = withContext(Dispatchers.IO) {
+        if (!isGoogleDriveConfigured()) {
+            return@withContext DriveAuthState.Failed("Google Drive backup is not enabled in this build.")
+        }
+        if (accountEmail.isBlank()) {
+            return@withContext DriveAuthState.Failed("Connect a Google account first.", requiresReconnect = true)
+        }
+        if (!isPlayServicesAvailable(context)) {
+            return@withContext DriveAuthState.Failed("Google Play Services is unavailable on this device.")
+        }
+        return@withContext try {
+            val request = AuthorizationRequest.Builder()
+                .setRequestedScopes(listOf(Scope(GoogleDriveSyncManager.SCOPE_DRIVE_APPDATA)))
+                .setAccount(Account(accountEmail, "com.google"))
+                .build()
+            val result = Tasks.await(Identity.getAuthorizationClient(context).authorize(request))
+            val pendingIntent = result.pendingIntent
+            val token = result.accessToken
+            when {
+                result.hasResolution() && pendingIntent != null -> DriveAuthState.NeedsConsent(pendingIntent)
+                !token.isNullOrBlank() -> DriveAuthState.Authorized(token, accountEmail)
+                else -> DriveAuthState.Failed("Reconnect your Google account to continue.", requiresReconnect = true)
             }
         } catch (e: ApiException) {
-            val friendly = when (e.statusCode) {
-                12501 -> "Google sign-in was cancelled."
-                12502 -> "Sign-in is already in progress."
-                7 -> "Network connection unavailable. Check your internet and try again."
-                4 -> "Please sign in with your Google account to continue."
-                10 -> "Google sign-in is not authorized for this app signature."
-                else -> "Could not connect to Google (${e.statusCode})."
+            SafeVaultLogger.w("GoogleAuth", "AuthorizationClient ApiException status=${e.statusCode}")
+            val message = when (e.statusCode) {
+                7 -> "Check your internet connection and try again."
+                4, 16, 17 -> "Reconnect your Google account to continue."
+                else -> "Could not verify Google Drive authorization. Reconnect your Google account and try again."
             }
-            Result.failure(Exception(friendly, e))
+            DriveAuthState.Failed(message, requiresReconnect = e.statusCode != 7)
         } catch (e: Exception) {
-            Result.failure(Exception(e.message ?: "Google sign-in failed.", e))
+            SafeVaultLogger.w("GoogleAuth", "AuthorizationClient failed", e)
+            DriveAuthState.Failed("Check your internet connection or reconnect your Google account.")
         }
     }
 
-    suspend fun getAccessToken(context: Context, account: GoogleSignInAccount): Result<String> =
-        withContext(Dispatchers.IO) {
-            try {
-                val androidAccount = account.account
-                    ?: return@withContext Result.failure(Exception("Google account handle is unavailable. Please reconnect."))
-
-                val scopeString = "oauth2:${GoogleDriveSyncManager.SCOPE_DRIVE_APPDATA}"
-                val token = GoogleAuthUtil.getToken(context, androidAccount, scopeString)
-                if (token.isNotBlank()) {
-                    Result.success(token)
-                } else {
-                    Result.failure(Exception("Empty authorization token returned."))
-                }
-            } catch (e: Exception) {
-                Result.failure(Exception("Google Drive permission check failed: ${e.message}", e))
-            }
-        }
-
-    suspend fun refreshAccessToken(
+    fun parseAuthorizationConsentResult(
         context: Context,
-        account: GoogleSignInAccount,
-        expiredToken: String
-    ): Result<String> = withContext(Dispatchers.IO) {
-        runCatching { GoogleAuthUtil.clearToken(context, expiredToken) }
-        getAccessToken(context, account)
+        data: Intent?,
+        accountEmail: String
+    ): DriveAuthState {
+        return try {
+            val result = Identity.getAuthorizationClient(context).getAuthorizationResultFromIntent(data)
+            val token = result.accessToken
+            if (!token.isNullOrBlank()) {
+                DriveAuthState.Authorized(token, accountEmail)
+            } else {
+                DriveAuthState.Failed("Google Drive access was not granted.", requiresReconnect = true)
+            }
+        } catch (e: ApiException) {
+            SafeVaultLogger.w("GoogleAuth", "Consent result ApiException status=${e.statusCode}")
+            if (e.statusCode == 12501 || e.statusCode == 16) {
+                DriveAuthState.Failed("Google Drive permission was cancelled.")
+            } else {
+                DriveAuthState.Failed("Could not grant Google Drive access. Try reconnecting.", requiresReconnect = true)
+            }
+        } catch (_: Exception) {
+            DriveAuthState.Failed("Could not complete Google Drive authorization.")
+        }
     }
 
     suspend fun signOut(context: Context): Unit = withContext(Dispatchers.IO) {
-        try {
-            val client = getClient(context)
-            runCatching { Tasks.await(client.signOut()) }
-            runCatching { Tasks.await(client.revokeAccess()) }
-        } catch (_: Exception) {
+        runCatching {
+            CredentialManager.create(context).clearCredentialState(ClearCredentialStateRequest())
         }
     }
 }

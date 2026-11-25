@@ -9,6 +9,7 @@ import android.view.autofill.AutofillId
 import android.view.autofill.AutofillManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,15 +18,20 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -47,9 +53,8 @@ import kotlinx.coroutines.withContext
 import java.util.Arrays
 
 /**
- * Dedicated secure activity for authenticating an Autofill request.
- * Displays a clean master password dialog to unlock the vault, verifies credentials,
- * and passes the matching dataset back to the Android Autofill framework.
+ * Dedicated secure activity for authenticating an Autofill request and handling
+ * deliberate manual credential selection when no strict automatic domain/app match exists.
  */
 class AutofillAuthActivity : ComponentActivity() {
 
@@ -61,7 +66,9 @@ class AutofillAuthActivity : ComponentActivity() {
         )
 
         val targetPackage = intent.getStringExtra("packageName").orEmpty()
-        val targetDomain = intent.getStringExtra("targetDomain") ?: targetPackage.ifBlank { "Requested App" }
+        val rawDomain = intent.getStringExtra("targetDomain").orEmpty()
+        val targetScheme = intent.getStringExtra("targetScheme").orEmpty()
+        val displayTarget = rawDomain.ifBlank { targetPackage.ifBlank { "this app" } }
 
         val usernameId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent.getParcelableExtra("usernameId", AutofillId::class.java)
@@ -76,6 +83,8 @@ class AutofillAuthActivity : ComponentActivity() {
             @Suppress("DEPRECATION")
             intent.getParcelableExtra("passwordId")
         }
+
+        val app = runCatching { PrivateVaultApplication.instance }.getOrNull()
 
         setContent {
             PrivateVaultTheme {
@@ -92,150 +101,255 @@ class AutofillAuthActivity : ComponentActivity() {
                             color = MaterialTheme.colorScheme.surface,
                             tonalElevation = 6.dp,
                             modifier = Modifier
-                                .fillMaxWidth(0.9f)
+                                .fillMaxWidth(0.92f)
                                 .padding(16.dp)
                         ) {
                             var password by remember { mutableStateOf("") }
                             var errorMessage by remember { mutableStateOf<String?>(null) }
                             var isAuthenticating by remember { mutableStateOf(false) }
+                            var unlockedManualList by remember { mutableStateOf<List<CredentialRecord>?>(null) }
+                            var searchQuery by remember { mutableStateOf("") }
                             val scope = rememberCoroutineScope()
 
-                            Column(modifier = Modifier.padding(24.dp)) {
-                                Text(
-                                    text = "Unlock Private Vault",
-                                    style = MaterialTheme.typography.titleLarge,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text(
-                                    text = "Enter master password to autofill credentials for $targetDomain",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Spacer(modifier = Modifier.height(16.dp))
+                            suspend fun finishWithCredentials(selected: List<CredentialRecord>) {
+                                val fillResponse = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                    PrivateVaultAutofillService.buildFillResponseForCredentials(
+                                        context = applicationContext,
+                                        packageName = targetPackage.ifBlank { packageName },
+                                        usernameId = usernameId,
+                                        passwordId = passwordId,
+                                        credentials = selected
+                                    )
+                                } else null
 
-                                OutlinedTextField(
-                                    value = password,
-                                    onValueChange = {
-                                        password = it
-                                        errorMessage = null
-                                    },
-                                    label = { Text("Vault Password") },
-                                    visualTransformation = PasswordVisualTransformation(),
-                                    singleLine = true,
-                                    enabled = !isAuthenticating,
-                                    modifier = Modifier.fillMaxWidth()
-                                )
+                                withContext(Dispatchers.Main) {
+                                    val replyIntent = Intent().apply {
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && fillResponse != null) {
+                                            putExtra(AutofillManager.EXTRA_AUTHENTICATION_RESULT, fillResponse)
+                                        }
+                                    }
+                                    setResult(Activity.RESULT_OK, replyIntent)
+                                    finish()
+                                }
+                            }
 
-                                if (errorMessage != null) {
+                            LaunchedEffect(Unit) {
+                                if (app != null && app.sessionManager.isUnlocked()) {
+                                    withContext(Dispatchers.IO) {
+                                        val creds = app.repository.getAllItemsForActiveSlot()
+                                            .filterIsInstance<CredentialRecord>()
+                                            .filter { !it.isArchived && !it.isTrashed }
+                                        val cleanTarget = AutofillHelper.normalizeDomain(rawDomain)
+                                        val directMatches = creds.filter {
+                                            AutofillHelper.matchesTarget(it, cleanTarget, targetPackage, targetScheme.ifBlank { null })
+                                        }
+                                        if (directMatches.isNotEmpty()) {
+                                            finishWithCredentials(directMatches)
+                                        } else {
+                                            withContext(Dispatchers.Main) {
+                                                unlockedManualList = creds
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            val pickerList = unlockedManualList
+                            if (pickerList != null) {
+                                val filtered = remember(pickerList, searchQuery) {
+                                    if (searchQuery.isBlank()) pickerList
+                                    else pickerList.filter {
+                                        it.serviceName.contains(searchQuery, ignoreCase = true) ||
+                                            it.username.contains(searchQuery, ignoreCase = true) ||
+                                            it.websiteUrl.contains(searchQuery, ignoreCase = true)
+                                    }
+                                }
+                                Column(modifier = Modifier.padding(20.dp)) {
+                                    Text(
+                                        text = "Choose a Login to Fill",
+                                        style = MaterialTheme.typography.titleLarge,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = "No saved login matched $displayTarget automatically. Select one below to fill it once:",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    OutlinedTextField(
+                                        value = searchQuery,
+                                        onValueChange = { searchQuery = it },
+                                        label = { Text("Search saved logins") },
+                                        singleLine = true,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                    Spacer(modifier = Modifier.height(10.dp))
+                                    if (filtered.isEmpty()) {
+                                        Text(
+                                            text = if (pickerList.isEmpty()) "Your vault has no saved logins yet." else "No matching logins found.",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.padding(vertical = 16.dp)
+                                        )
+                                    } else {
+                                        LazyColumn(modifier = Modifier.heightIn(max = 260.dp)) {
+                                            items(filtered, key = { it.id }) { cred ->
+                                                Column(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .clickable {
+                                                            scope.launch(Dispatchers.IO) {
+                                                                finishWithCredentials(listOf(cred))
+                                                            }
+                                                        }
+                                                        .padding(vertical = 10.dp, horizontal = 4.dp)
+                                                ) {
+                                                    Text(cred.serviceName.ifBlank { "Saved Login" }, fontWeight = FontWeight.SemiBold)
+                                                    Text(cred.username.ifBlank { "Account" }, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                }
+                                                HorizontalDivider()
+                                            }
+                                        }
+                                    }
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                                        TextButton(
+                                            onClick = {
+                                                setResult(Activity.RESULT_CANCELED)
+                                                finish()
+                                            }
+                                        ) {
+                                            Text("Cancel")
+                                        }
+                                    }
+                                }
+                            } else {
+                                Column(modifier = Modifier.padding(24.dp)) {
+                                    Text(
+                                        text = "Unlock Private Vault",
+                                        style = MaterialTheme.typography.titleLarge,
+                                        fontWeight = FontWeight.Bold
+                                    )
                                     Spacer(modifier = Modifier.height(8.dp))
                                     Text(
-                                        text = errorMessage!!,
-                                        color = MaterialTheme.colorScheme.error,
-                                        style = MaterialTheme.typography.bodySmall
+                                        text = "Enter your master password to check logins for $displayTarget",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
-                                }
+                                    Spacer(modifier = Modifier.height(16.dp))
 
-                                Spacer(modifier = Modifier.height(24.dp))
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.End,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    TextButton(
-                                        onClick = {
-                                            setResult(Activity.RESULT_CANCELED)
-                                            finish()
+                                    OutlinedTextField(
+                                        value = password,
+                                        onValueChange = {
+                                            password = it
+                                            errorMessage = null
                                         },
-                                        enabled = !isAuthenticating
-                                    ) {
-                                        Text("Cancel")
+                                        label = { Text("Vault Password") },
+                                        visualTransformation = PasswordVisualTransformation(),
+                                        singleLine = true,
+                                        enabled = !isAuthenticating,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+
+                                    if (errorMessage != null) {
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Text(
+                                            text = errorMessage!!,
+                                            color = MaterialTheme.colorScheme.error,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
                                     }
 
-                                    Button(
-                                        onClick = {
-                                            if (password.isBlank()) {
-                                                errorMessage = "Password cannot be empty"
-                                                return@Button
-                                            }
-                                            isAuthenticating = true
-                                            val pwdChars = password.toCharArray()
-                                            scope.launch(Dispatchers.IO) {
-                                                try {
-                                                    val app = PrivateVaultApplication.instance
-                                                    val authResult = app.repository.unlockVault(pwdChars)
-                                                    when (authResult) {
-                                                        is AuthResult.Success -> {
-                                                            // Vault unlocked! Fetch credentials
-                                                            val allItems = app.repository.getAllItemsForActiveSlot()
-                                                            val credentials = allItems.filterIsInstance<CredentialRecord>()
-                                                                .filter { !it.isArchived && !it.isTrashed }
+                                    Spacer(modifier = Modifier.height(24.dp))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.End,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        TextButton(
+                                            onClick = {
+                                                setResult(Activity.RESULT_CANCELED)
+                                                finish()
+                                            },
+                                            enabled = !isAuthenticating
+                                        ) {
+                                            Text("Cancel")
+                                        }
 
-                                                            val cleanTarget = AutofillHelper.normalizeDomain(targetDomain)
-                                                            val directMatches = credentials.filter {
-                                                                AutofillHelper.matchesTarget(it, cleanTarget, targetPackage)
-                                                            }
+                                        Button(
+                                            onClick = {
+                                                if (password.isBlank()) {
+                                                    errorMessage = "Password cannot be empty"
+                                                    return@Button
+                                                }
+                                                isAuthenticating = true
+                                                val pwdChars = password.toCharArray()
+                                                scope.launch(Dispatchers.IO) {
+                                                    try {
+                                                        val application = app ?: PrivateVaultApplication.instance
+                                                        val authResult = application.repository.unlockVault(pwdChars)
+                                                        when (authResult) {
+                                                            is AuthResult.Success -> {
+                                                                val allItems = application.repository.getAllItemsForActiveSlot()
+                                                                val credentials = allItems.filterIsInstance<CredentialRecord>()
+                                                                    .filter { !it.isArchived && !it.isTrashed }
 
-                                                            val fillResponse = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                                                PrivateVaultAutofillService.buildFillResponseForCredentials(
-                                                                    context = applicationContext,
-                                                                    packageName = targetPackage.ifBlank { packageName },
-                                                                    usernameId = usernameId,
-                                                                    passwordId = passwordId,
-                                                                    credentials = directMatches
-                                                                )
-                                                            } else null
-
-                                                            withContext(Dispatchers.Main) {
-                                                                val replyIntent = Intent().apply {
-                                                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && fillResponse != null) {
-                                                                        putExtra(AutofillManager.EXTRA_AUTHENTICATION_RESULT, fillResponse)
+                                                                val cleanTarget = AutofillHelper.normalizeDomain(rawDomain)
+                                                                val directMatches = credentials.filter {
+                                                                    AutofillHelper.matchesTarget(it, cleanTarget, targetPackage, targetScheme.ifBlank { null })
+                                                                }
+                                                                if (directMatches.isNotEmpty()) {
+                                                                    finishWithCredentials(directMatches)
+                                                                } else {
+                                                                    withContext(Dispatchers.Main) {
+                                                                        password = ""
+                                                                        isAuthenticating = false
+                                                                        unlockedManualList = credentials
                                                                     }
                                                                 }
-                                                                setResult(Activity.RESULT_OK, replyIntent)
-                                                                finish()
+                                                            }
+                                                            is AuthResult.IncorrectPassword, is AuthResult.InvalidPassword -> {
+                                                                withContext(Dispatchers.Main) {
+                                                                    errorMessage = "Incorrect vault password"
+                                                                    isAuthenticating = false
+                                                                }
+                                                            }
+                                                            is AuthResult.LockedOut -> {
+                                                                withContext(Dispatchers.Main) {
+                                                                    errorMessage = "Too many failed attempts. Try again in ${authResult.remainingSeconds}s."
+                                                                    isAuthenticating = false
+                                                                }
+                                                            }
+                                                            else -> {
+                                                                withContext(Dispatchers.Main) {
+                                                                    errorMessage = "Authentication failed"
+                                                                    isAuthenticating = false
+                                                                }
                                                             }
                                                         }
-                                                        is AuthResult.IncorrectPassword, is AuthResult.InvalidPassword -> {
-                                                            withContext(Dispatchers.Main) {
-                                                                errorMessage = "Incorrect vault password"
-                                                                isAuthenticating = false
-                                                            }
+                                                    } catch (e: Exception) {
+                                                        SafeVaultLogger.e("AutofillAuth", "Unlock error", e)
+                                                        withContext(Dispatchers.Main) {
+                                                            errorMessage = "Could not unlock vault. Try again."
+                                                            isAuthenticating = false
                                                         }
-                                                        is AuthResult.LockedOut -> {
-                                                            withContext(Dispatchers.Main) {
-                                                                errorMessage = "Too many failed attempts. Try again in ${authResult.remainingSeconds}s."
-                                                                isAuthenticating = false
-                                                            }
-                                                        }
-                                                        else -> {
-                                                            withContext(Dispatchers.Main) {
-                                                                errorMessage = "Authentication failed"
-                                                                isAuthenticating = false
-                                                            }
-                                                        }
+                                                    } finally {
+                                                        Arrays.fill(pwdChars, '\u0000')
                                                     }
-                                                } catch (e: Exception) {
-                                                    SafeVaultLogger.e("AutofillAuth", "Unlock error", e)
-                                                    withContext(Dispatchers.Main) {
-                                                        errorMessage = "Error unlocking vault: ${e.message}"
-                                                        isAuthenticating = false
-                                                    }
-                                                } finally {
-                                                    Arrays.fill(pwdChars, '\u0000')
                                                 }
+                                            },
+                                            enabled = !isAuthenticating
+                                        ) {
+                                            if (isAuthenticating) {
+                                                CircularProgressIndicator(
+                                                    modifier = Modifier.height(18.dp),
+                                                    strokeWidth = 2.dp,
+                                                    color = MaterialTheme.colorScheme.onPrimary
+                                                )
+                                            } else {
+                                                Text("Unlock")
                                             }
-                                        },
-                                        enabled = !isAuthenticating
-                                    ) {
-                                        if (isAuthenticating) {
-                                            CircularProgressIndicator(
-                                                modifier = Modifier.height(18.dp),
-                                                strokeWidth = 2.dp,
-                                                color = MaterialTheme.colorScheme.onPrimary
-                                            )
-                                        } else {
-                                            Text("Unlock & Fill")
                                         }
                                     }
                                 }

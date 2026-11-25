@@ -3,7 +3,4 @@
     <cache-path
         name="ota_updates"
         path="ota_updates/" />
-    <cache-path
-        name="temporary_exports"
-        path="temporary_exports/" />
 </paths>

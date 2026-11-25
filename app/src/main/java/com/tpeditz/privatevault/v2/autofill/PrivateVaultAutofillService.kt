@@ -158,8 +158,44 @@ class PrivateVaultAutofillService : AutofillService() {
                 val credentials = allItems.filterIsInstance<CredentialRecord>()
                     .filter { !it.isArchived && !it.isTrashed }
 
-                val cleanTarget = normalizeDomain(targetDomain)
-                val directMatches = credentials.filter { matchesTarget(it, cleanTarget, packageName) }
+                val cleanTarget = AutofillHelper.normalizeDomain(targetDomain)
+                val directMatches = credentials.filter {
+                    AutofillHelper.matchesTarget(it, cleanTarget, packageName, parsedFields.webScheme)
+                }
+
+                if (directMatches.isEmpty()) {
+                    // Do not disclose unrelated credentials; offer deliberate manual selection after confirmation
+                    val pickerIntent = Intent(this@PrivateVaultAutofillService, AutofillAuthActivity::class.java).apply {
+                        putExtra("packageName", packageName)
+                        putExtra("targetDomain", targetDomain)
+                        putExtra("targetScheme", parsedFields.webScheme.orEmpty())
+                        putExtra("usernameId", parsedFields.usernameId)
+                        putExtra("passwordId", parsedFields.passwordId)
+                    }
+                    val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_MUTABLE
+                    } else {
+                        PendingIntent.FLAG_CANCEL_CURRENT
+                    }
+                    val pendingIntent = PendingIntent.getActivity(
+                        this@PrivateVaultAutofillService,
+                        1002,
+                        pickerIntent,
+                        flags
+                    )
+                    val remoteViews = RemoteViews(this@PrivateVaultAutofillService.packageName, android.R.layout.simple_list_item_1).apply {
+                        setTextViewText(android.R.id.text1, "Choose login from Private Vault")
+                    }
+                    val anchorId = parsedFields.usernameId ?: parsedFields.passwordId!!
+                    val requiredIds = listOfNotNull(parsedFields.usernameId, parsedFields.passwordId).toTypedArray()
+                    val builder = FillResponse.Builder()
+                        .setAuthentication(arrayOf(anchorId), pendingIntent.intentSender, remoteViews)
+                    if (requiredIds.isNotEmpty()) {
+                        builder.setSaveInfo(SaveInfo.Builder(SaveInfo.SAVE_DATA_TYPE_PASSWORD, requiredIds).build())
+                    }
+                    callback.onSuccess(builder.build())
+                    return@launch
+                }
 
                 val fillResponse = buildFillResponseForCredentials(
                     context = applicationContext,
@@ -208,7 +244,8 @@ class PrivateVaultAutofillService : AutofillService() {
                         serviceName = serviceName,
                         username = usernameVal,
                         password = passwordVal,
-                        websiteUrl = parsed.webDomain.orEmpty()
+                        websiteUrl = parsed.webDomain?.takeIf { it.isNotBlank() }
+                            ?: "android://${structure.activityComponent.packageName}"
                     )
                     app.repository.saveItem(newCred)
                     SafeVaultLogger.i("Autofill", "Saved autofilled credential for $serviceName")
@@ -234,6 +271,7 @@ object AutofillStructureParser {
         val usernameId: AutofillId?,
         val passwordId: AutofillId?,
         val webDomain: String?,
+        val webScheme: String? = null,
         val extractedUsername: String? = null,
         val extractedPassword: String? = null
     )
@@ -242,6 +280,7 @@ object AutofillStructureParser {
         var usernameId: AutofillId? = null
         var passwordId: AutofillId? = null
         var webDomain: String? = null
+        var webScheme: String? = null
         var extractedUsername: String? = null
         var extractedPassword: String? = null
 
@@ -253,17 +292,19 @@ object AutofillStructureParser {
             if (res.usernameId != null) usernameId = res.usernameId
             if (res.passwordId != null) passwordId = res.passwordId
             if (res.webDomain != null) webDomain = res.webDomain
+            if (res.webScheme != null) webScheme = res.webScheme
             if (res.extractedUsername != null) extractedUsername = res.extractedUsername
             if (res.extractedPassword != null) extractedPassword = res.extractedPassword
         }
 
-        return ParsedFields(usernameId, passwordId, webDomain, extractedUsername, extractedPassword)
+        return ParsedFields(usernameId, passwordId, webDomain, webScheme, extractedUsername, extractedPassword)
     }
 
     private fun traverseNode(node: android.app.assist.AssistStructure.ViewNode): ParsedFields {
         var usernameId: AutofillId? = null
         var passwordId: AutofillId? = null
         var webDomain: String? = node.webDomain
+        var webScheme: String? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) node.webScheme else null
         var extractedUsername: String? = null
         var extractedPassword: String? = null
 
@@ -293,10 +334,11 @@ object AutofillStructureParser {
             if (usernameId == null && childRes.usernameId != null) usernameId = childRes.usernameId
             if (passwordId == null && childRes.passwordId != null) passwordId = childRes.passwordId
             if (webDomain == null && childRes.webDomain != null) webDomain = childRes.webDomain
+            if (webScheme == null && childRes.webScheme != null) webScheme = childRes.webScheme
             if (extractedUsername == null && childRes.extractedUsername != null) extractedUsername = childRes.extractedUsername
             if (extractedPassword == null && childRes.extractedPassword != null) extractedPassword = childRes.extractedPassword
         }
 
-        return ParsedFields(usernameId, passwordId, webDomain, extractedUsername, extractedPassword)
+        return ParsedFields(usernameId, passwordId, webDomain, webScheme, extractedUsername, extractedPassword)
     }
 }
