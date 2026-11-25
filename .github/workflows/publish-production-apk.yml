@@ -4,13 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Run mode: 'test' builds and verifies everything without publishing; 'publish' creates a public GitHub Release"
+        description: "Run mode: 'test' builds without publishing; 'publish' creates a public GitHub Release; 'verify' checks existing public OTA assets only"
         required: true
         default: "test"
         type: choice
         options:
           - test
           - publish
+          - verify
       release_notes:
         description: "Plain-text release notes shown in GitHub Releases and in the app update prompt"
         required: false
@@ -22,6 +23,7 @@ permissions:
 
 jobs:
   release:
+    if: ${{ inputs.mode != 'verify' }}
     name: Build Signed Production APK & OTA Manifest
     runs-on: ubuntu-latest
 
@@ -227,33 +229,7 @@ jobs:
 
       - name: Verify Published OTA Endpoints
         if: ${{ inputs.mode == 'publish' }}
-        env:
-          APKSIGNER: ${{ steps.verify_apk.outputs.apksigner_path }}
-        run: |
-          sleep 5
-          curl -fsSL "https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/update.json" -o /tmp/live_update.json
-          curl -fsSL "https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/private-vault.apk" -o /tmp/live_private-vault.apk
-          python3 - <<'PY'
-          import hashlib, json
-          from pathlib import Path
-
-          staged = json.load(open("release_artifacts/update.json"))
-          live = json.load(open("/tmp/live_update.json"))
-          assert staged["sha256"] == live["sha256"], "Published update.json SHA-256 mismatch"
-          assert staged["versionCode"] == live["versionCode"], "Published update.json versionCode mismatch"
-
-          apk_bytes = Path("/tmp/live_private-vault.apk").read_bytes()
-          actual_sha256 = hashlib.sha256(apk_bytes).hexdigest().lower()
-          assert len(apk_bytes) == live["sizeBytes"], f"Live APK size mismatch: {len(apk_bytes)} vs {live['sizeBytes']}"
-          assert actual_sha256 == live["sha256"], f"Live APK SHA-256 mismatch: {actual_sha256} vs {live['sha256']}"
-          print("Verified live update.json and full private-vault.apk download bytes/SHA-256.")
-          PY
-
-          LIVE_VERIFY=$("$APKSIGNER" verify --verbose --print-certs /tmp/live_private-vault.apk)
-          if ! echo "$LIVE_VERIFY" | tr '[:upper:]' '[:lower:]' | grep -q "3beeff138b716168b2f166983d42496b9d24f629b75ee25bdafd16676f06a770"; then
-            echo "::error::Downloaded live APK certificate pin check failed."
-            exit 1
-          fi
+        run: bash scripts/verify_published_ota.sh release_artifacts/update.json
 
       - name: Securely Shred Temporary Keystore
         if: always()
@@ -261,3 +237,17 @@ jobs:
           if [ -f "${RUNNER_TEMP}/release.jks" ]; then
             shred -u "${RUNNER_TEMP}/release.jks" || rm -f "${RUNNER_TEMP}/release.jks"
           fi
+
+  verify-live:
+    name: Verify Existing Public OTA Assets
+    if: ${{ inputs.mode == 'verify' }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify Published OTA Endpoints
+        run: bash scripts/verify_published_ota.sh
