@@ -85,6 +85,8 @@ class VaultViewModel(
     private var currentStagedRestore: StagedBackupRestore? = null
     private var totpTickerJob: Job? = null
     private var activeBackupJob: Job? = null
+    private var loadItemsJob: Job? = null
+    @Volatile private var cachedAutoLockTimeoutSeconds: Int = 0
     private var activeRestoreJob: Job? = null
     private var foregroundOtaJob: Job? = null
     private var installUpdateJob: Job? = null
@@ -101,6 +103,15 @@ class VaultViewModel(
             sessionManager.sessionState.collect { session ->
                 when (session) {
                     is VaultSessionManager.SessionState.Unlocked -> {
+                        if (lastActiveSessionId != session.sessionId) {
+                            loadItemsJob?.cancel()
+                            _uiState.update { it.copy(notes = emptyList(), credentials = emptyList(), media = emptyList(),
+                                documents = emptyList(), secureLinks = emptyList(), folders = emptyList(), albums = emptyList(),
+                                authenticators = emptyList(), pendingSharedText = null, connectedGoogleEmail = "",
+                                autoCloudBackupEnabled = false, autoCloudBackupKeyConfigured = false,
+                                isCloudRecoveryPasswordLegacyShort = false, lastCloudBackupEpochMs = 0L,
+                                lastCloudBackupStatusMessage = null, privacyMetrics = PrivacyHealthMetrics()) }
+                        }
                         if (lastActiveSessionId != null && lastActiveSessionId != session.sessionId) {
                             cancelBackup()
                             cancelRestore()
@@ -115,11 +126,13 @@ class VaultViewModel(
                             )
                         }
                         loadActiveVaultItems()
+                        refreshSystemSecurityStatus()
                         startTotpTicker()
                         refreshOtaOnForeground()
                     }
                     is VaultSessionManager.SessionState.Locked -> {
                         lastActiveSessionId = null
+                        loadItemsJob?.cancel()
                         cancelBackup()
                         cancelRestore()
                         clearPendingRestore()
@@ -141,6 +154,13 @@ class VaultViewModel(
                                 albums = emptyList(),
                                 authenticators = emptyList(),
                                 searchQuery = "",
+                                pendingSharedText = null,
+                                connectedGoogleEmail = "",
+                                autoCloudBackupEnabled = false,
+                                autoCloudBackupKeyConfigured = false,
+                                isCloudRecoveryPasswordLegacyShort = false,
+                                lastCloudBackupEpochMs = 0L,
+                                lastCloudBackupStatusMessage = null,
                                 currentSecondary = SecondaryDestination.None,
                                 pendingRestorePayload = null,
                                 pendingRestoreError = null
@@ -174,6 +194,7 @@ class VaultViewModel(
         }
         viewModelScope.launch {
             preferencesRepository.autoLockTimeoutSeconds.collect { sec ->
+                cachedAutoLockTimeoutSeconds = sec
                 _uiState.update {
                     it.copy(
                         autoLockTimeoutSeconds = sec,
@@ -189,7 +210,8 @@ class VaultViewModel(
         }
         viewModelScope.launch {
             preferencesRepository.biometricUnlockEnabled.collect { enabled ->
-                val actualEnrolled = enabled && BiometricKeystoreManager.hasKeystoreKey()
+                val actualEnrolled = enabled && BiometricKeystoreManager.hasKeystoreKey() &&
+                    sessionManager.getActiveSlotIdOrNull() != VaultSessionManager.DECOY_SLOT
                 _uiState.update {
                     it.copy(
                         isBiometricsConfigured = actualEnrolled,
@@ -202,8 +224,8 @@ class VaultViewModel(
             preferencesRepository.autoCloudBackupEnabled.collect { enabled ->
                 _uiState.update {
                     it.copy(
-                        autoCloudBackupEnabled = enabled,
-                        privacyMetrics = it.privacyMetrics.copy(isAutoBackupEnabled = enabled)
+                        autoCloudBackupEnabled = enabled && realSessionId() != null,
+                        privacyMetrics = it.privacyMetrics.copy(isAutoBackupEnabled = enabled && realSessionId() != null)
                     )
                 }
             }
@@ -224,9 +246,9 @@ class VaultViewModel(
                 val legacyShort = computeIsCloudRecoveryLegacyShort()
                 _uiState.update {
                     it.copy(
-                        connectedGoogleEmail = storedEmail.trim(),
-                        autoCloudBackupKeyConfigured = hasRecoveryPwd,
-                        isCloudRecoveryPasswordLegacyShort = legacyShort
+                        connectedGoogleEmail = if (realSessionId() != null) storedEmail.trim() else "",
+                        autoCloudBackupKeyConfigured = hasRecoveryPwd && realSessionId() != null,
+                        isCloudRecoveryPasswordLegacyShort = legacyShort && realSessionId() != null
                     )
                 }
             }
@@ -235,8 +257,8 @@ class VaultViewModel(
             preferencesRepository.lastCloudBackupEpochMs.collect { epoch ->
                 _uiState.update {
                     it.copy(
-                        lastCloudBackupEpochMs = epoch,
-                        privacyMetrics = it.privacyMetrics.copy(lastCloudBackupEpochMs = epoch)
+                        lastCloudBackupEpochMs = if (realSessionId() != null) epoch else 0L,
+                        privacyMetrics = it.privacyMetrics.copy(lastCloudBackupEpochMs = if (realSessionId() != null) epoch else 0L)
                     )
                 }
             }
@@ -250,7 +272,7 @@ class VaultViewModel(
         }
         viewModelScope.launch {
             preferencesRepository.autoCloudBackupStatus.collect { status ->
-                _uiState.update { it.copy(lastCloudBackupStatusMessage = status.ifBlank { null }) }
+                _uiState.update { it.copy(lastCloudBackupStatusMessage = if (realSessionId() != null) status.ifBlank { null } else null) }
             }
         }
         viewModelScope.launch {
@@ -330,15 +352,27 @@ class VaultViewModel(
 
     fun onAppForegrounded() {
         otaForeground = true
-        viewModelScope.launch {
-            val timeoutSec = preferencesRepository.autoLockTimeoutSeconds.first()
-            sessionManager.onAppForegrounded(timeoutSec)
-            clipboardManager.onAppForegrounded()
-        }
+        sessionManager.onAppForegrounded(cachedAutoLockTimeoutSeconds)
+        clipboardManager.onAppForegrounded()
     }
 
     fun grantFilePickerImmunity() {
         sessionManager.grantFilePickerImmunity()
+    }
+
+    fun clearFilePickerImmunity() = sessionManager.clearFilePickerImmunity()
+    fun canEnrollBiometrics(): Boolean {
+        val session = sessionManager.getActiveSession() ?: return false
+        return session.slotId == VaultSessionManager.REAL_SLOT && !session.isDecoyConfiguredInRealVault
+    }
+
+    private fun realSessionId(): Long? =
+        sessionManager.getActiveSession()?.takeIf { it.slotId == VaultSessionManager.REAL_SLOT }?.sessionId
+
+    private fun requireRealSession(expectedId: Long? = null): Long {
+        val id = realSessionId() ?: throw IllegalStateException("Unlock your main vault to manage cloud backup.")
+        check(expectedId == null || id == expectedId) { "Vault session changed. Unlock and try again." }
+        return id
     }
 
     // ============================================================================================
@@ -412,8 +446,11 @@ class VaultViewModel(
 
     fun loadActiveVaultItems() {
         val expectedSessionId = sessionManager.getCurrentSessionId() ?: return
-        viewModelScope.launch {
-            val auditResult = repository.getAllItemsForActiveSlotWithAudit()
+        loadItemsJob?.cancel()
+        loadItemsJob = viewModelScope.launch {
+            val auditResult = try {
+                repository.getAllItemsForActiveSlotWithAudit(expectedSessionId)
+            } catch (e: CancellationException) { throw e } catch (_: Exception) { return@launch }
             if (sessionManager.getCurrentSessionId() != expectedSessionId) return@launch
             val items = auditResult.items
 
@@ -450,9 +487,10 @@ class VaultViewModel(
 
             val avgScore = if (passwordsList.isNotEmpty()) scoreSum / passwordsList.size else 0
             val lastLocal = preferencesRepository.lastLocalBackupEpochMs.first()
-            val lastCloud = preferencesRepository.lastCloudBackupEpochMs.first()
-            val autoBackup = preferencesRepository.autoCloudBackupEnabled.first()
-            val bio = preferencesRepository.biometricUnlockEnabled.first() &&
+            val real = realSessionId() == expectedSessionId
+            val lastCloud = if (real) preferencesRepository.lastCloudBackupEpochMs.first() else 0L
+            val autoBackup = real && preferencesRepository.autoCloudBackupEnabled.first()
+            val bio = real && preferencesRepository.biometricUnlockEnabled.first() &&
                 BiometricKeystoreManager.hasKeystoreKey()
             val screenSec = preferencesRepository.screenshotProtectionEnabled.first()
             val timeoutSec = preferencesRepository.autoLockTimeoutSeconds.first()
@@ -479,10 +517,12 @@ class VaultViewModel(
                 isUpdateAvailable = updateAvailable
             )
 
-            _uiState.update {
+            ensureActive()
+            sessionManager.runIfCurrentSession(expectedSessionId) {
+              _uiState.update {
                 it.copy(
                     isBiometricsConfigured = bio,
-                    autoCloudBackupKeyConfigured = AutoCloudBackupKeyStore.hasRecoveryPassword(context),
+                    autoCloudBackupKeyConfigured = real && AutoCloudBackupKeyStore.hasRecoveryPassword(context),
                     notes = notes,
                     credentials = credentials,
                     media = media,
@@ -493,6 +533,7 @@ class VaultViewModel(
                     authenticators = authenticators,
                     privacyMetrics = metrics
                 )
+              }
             }
             preparePendingAutoCloudBackupIfNeeded()
         }
@@ -879,6 +920,7 @@ class VaultViewModel(
     }
 
     private fun computeIsCloudRecoveryLegacyShort(): Boolean {
+        if (realSessionId() == null) return false
         val chars = AutoCloudBackupKeyStore.readRecoveryPasswordOrNull(context) ?: return false
         return try {
             PasswordPolicy.isShortLegacyPassword(chars)
@@ -892,9 +934,11 @@ class VaultViewModel(
             val liveAutofill = AutofillHelper.isAutofillServiceEnabled(context)
             runCatching { preferencesRepository.setAutofillEnabled(liveAutofill) }
             val bioPref = preferencesRepository.biometricUnlockEnabled.first()
-            val actualBio = bioPref && BiometricKeystoreManager.hasKeystoreKey()
+            val actualBio = bioPref && BiometricKeystoreManager.hasKeystoreKey() &&
+                sessionManager.getActiveSlotIdOrNull() != VaultSessionManager.DECOY_SLOT
             val storedEmail = preferencesRepository.connectedGoogleAccount.first().trim()
             val hasRecoveryPwd = AutoCloudBackupKeyStore.hasRecoveryPassword(context)
+            val autoEnabled = preferencesRepository.autoCloudBackupEnabled.first()
             val legacyShort = withContext(Dispatchers.IO) { computeIsCloudRecoveryLegacyShort() }
             val currentOta = otaUpdateManager.otaState.value
             val updateAvailable = currentOta is OtaState.UpdateAvailable ||
@@ -903,9 +947,10 @@ class VaultViewModel(
             _uiState.update {
                 it.copy(
                     isBiometricsConfigured = actualBio,
-                    connectedGoogleEmail = storedEmail,
-                    autoCloudBackupKeyConfigured = hasRecoveryPwd,
-                    isCloudRecoveryPasswordLegacyShort = legacyShort,
+                    connectedGoogleEmail = if (realSessionId() != null) storedEmail else "",
+                    autoCloudBackupKeyConfigured = hasRecoveryPwd && realSessionId() != null,
+                    isCloudRecoveryPasswordLegacyShort = legacyShort && realSessionId() != null,
+                    autoCloudBackupEnabled = realSessionId() != null && autoEnabled,
                     privacyMetrics = it.privacyMetrics.copy(
                         isAutofillActive = liveAutofill,
                         isBiometricEnabled = actualBio,
@@ -917,6 +962,7 @@ class VaultViewModel(
     }
 
     fun disableBiometrics() {
+        if (realSessionId() == null) return
         viewModelScope.launch {
             repository.disableBiometricKey()
             preferencesRepository.setBiometricUnlockEnabled(false)
@@ -937,6 +983,9 @@ class VaultViewModel(
                 withContext(Dispatchers.Main) { onComplete?.invoke(ok, if (ok) null else "Check your primary password and use at least 12 characters for your decoy password.") }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) { onComplete?.invoke(false, VaultErrorMapper.mapVaultActionError(e)) }
+            } finally {
+                primaryPasswordChars.fill('\u0000')
+                decoyPasswordChars.fill('\u0000')
             }
         }
     }
@@ -971,6 +1020,10 @@ class VaultViewModel(
         onResult: (GoogleDriveAuthHelper.DriveAuthState) -> Unit
     ) {
         viewModelScope.launch {
+            if (realSessionId() == null) {
+                onResult(GoogleDriveAuthHelper.DriveAuthState.Failed("Unlock your main vault to connect Google Drive."))
+                return@launch
+            }
             val targetEmail = email?.trim()?.takeIf { it.isNotBlank() }
                 ?: preferencesRepository.connectedGoogleAccount.first().trim()
             val authState = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, targetEmail)
@@ -981,6 +1034,7 @@ class VaultViewModel(
     fun onGoogleAccountConnected(email: String, onComplete: ((Boolean) -> Unit)? = null) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                requireRealSession()
                 val cleanEmail = email.trim()
                 preferencesRepository.setConnectedGoogleAccount(cleanEmail)
                 preferencesRepository.setAutoCloudBackupStatus("Connected to $cleanEmail")
@@ -1010,6 +1064,7 @@ class VaultViewModel(
     fun disconnectGoogleAccount(onComplete: (Boolean, String?) -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                requireRealSession()
                 CloudBackupScheduler.cancelAllCloudWork(context)
                 CloudBackupScheduler.clearPendingSnapshots(context)
                 AutoCloudBackupKeyStore.clearRecoveryPassword(context)
@@ -1044,6 +1099,7 @@ class VaultViewModel(
     ) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                requireRealSession()
                 if (enabled) {
                     val connectedEmail = preferencesRepository.connectedGoogleAccount.first().trim()
                     if (connectedEmail.isBlank()) {
@@ -1135,6 +1191,7 @@ class VaultViewModel(
     }
 
     fun setCloudBackupFrequency(frequency: CloudBackupFrequency) {
+        if (realSessionId() == null) return
         viewModelScope.launch(Dispatchers.IO) {
             preferencesRepository.setCloudBackupFrequency(frequency)
             _uiState.update { it.copy(cloudBackupFrequency = frequency) }
@@ -1148,6 +1205,7 @@ class VaultViewModel(
     }
 
     fun setCloudBackupWifiOnly(wifiOnly: Boolean) {
+        if (realSessionId() == null) return
         viewModelScope.launch(Dispatchers.IO) {
             preferencesRepository.setCloudBackupWifiOnly(wifiOnly)
             _uiState.update { it.copy(cloudBackupWifiOnly = wifiOnly) }
@@ -1170,12 +1228,13 @@ class VaultViewModel(
             if (email.isBlank()) return@launch
             val recoveryPwd = AutoCloudBackupKeyStore.readRecoveryPasswordOrNull(context) ?: return@launch
             try {
-                val items = repository.getAllItemsForActiveSlot()
+                val items = repository.getAllItemsForActiveSlot(session.sessionId)
                 CloudBackupScheduler.stageEncryptedSnapshot(context, email) { fos ->
                     repository.createAuthoritativeStreamingBackup(
                         items = items,
                         backupPasswordChars = recoveryPwd,
-                        outputStream = fos
+                        outputStream = fos,
+                        expectedSessionId = session.sessionId
                     )
                 }
                 val wifiOnly = preferencesRepository.cloudBackupWifiOnly.first()
@@ -1207,6 +1266,7 @@ class VaultViewModel(
             var resolvedChars: CharArray? = null
             var ownsResolvedChars = false
             try {
+                val backupSessionId = requireRealSession()
                 val activePwd = if (backupPasswordChars != null && backupPasswordChars.isNotEmpty()) {
                     val policy = PasswordPolicy.validateNewPassword(backupPasswordChars, "Cloud backup password")
                     if (!policy.isValid) {
@@ -1249,21 +1309,24 @@ class VaultViewModel(
                     }
                 }
 
-                val allItems = repository.getAllItemsForActiveSlot()
+                val allItems = repository.getAllItemsForActiveSlot(backupSessionId)
                 FileOutputStream(tempBackupFile).use { fos ->
                     repository.createAuthoritativeStreamingBackup(
                         items = allItems,
                         backupPasswordChars = activePwd,
-                        outputStream = fos
+                        outputStream = fos,
+                        expectedSessionId = backupSessionId
                     )
                     fos.flush()
                     fos.fd.sync()
                 }
+                requireRealSession(backupSessionId)
                 var res = googleDriveSyncManager.uploadBackupSnapshotFile(token, tempBackupFile)
                 if (res is GoogleDriveSyncManager.SyncResult.Error && res.isAuthError) {
                     val refreshed = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)
                     if (refreshed is GoogleDriveAuthHelper.DriveAuthState.Authorized) {
                         token = refreshed.accessToken
+                        requireRealSession(backupSessionId)
                         res = googleDriveSyncManager.uploadBackupSnapshotFile(token, tempBackupFile)
                     } else if (refreshed is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent) {
                         withContext(Dispatchers.Main) {
@@ -1307,8 +1370,9 @@ class VaultViewModel(
         onDownloaded: (File?, String?) -> Unit
     ) {
         viewModelScope.launch(Dispatchers.IO) {
-            val targetFile = File(context.cacheDir, "cloud_download_${fileId.take(8)}_${System.currentTimeMillis()}.pvault")
+            val targetFile = File(context.cacheDir, "cloud_download_${java.util.UUID.randomUUID()}.pvault")
             try {
+                requireRealSession()
                 val email = preferencesRepository.connectedGoogleAccount.first().trim()
                 if (email.isBlank()) {
                     return@launch withContext(Dispatchers.Main) {
@@ -1367,6 +1431,7 @@ class VaultViewModel(
     ) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                requireRealSession()
                 val email = preferencesRepository.connectedGoogleAccount.first().trim()
                 if (email.isBlank()) {
                     withContext(Dispatchers.Main) { onResult(emptyList(), "Connect a Google account first.") }
@@ -1417,6 +1482,7 @@ class VaultViewModel(
     fun deleteCloudSnapshot(fileId: String, onComplete: (Boolean) -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                val expectedId = requireRealSession()
                 val email = preferencesRepository.connectedGoogleAccount.first().trim()
                 if (email.isBlank()) {
                     withContext(Dispatchers.Main) { onComplete(false) }
@@ -1425,11 +1491,13 @@ class VaultViewModel(
                 val authState = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)
                 var token = (authState as? GoogleDriveAuthHelper.DriveAuthState.Authorized)?.accessToken
                 if (token != null) {
+                    requireRealSession(expectedId)
                     var res = googleDriveSyncManager.deleteCloudBackup(token, fileId)
                     if (res is GoogleDriveSyncManager.SyncResult.Error && res.isAuthError) {
                         val refreshed = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)
                         if (refreshed is GoogleDriveAuthHelper.DriveAuthState.Authorized) {
                             token = refreshed.accessToken
+                            requireRealSession(expectedId)
                             res = googleDriveSyncManager.deleteCloudBackup(token, fileId)
                         }
                     }
@@ -1525,7 +1593,8 @@ class VaultViewModel(
         _uiState.update { it.copy(isLoading = true, backupProgressRatio = 0f, backupStatusMessage = "Preparing backup...") }
         activeBackupJob = viewModelScope.launch(Dispatchers.IO) {
             try {
-                val allItems = repository.getAllItemsForActiveSlot()
+                val expectedId = sessionManager.getCurrentSessionId() ?: error("Unlock your vault first.")
+                val allItems = repository.getAllItemsForActiveSlot(expectedId)
                 val filteredItems = when (scope) {
                     BackupExportScope.ALL_DATA -> allItems
                     BackupExportScope.NOTES_PASSWORDS_LINKS -> allItems.filter {
@@ -1542,6 +1611,7 @@ class VaultViewModel(
                     items = filteredItems,
                     backupPasswordChars = passwordChars,
                     outputStream = outputStream,
+                    expectedSessionId = expectedId,
                     isCancelled = { !isActive },
                     onProgress = { written, total ->
                         val ratio = if (total > 0L) (written.toFloat() / total.toFloat()).coerceIn(0f, 1f) else 0f
@@ -1774,6 +1844,7 @@ class VaultViewModel(
                     }
                     return@launch
                 }
+                _uiState.update { it.copy(isVaultInitialized = true, isBiometricsConfigured = false) }
                 ensureActive()
                 repository.commitRestore(staged, mode, isCancelled = { !isActive })
                 currentStagedRestore = null

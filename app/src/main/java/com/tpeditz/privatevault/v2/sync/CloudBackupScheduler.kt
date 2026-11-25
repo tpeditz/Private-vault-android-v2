@@ -166,7 +166,7 @@ object CloudBackupScheduler {
         dir: File,
         accountEmail: String
     ): StagedCloudSnapshot? = snapshotCoordinatorMutex.withLock {
-        if (!dir.exists() || accountEmail.isBlank()) return@withLock null
+        if (activeUploadingSnapshotId != null || !dir.exists() || accountEmail.isBlank()) return@withLock null
         val candidates = listValidSnapshotsInDirLocked(dir)
             .filter { it.meta.accountEmail.equals(accountEmail, ignoreCase = true) }
             .sortedByDescending { it.meta.preparedAtEpochMs }

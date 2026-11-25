@@ -92,7 +92,7 @@ object StreamingMediaCryptoEngine {
         require(fileMediaKey.size == CryptoEngine.DEK_BYTES) { "Media key must be 32 bytes." }
         require(expectedPlaintextSize > 0L) { "Cannot import an empty (0-byte) file." }
 
-        val totalChunksLong = (expectedPlaintextSize + CHUNK_PLAIN_BYTES - 1L) / CHUNK_PLAIN_BYTES.toLong()
+        val totalChunksLong = (expectedPlaintextSize - 1L) / CHUNK_PLAIN_BYTES.toLong() + 1L
         require(totalChunksLong in 1L..Int.MAX_VALUE.toLong()) { "Invalid chunk count." }
         val totalChunks = totalChunksLong.toInt()
 
@@ -283,6 +283,9 @@ object StreamingMediaCryptoEngine {
         val nominalChunk = bb.int
         val totalChunks = bb.int
         val totalPlain = bb.long
+        require(formatVersion == FORMAT_VERSION_V1 && flags == 0) { "Unsupported encrypted media format." }
+        require(nominalChunk == CHUNK_PLAIN_BYTES && totalPlain > 0L && totalChunks > 0) { "Invalid encrypted media header." }
+        require((totalPlain - 1L) / CHUNK_PLAIN_BYTES + 1L == totalChunks.toLong()) { "Invalid encrypted media chunk count." }
         return ParsedMediaHeader(
             formatVersion = formatVersion,
             flags = flags,
@@ -290,6 +293,16 @@ object StreamingMediaCryptoEngine {
             totalChunks = totalChunks,
             totalPlaintextBytes = totalPlain
         )
+    }
+
+    private fun expectedChunkLength(header: ParsedMediaHeader, index: Int): Int {
+        require(index in 0 until header.totalChunks) { "Invalid media chunk index." }
+        return minOf(CHUNK_PLAIN_BYTES.toLong(), header.totalPlaintextBytes - index.toLong() * CHUNK_PLAIN_BYTES).toInt()
+    }
+
+    private fun requireFileSize(header: ParsedMediaHeader, size: Long) {
+        val overhead = HEADER_BYTES.toLong() + header.totalChunks.toLong() * CHUNK_FRAME_OVERHEAD_BYTES
+        require(size >= overhead && size - overhead == header.totalPlaintextBytes) { "Encrypted media length is invalid." }
     }
 
     @Throws(IOException::class, AEADBadTagException::class)
@@ -304,6 +317,7 @@ object StreamingMediaCryptoEngine {
             val headerBytes = ByteArray(HEADER_BYTES)
             raf.readFully(headerBytes)
             val header = parseHeaderBytes(headerBytes)
+            requireFileSize(header, raf.length())
 
             val frameHeaderBuf = ByteArray(4 + CryptoEngine.NONCE_BYTES)
             val nonce = ByteArray(CryptoEngine.NONCE_BYTES)
@@ -315,6 +329,7 @@ object StreamingMediaCryptoEngine {
                 bb.get(nonce)
 
                 val isLast = (i == header.totalChunks - 1)
+                require(chunkPlainLen == expectedChunkLength(header, i)) { "Invalid encrypted chunk length." }
                 val cipherLen = chunkPlainLen + CryptoEngine.GCM_TAG_BYTES
                 val cipherBuf = ByteArray(cipherLen)
                 raf.readFully(cipherBuf)
@@ -406,8 +421,9 @@ object StreamingMediaCryptoEngine {
         private val mediaFile: File,
         private val mediaId: String,
         private val vaultSlot: Int,
-        private val fileMediaKey: ByteArray
+        fileMediaKey: ByteArray
     ) : MediaDataSource() {
+        private val fileMediaKey = fileMediaKey.copyOf()
 
         private val raf: RandomAccessFile = RandomAccessFile(mediaFile, "r")
         private val header: ParsedMediaHeader
@@ -421,8 +437,15 @@ object StreamingMediaCryptoEngine {
 
         init {
             val headerBuf = ByteArray(HEADER_BYTES)
-            raf.readFully(headerBuf)
-            header = parseHeaderBytes(headerBuf)
+            try {
+                raf.readFully(headerBuf)
+                header = parseHeaderBytes(headerBuf)
+                requireFileSize(header, raf.length())
+            } catch (e: Exception) {
+                raf.close()
+                Arrays.fill(fileMediaKey, 0.toByte())
+                throw e
+            }
         }
 
         @Synchronized
@@ -430,10 +453,11 @@ object StreamingMediaCryptoEngine {
 
         @Synchronized
         override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+            require(position >= 0L && offset >= 0 && size >= 0 && offset <= buffer.size && size <= buffer.size - offset)
+            if (size == 0) return 0
             if (position >= header.totalPlaintextBytes) return -1
-            if (size <= 0) return 0
 
-            val toRead = size.coerceAtMost((header.totalPlaintextBytes - position).toInt())
+            val toRead = minOf(size.toLong(), header.totalPlaintextBytes - position).toInt()
             var bytesCopied = 0
 
             while (bytesCopied < toRead) {
@@ -473,14 +497,16 @@ object StreamingMediaCryptoEngine {
         }
 
         private fun readAndDecryptChunkAt(index: Int): ByteArray {
+            val expectedLength = expectedChunkLength(header, index)
             // Compute file offset of chunk frame `index`
-            var frameOffset = HEADER_BYTES.toLong() + (index.toLong() * FULL_CHUNK_FRAME_BYTES.toLong())
+            val frameOffset = HEADER_BYTES.toLong() + (index.toLong() * FULL_CHUNK_FRAME_BYTES.toLong())
             raf.seek(frameOffset)
 
             val frameHeader = ByteArray(4 + CryptoEngine.NONCE_BYTES)
             raf.readFully(frameHeader)
             val bb = ByteBuffer.wrap(frameHeader)
             val plainLen = bb.int
+            require(plainLen == expectedLength) { "Invalid encrypted chunk length." }
             val nonce = ByteArray(CryptoEngine.NONCE_BYTES)
             bb.get(nonce)
 
@@ -516,6 +542,7 @@ object StreamingMediaCryptoEngine {
             cachedChunkBytesB = null
             cachedChunkIndexA = -1
             cachedChunkIndexB = -1
+            Arrays.fill(fileMediaKey, 0.toByte())
             runCatching { raf.close() }
         }
     }

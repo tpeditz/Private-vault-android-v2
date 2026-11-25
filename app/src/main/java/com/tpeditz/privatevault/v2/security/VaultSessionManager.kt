@@ -46,6 +46,7 @@ class VaultSessionManager(
             val unlockedAtEpochMs: Long = System.currentTimeMillis()
         ) : SessionState {
 
+            @Synchronized
             fun borrowDekCopy(): ByteArray {
                 check(!isWiped) { "Session $sessionId has already been locked and wiped." }
                 return internalDekBytes.copyOf()
@@ -58,6 +59,7 @@ class VaultSessionManager(
             var isWiped: Boolean = false
                 private set
 
+            @Synchronized
             internal fun wipeKeyMaterial() {
                 isWiped = true
                 Arrays.fill(internalDekBytes, 0.toByte())
@@ -157,10 +159,9 @@ class VaultSessionManager(
         lastBackgroundedAtMonotonicMs = null
 
         // If file picker immunity is active, do not lock due to background timeout
-        if (now <= filePickerGrantUntilMonotonicMs) {
-            return false
-        }
+        val grant = filePickerGrantUntilMonotonicMs
         filePickerGrantUntilMonotonicMs = 0L
+        if (bgTime != null && grant > 0L && now <= grant) return false
 
         if (bgTime != null && timeoutSeconds >= 0) {
             val elapsedMs = now - bgTime
@@ -204,6 +205,26 @@ class VaultSessionManager(
             "Vault operation rejected: Vault is locked."
         }
         return s
+    }
+
+    @Synchronized
+    fun runIfCurrentSession(expectedId: Long, action: () -> Unit): Boolean {
+        val current = getActiveSession()
+        if (current?.sessionId != expectedId) return false
+        action()
+        return true
+    }
+
+    @Synchronized
+    fun refreshRealDecoyPolicy(expectedId: Long, enabled: Boolean) {
+        val current = getActiveSession() ?: return
+        if (current.sessionId != expectedId || current.slotId != REAL_SLOT) return
+        val copy = current.borrowDekCopy()
+        try {
+            openSession(REAL_SLOT, copy, enabled)
+        } finally {
+            Arrays.fill(copy, 0.toByte())
+        }
     }
 
     fun getActiveSession(): SessionState.Unlocked? {

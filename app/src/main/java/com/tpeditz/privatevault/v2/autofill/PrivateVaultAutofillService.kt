@@ -120,6 +120,7 @@ class PrivateVaultAutofillService : AutofillService() {
             val unlockIntent = Intent(this, AutofillAuthActivity::class.java).apply {
                 putExtra("packageName", packageName)
                 putExtra("targetDomain", targetDomain)
+                putExtra("targetScheme", parsedFields.webScheme.orEmpty())
                 putExtra("usernameId", parsedFields.usernameId)
                 putExtra("passwordId", parsedFields.passwordId)
             }
@@ -141,7 +142,7 @@ class PrivateVaultAutofillService : AutofillService() {
 
             val response = FillResponse.Builder()
                 .setAuthentication(
-                    arrayOf(parsedFields.usernameId ?: parsedFields.passwordId!!),
+                    listOfNotNull(parsedFields.usernameId, parsedFields.passwordId).toTypedArray(),
                     pendingIntent.intentSender,
                     remoteViews
                 )
@@ -154,7 +155,8 @@ class PrivateVaultAutofillService : AutofillService() {
         // Vault is unlocked: Look up authentic credentials
         serviceScope.launch {
             try {
-                val allItems = app.repository.getAllItemsForActiveSlot()
+                val expectedId = app.sessionManager.getCurrentSessionId() ?: run { callback.onSuccess(null); return@launch }
+                val allItems = app.repository.getAllItemsForActiveSlot(expectedId)
                 val credentials = allItems.filterIsInstance<CredentialRecord>()
                     .filter { !it.isArchived && !it.isTrashed }
 
@@ -205,7 +207,9 @@ class PrivateVaultAutofillService : AutofillService() {
                     credentials = directMatches
                 )
 
-                callback.onSuccess(fillResponse)
+                if (!app.sessionManager.runIfCurrentSession(expectedId) {
+                    if (!cancellationSignal.isCanceled) callback.onSuccess(fillResponse)
+                }) callback.onSuccess(null)
             } catch (e: Exception) {
                 SafeVaultLogger.e("Autofill", "Fill request failed", e)
                 callback.onSuccess(null)
@@ -248,9 +252,9 @@ class PrivateVaultAutofillService : AutofillService() {
                             ?: "android://${structure.activityComponent.packageName}"
                     )
                     app.repository.saveItem(newCred)
-                    SafeVaultLogger.i("Autofill", "Saved autofilled credential for $serviceName")
+                    SafeVaultLogger.i("Autofill", "Saved a credential")
                 } catch (e: Exception) {
-                    SafeVaultLogger.w("Autofill", "Failed to save credential: ${e.message}")
+                    SafeVaultLogger.w("Autofill", "Failed to save credential")
                 } finally {
                     callback.onSuccess()
                 }

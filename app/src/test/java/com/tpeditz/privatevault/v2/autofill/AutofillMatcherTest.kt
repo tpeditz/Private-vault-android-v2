@@ -11,14 +11,21 @@ class AutofillMatcherTest {
     @Test
     fun testDomainNormalization() {
         assertEquals("github.com", AutofillHelper.normalizeDomain("https://github.com/login"))
-        assertEquals("github.com", AutofillHelper.normalizeDomain("http://www.github.com"))
-        assertEquals("github.com", AutofillHelper.normalizeDomain("www.github.com/settings"))
+        assertEquals("www.github.com", AutofillHelper.normalizeDomain("http://www.github.com"))
+        assertEquals("www.github.com", AutofillHelper.normalizeDomain("www.github.com/settings"))
         assertEquals("github.com", AutofillHelper.normalizeDomain("github.com"))
         assertEquals(
             "subdomain.example.com",
             AutofillHelper.normalizeDomain("https://subdomain.example.com:8443/auth?step=1")
         )
         assertEquals("", AutofillHelper.normalizeDomain(""))
+    }
+
+    @Test
+    fun unverifiedWebOriginRequiresManualSelection() {
+        val cred = CredentialRecord(serviceName = "Example", websiteUrl = "https://example.test",
+            username = "fixture", password = "TEST_ONLY_PASSWORD")
+        assertFalse(AutofillHelper.matchesTarget(cred, "example.test", "com.example.browser", "https"))
     }
 
     @Test
@@ -34,21 +41,21 @@ class AutofillMatcherTest {
             AutofillHelper.matchesTarget(
                 cred,
                 cleanTargetDomain = AutofillHelper.normalizeDomain("github.com"),
-                packageName = ""
+                packageName = "", targetScheme = "https", webOriginVerified = true
             )
         )
-        assertTrue(
+        assertFalse(
             AutofillHelper.matchesTarget(
                 cred,
                 cleanTargetDomain = AutofillHelper.normalizeDomain("www.github.com"),
-                packageName = ""
+                packageName = "", targetScheme = "https", webOriginVerified = true
             )
         )
         assertTrue(
             AutofillHelper.matchesTarget(
                 cred,
                 cleanTargetDomain = AutofillHelper.normalizeDomain("https://github.com/session"),
-                packageName = ""
+                packageName = "", targetScheme = "https", webOriginVerified = true
             )
         )
         assertFalse(
@@ -154,7 +161,7 @@ class AutofillMatcherTest {
                 webOnlyCred,
                 cleanTargetDomain = "github.com",
                 packageName = "",
-                targetScheme = "https"
+                targetScheme = "https", webOriginVerified = true
             )
         )
     }
@@ -174,18 +181,18 @@ class AutofillMatcherTest {
             websiteUrl = "https://bank.example.com"
         )
 
-        assertTrue(
+        assertFalse(
             AutofillHelper.matchesTarget(
                 cloudCred,
                 cleanTargetDomain = "cloud.google.com",
-                packageName = ""
+                packageName = "", targetScheme = "https", webOriginVerified = true
             )
         )
-        assertTrue(
+        assertFalse(
             AutofillHelper.matchesTarget(
                 cloudCred,
                 cleanTargetDomain = "google.com",
-                packageName = ""
+                packageName = "", targetScheme = "https", webOriginVerified = true
             )
         )
 

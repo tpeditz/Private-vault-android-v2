@@ -116,7 +116,7 @@ class OtaUpdateManager(
                     pInfo.versionCode.toLong()
                 }
             } catch (_: Exception) {
-                1L
+                BuildConfig.VERSION_CODE.toLong()
             }
         }
 
@@ -513,7 +513,7 @@ class OtaUpdateManager(
         require(result.isVerified) { "APK signature verification failed." }
 
         val signerCerts = result.signerCertificates
-        require(signerCerts.isNotEmpty()) { "No signer certificates found in candidate APK." }
+        require(signerCerts.size == 1) { "Candidate APK must have exactly one trusted signer." }
 
         val candidateCertSha256List = signerCerts.map { cert ->
             sha256Hex(cert.encoded).lowercase(Locale.US)
@@ -674,7 +674,21 @@ class OtaUpdateManager(
                 response.close()
                 throw HttpStatusException(code)
             }
-            return response.use { it.body?.string().orEmpty() }
+            return response.use {
+                val body = it.body ?: throw IllegalArgumentException("Missing update manifest.")
+                val limit = 256 * 1024L
+                require(body.contentLength() <= limit) { "Update manifest is too large." }
+                val out = java.io.ByteArrayOutputStream()
+                body.byteStream().use { input ->
+                    val buffer = ByteArray(8192)
+                    var count: Int
+                    while (input.read(buffer).also { count = it } != -1) {
+                        require(out.size().toLong() + count <= limit) { "Update manifest is too large." }
+                        out.write(buffer, 0, count)
+                    }
+                }
+                out.toString("UTF-8")
+            }
         }
         throw IllegalArgumentException("Too many redirects.")
     }

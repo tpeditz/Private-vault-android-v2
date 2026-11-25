@@ -143,11 +143,8 @@ class VaultRepository(
     }
 
     suspend fun isDecoyConfigured(): Boolean = withContext(Dispatchers.IO) {
-        val decoyEnv = dao.getEnvelopeForSlot(VaultSessionManager.DECOY_SLOT) ?: return@withContext false
-        val realEnv = dao.getEnvelopeForSlot(VaultSessionManager.REAL_SLOT) ?: return@withContext false
-        // Slot 0 holds the authoritative decoyPolicyFlag inside its authenticated envelope,
-        // but if unlocked we check session. If locked we check the DB record.
-        true
+        val session = sessionManager.getActiveSession()
+        session?.slotId == VaultSessionManager.REAL_SLOT && session.isDecoyConfiguredInRealVault
     }
 
     /**
@@ -159,6 +156,10 @@ class VaultRepository(
     ): AuthResult = withContext(Dispatchers.IO) {
         vaultMutationMutex.withLock {
             kdfMutex.withLock {
+                if (dao.getEnvelopeForSlot(VaultSessionManager.REAL_SLOT) != null ||
+                    dao.getEnvelopeForSlot(VaultSessionManager.DECOY_SLOT) != null) {
+                    return@withContext AuthResult.Error("A vault already exists. Unlock the existing vault instead.")
+                }
                 val policy = PasswordPolicy.validateNewPassword(masterPasswordChars, "Master password")
                 if (!policy.isValid) {
                     return@withContext AuthResult.Error(policy.errorMessage ?: "Invalid master password.")
@@ -505,7 +506,9 @@ class VaultRepository(
      */
     suspend fun enrollBiometricKey(cipher: Cipher): Boolean = withContext(Dispatchers.IO) {
         val session = sessionManager.requireUnlockedSession()
-        require(session.slotId == VaultSessionManager.REAL_SLOT) { "Biometrics allowed for Real Vault only." }
+        require(session.slotId == VaultSessionManager.REAL_SLOT && !session.isDecoyConfiguredInRealVault) {
+            "Biometrics are unavailable for this vault configuration."
+        }
 
         val realEnv = dao.getEnvelopeForSlot(VaultSessionManager.REAL_SLOT) ?: return@withContext false
         val dek = session.borrowDekCopy()
@@ -541,8 +544,13 @@ class VaultRepository(
     ): Boolean = withContext(Dispatchers.IO) {
         vaultMutationMutex.withLock {
             kdfMutex.withLock {
+                val activeSession = sessionManager.requireUnlockedSession()
+                require(activeSession.slotId == VaultSessionManager.REAL_SLOT) { "Unlock the main vault to manage security settings." }
                 val policy = PasswordPolicy.validateNewPassword(decoyPasswordChars, "Decoy password")
                 require(policy.isValid) { policy.errorMessage ?: "Invalid decoy password." }
+                require(!primaryPasswordChars.contentEquals(decoyPasswordChars) &&
+                    java.text.Normalizer.normalize(String(primaryPasswordChars), java.text.Normalizer.Form.NFC) !=
+                    java.text.Normalizer.normalize(String(decoyPasswordChars), java.text.Normalizer.Form.NFC)) { "Choose a different decoy password." }
             val realEnv = dao.getEnvelopeForSlot(VaultSessionManager.REAL_SLOT) ?: return@withLock false
             val decoyEnv = dao.getEnvelopeForSlot(VaultSessionManager.DECOY_SLOT) ?: return@withLock false
 
@@ -664,6 +672,7 @@ class VaultRepository(
                 decoySlotId = VaultSessionManager.DECOY_SLOT,
                 seedRecords = seedRecords
             )
+            sessionManager.refreshRealDecoyPolicy(activeSession.sessionId, true)
             true
             }
         }
@@ -675,6 +684,8 @@ class VaultRepository(
     suspend fun disableDecoyVault(primaryPasswordChars: CharArray): Boolean = withContext(Dispatchers.IO) {
         vaultMutationMutex.withLock {
             kdfMutex.withLock {
+                val activeSession = sessionManager.requireUnlockedSession()
+                require(activeSession.slotId == VaultSessionManager.REAL_SLOT) { "Unlock the main vault to manage security settings." }
             val realEnv = dao.getEnvelopeForSlot(VaultSessionManager.REAL_SLOT) ?: return@withLock false
             val decoyEnv = dao.getEnvelopeForSlot(VaultSessionManager.DECOY_SLOT) ?: return@withLock false
 
@@ -749,6 +760,7 @@ class VaultRepository(
                 dummyDecoyEnvelope = updatedDecoyEnv,
                 decoySlotId = VaultSessionManager.DECOY_SLOT
             )
+            sessionManager.refreshRealDecoyPolicy(activeSession.sessionId, false)
             true
             }
         }
@@ -832,8 +844,9 @@ class VaultRepository(
         val corruptedCount: Int = 0
     )
 
-    suspend fun getAllItemsForActiveSlotWithAudit(): LoadedVaultItems = withContext(Dispatchers.IO) {
+    suspend fun getAllItemsForActiveSlotWithAudit(expectedSessionId: Long? = null): LoadedVaultItems = withContext(Dispatchers.IO) {
         val session = sessionManager.requireUnlockedSession()
+        require(expectedSessionId == null || session.sessionId == expectedSessionId) { "Vault session changed." }
         val records = dao.getRecordsForSlot(session.slotId)
         val dek = session.borrowDekCopy()
         val items = mutableListOf<VaultItem>()
@@ -860,11 +873,12 @@ class VaultRepository(
         } finally {
             Arrays.fill(dek, 0.toByte())
         }
+        require(sessionManager.getCurrentSessionId() == session.sessionId) { "Vault session changed." }
         LoadedVaultItems(items = items, corruptedCount = corrupted)
     }
 
-    suspend fun getAllItemsForActiveSlot(): List<VaultItem> = withContext(Dispatchers.IO) {
-        getAllItemsForActiveSlotWithAudit().items
+    suspend fun getAllItemsForActiveSlot(expectedSessionId: Long? = null): List<VaultItem> = withContext(Dispatchers.IO) {
+        getAllItemsForActiveSlotWithAudit(expectedSessionId).items
     }
 
     suspend fun saveItem(item: VaultItem): Unit = withContext(Dispatchers.IO) {
@@ -1339,12 +1353,16 @@ class VaultRepository(
         }
         require(mediaFile.exists()) { "Encrypted video file not found." }
         val fileMediaKey = Base64.decode(mediaRecord.fileMediaKeyBase64)
-        StreamingMediaCryptoEngine.EncryptedChunkMediaDataSource(
-            mediaFile = mediaFile,
-            mediaId = mediaRecord.id,
-            vaultSlot = session.slotId,
-            fileMediaKey = fileMediaKey
-        )
+        try {
+            StreamingMediaCryptoEngine.EncryptedChunkMediaDataSource(
+                mediaFile = mediaFile,
+                mediaId = mediaRecord.id,
+                vaultSlot = session.slotId,
+                fileMediaKey = fileMediaKey
+            )
+        } finally {
+            Arrays.fill(fileMediaKey, 0.toByte())
+        }
     }
 
     suspend fun loadDecryptedThumbnailBytes(mediaRecord: MediaRecord): ByteArray = withContext(Dispatchers.IO) {
@@ -1410,14 +1428,16 @@ class VaultRepository(
         items: List<VaultItem>,
         backupPasswordChars: CharArray,
         outputStream: OutputStream,
-        appVersionName: String = "2.0.1",
+        appVersionName: String = com.tpeditz.privatevault.v2.BuildConfig.VERSION_NAME.removeSuffix("-debug"),
         kdfParams: CryptoEngine.KdfParams = CryptoEngine.KdfParams(),
         isCancelled: () -> Boolean = { false },
-        onProgress: (bytesWritten: Long, totalEstimatedBytes: Long) -> Unit = { _, _ -> }
+        onProgress: (bytesWritten: Long, totalEstimatedBytes: Long) -> Unit = { _, _ -> },
+        expectedSessionId: Long? = null
     ) = withContext(Dispatchers.IO) {
         vaultMutationMutex.withLock {
             val session = sessionManager.requireUnlockedSession()
             val initialSessionId = session.sessionId
+            require(expectedSessionId == null || initialSessionId == expectedSessionId) { "Vault session changed." }
             val slotId = session.slotId
             require(!session.isWiped) { "Vault session is invalid or wiped." }
 
@@ -1472,10 +1492,10 @@ class VaultRepository(
             var folderIdx = -1
 
             headers.forEachIndexed { index, rawHeader ->
-                val h = rawHeader.trim().lowercase()
+                val h = rawHeader.trim().removePrefix("\uFEFF").lowercase()
                 when {
-                    h.contains("title") || h.contains("service") || h.contains("name") -> if (titleIdx == -1) titleIdx = index
                     h.contains("username") || h.contains("login") || h.contains("email") || h.contains("user") -> if (userIdx == -1) userIdx = index
+                    h.contains("title") || h.contains("service") || h == "name" -> if (titleIdx == -1) titleIdx = index
                     h.contains("password") || h.contains("pass") -> if (pwdIdx == -1) pwdIdx = index
                     h.contains("url") || h.contains("website") || h.contains("uri") -> if (urlIdx == -1) urlIdx = index
                     h.contains("note") || h.contains("comment") -> if (notesIdx == -1) notesIdx = index
@@ -1599,7 +1619,7 @@ class VaultRepository(
         return when {
             db != null -> db.withTransaction { block() }
             dao is TransactionalVaultDao -> dao.withTransaction(block)
-            else -> block()
+            else -> throw IllegalStateException("Restore requires an available database transaction.")
         }
     }
 
@@ -1697,14 +1717,10 @@ class VaultRepository(
             fos.flush()
             fos.fd.sync()
         }
-        if (journalFile.exists() && !journalFile.delete()) {
-            throw java.io.IOException("Could not replace existing restore journal.")
-        }
+        // Same-directory rename on Android replaces the prior journal atomically.
+        // Never fall back to a partial overwrite or remove the old journal first.
         if (!tempFile.renameTo(journalFile)) {
-            tempFile.copyTo(journalFile, overwrite = true)
-            if (!tempFile.delete()) {
-                SafeVaultLogger.w("VaultRepo", "Could not remove temporary journal file")
-            }
+            throw java.io.IOException("Could not atomically replace restore journal.")
         }
         check(journalFile.exists()) { "Restore journal was not persisted safely." }
     }
@@ -1818,7 +1834,7 @@ class VaultRepository(
                         if (path.isNotBlank()) {
                             val f = File(path)
                             val canon = runCatching { f.canonicalPath }.getOrNull()
-                            if (f.exists() && (canon == null || !authoritativeReferencedPaths.contains(canon))) {
+                            if (f.exists() && canon != null && !authoritativeReferencedPaths.contains(canon)) {
                                 if (!f.delete()) allCleanupSucceeded = false
                             }
                         }
@@ -1863,12 +1879,10 @@ class VaultRepository(
             val initialSessionId = session.sessionId
             val slotId = session.slotId
             require(!session.isWiped) { "Vault operation rejected: Vault session is wiped or invalid." }
-            val dek = session.borrowDekCopy()
 
             val mediaDir = File(filesDir, "media").apply { mkdirs() }
             val thumbDir = File(filesDir, "thumbs").apply { mkdirs() }
             val docDir = File(filesDir, "documents").apply { mkdirs() }
-            val filesDirCanonical = filesDir.canonicalPath
 
             val stagedMediaDir = File(staged.stagingDir, "media")
             val stagedThumbDir = File(staged.stagingDir, "thumbs")
@@ -1884,6 +1898,7 @@ class VaultRepository(
             for (item in staged.payload.items) {
                 if (isCancelled()) throw CancellationException("Restore cancelled during validation.")
                 require(item.id.isNotBlank()) { "Restore rejected: Encountered record with blank ID." }
+                if (item is MediaRecord || item is DocumentRecord) VaultFileSafety.requireAssetId(item.id)
                 require(seenIds.add(item.id)) { "Restore rejected: Duplicate record ID ${item.id} in backup manifest." }
 
                 if (item is MediaRecord) {
@@ -2005,12 +2020,17 @@ class VaultRepository(
             val commitToken = UUID.randomUUID().toString().replace("-", "").take(12)
             val recoveryJournalDir = File(filesDir, RECOVERY_JOURNAL_DIR_NAME)
             val journalFile = File(recoveryJournalDir, RECOVERY_MANIFEST_FILE_NAME)
+            if (journalFile.exists()) {
+                check(executeRecoveryRollback(recoveryJournalDir, journalFile)) { "Previous restore recovery is still pending." }
+            }
 
             val writtenDurableFiles = mutableListOf<File>()
             val filesToDeleteAfterCommit = mutableListOf<File>()
+            var journalWritten = false
             val durableMediaRelPaths = mutableMapOf<String, Pair<String, String>>()
             val durableDocRelPaths = mutableMapOf<String, String>()
 
+            val dek = session.borrowDekCopy()
             try {
                 val existingRecordsMap = if (mode == RestoreMode.MERGE_KEEP_NEWEST) {
                     dao.getRecordsForSlot(slotId).associateBy { it.recordId }
@@ -2066,16 +2086,26 @@ class VaultRepository(
                     }
                 }
 
-                // Record journal BEFORE creating new files so abrupt kills can purge orphaned partial files
+                // Persist planned destinations before copying, including partially written files.
+                for (item in itemsToRestore) {
+                    if (item is MediaRecord) {
+                        writtenDurableFiles.add(VaultFileSafety.requireWithin(mediaDir, File(mediaDir, "${item.id}_$commitToken.pvmedia")))
+                        writtenDurableFiles.add(VaultFileSafety.requireWithin(thumbDir, File(thumbDir, "${item.id}_$commitToken.pvthumb")))
+                    } else if (item is DocumentRecord) {
+                        writtenDurableFiles.add(VaultFileSafety.requireWithin(docDir, File(docDir, "${item.id}_$commitToken.pvdoc")))
+                    }
+                }
                 writeRecoveryJournal(
                     recoveryJournalDir = recoveryJournalDir,
                     journalFile = journalFile,
                     slotId = slotId,
                     mode = mode,
                     state = STATE_PREPARING,
+                    stagingDir = staged.stagingDir,
                     writtenAssetFiles = writtenDurableFiles,
                     filesToDeleteAfterCommit = filesToDeleteAfterCommit
                 )
+                journalWritten = true
 
                 for (item in itemsToRestore) {
                     if (isCancelled()) throw CancellationException("Restore cancelled during file write.")
@@ -2095,13 +2125,13 @@ class VaultRepository(
                         val relThumbPath = "thumbs/${item.id}_$commitToken.pvthumb"
                         val destMediaFile = File(filesDir, relMediaPath)
                         val destThumbFile = File(filesDir, relThumbPath)
-                        require(destMediaFile.canonicalPath.startsWith(filesDirCanonical))
-                        require(destThumbFile.canonicalPath.startsWith(filesDirCanonical))
+                        VaultFileSafety.requireWithin(mediaDir, destMediaFile)
+                        VaultFileSafety.requireWithin(thumbDir, destThumbFile)
 
                         copyStreamWithSync(stagedMediaFile, destMediaFile)
-                        writtenDurableFiles.add(destMediaFile)
+
                         copyStreamWithSync(stagedThumbFile, destThumbFile)
-                        writtenDurableFiles.add(destThumbFile)
+
 
                         durableMediaRelPaths[item.id] = relMediaPath to relThumbPath
                     }
@@ -2114,10 +2144,10 @@ class VaultRepository(
 
                         val relDocPath = "documents/${item.id}_$commitToken.pvdoc"
                         val destDocFile = File(filesDir, relDocPath)
-                        require(destDocFile.canonicalPath.startsWith(filesDirCanonical))
+                        VaultFileSafety.requireWithin(docDir, destDocFile)
 
                         copyStreamWithSync(stagedDocFile, destDocFile)
-                        writtenDurableFiles.add(destDocFile)
+
 
                         durableDocRelPaths[item.id] = relDocPath
                     }
@@ -2130,6 +2160,7 @@ class VaultRepository(
                     slotId = slotId,
                     mode = mode,
                     state = STATE_STAGED,
+                    stagingDir = staged.stagingDir,
                     writtenAssetFiles = writtenDurableFiles,
                     filesToDeleteAfterCommit = filesToDeleteAfterCommit
                 )
@@ -2224,6 +2255,7 @@ class VaultRepository(
                             slotId = slotId,
                             mode = mode,
                             state = STATE_COMMITTED,
+                            stagingDir = staged.stagingDir,
                             writtenAssetFiles = writtenDurableFiles,
                             filesToDeleteAfterCommit = filesToDeleteAfterCommit
                         )
@@ -2257,6 +2289,9 @@ class VaultRepository(
                     RestoreReport(restoredItems, restoredMedia, restoredDocs)
                 }
             } catch (e: Exception) {
+                if (journalWritten && journalFile.exists()) {
+                    executeRecoveryRollback(recoveryJournalDir, journalFile)
+                }
                 SafeVaultLogger.e("VaultRepo", "Restore aborted before commit", e)
                 throw e
             } finally {

@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
     <!-- Prevent standard unencrypted Android OS cloud backups of vault database and keystore -->
-    <exclude domain="database" path="private_vault_encrypted.db" />
+    <exclude domain="database" path="." />
     <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="." />
 </full-backup-content>

@@ -59,14 +59,15 @@ class CloudBackupWorker(
         // If vault is actively unlocked on Real Slot and backup is due (or no snapshot ready yet), stage an immutable snapshot
         if (stagedSnapshot == null && app != null && (now - lastCloudMs >= intervalMs || lastCloudMs == 0L)) {
             val session = app.sessionManager.getActiveSession()
-            val recoveryPwd = AutoCloudBackupKeyStore.readRecoveryPasswordOrNull(applicationContext)
+            val recoveryPwd = if (session?.slotId == VaultSessionManager.REAL_SLOT && !session.isWiped)
+                AutoCloudBackupKeyStore.readRecoveryPasswordOrNull(applicationContext) else null
             if (session != null &&
                 session.slotId == VaultSessionManager.REAL_SLOT &&
                 !session.isWiped &&
                 recoveryPwd != null
             ) {
                 try {
-                    val items = app.repository.getAllItemsForActiveSlot()
+                    val items = app.repository.getAllItemsForActiveSlot(session.sessionId)
                     CloudBackupScheduler.stageEncryptedSnapshot(
                         context = applicationContext,
                         accountEmail = expectedEmail
@@ -74,7 +75,8 @@ class CloudBackupWorker(
                         app.repository.createAuthoritativeStreamingBackup(
                             items = items,
                             backupPasswordChars = recoveryPwd,
-                            outputStream = fos
+                            outputStream = fos,
+                            expectedSessionId = session.sessionId
                         )
                     }
                     stagedSnapshot = CloudBackupScheduler.acquireLatestReadySnapshot(applicationContext, expectedEmail)

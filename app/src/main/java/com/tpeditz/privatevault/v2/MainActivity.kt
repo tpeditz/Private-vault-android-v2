@@ -215,8 +215,29 @@ class MainActivity : FragmentActivity() {
             var pendingDownloadSnapFileId by remember { mutableStateOf<String?>(null) }
             var pendingConnectedEmailForConsent by remember { mutableStateOf("") }
 
+            LaunchedEffect(uiState.isUnlocked, uiState.isVaultInitialized, uiState.activeSlotId) {
+                if (!uiState.isUnlocked && uiState.isVaultInitialized) {
+                    showCloudBackupPasswordDialog = false
+                    showCloudRestorePasswordDialog = false
+                    showRetryRestorePasswordDialog = false
+                    showFirstLaunchRestoreDialog = false
+                    cloudBackupPassword = ""
+                    confirmCloudBackupPassword = ""
+                    cloudRestorePassword = ""
+                    retryRestorePassword = ""
+                    firstLaunchRestorePassword = ""
+                    pendingBackupPassword?.fill('\u0000')
+                    pendingRestorePassword?.fill('\u0000')
+                    pendingBackupPassword = null
+                    pendingRestorePassword = null
+                    pendingBackupScope = null
+                    pendingDownloadSnapFileId = null
+                    pendingConnectedEmailForConsent = ""
+                }
+            }
+
             fun inspectLocalUriWithPassword(uri: Uri, passwordChars: CharArray) {
-                viewModel.grantFilePickerImmunity()
+                viewModel.clearFilePickerImmunity()
                 val ins = runCatching { contentResolver.openInputStream(uri) }.getOrNull()
                 if (ins != null) {
                     viewModel.inspectBackupForRestore(ins, passwordChars) { _, _ ->
@@ -260,7 +281,7 @@ class MainActivity : FragmentActivity() {
                 pendingBackupScope = null
                 pendingBackupPassword = null
                 if (uri != null && activeScope != null && activePwd != null) {
-                    viewModel.grantFilePickerImmunity()
+                    viewModel.clearFilePickerImmunity()
                     val os = runCatching { contentResolver.openOutputStream(uri) }.getOrNull()
                     if (os != null) {
                         viewModel.exportStreamingBackup(
@@ -308,8 +329,8 @@ class MainActivity : FragmentActivity() {
                 contract = ActivityResultContracts.OpenDocument()
             ) { uri: Uri? ->
                 if (uri != null) {
-                    viewModel.grantFilePickerImmunity()
-                    val ins = contentResolver.openInputStream(uri)
+                    viewModel.clearFilePickerImmunity()
+                    val ins = runCatching { contentResolver.openInputStream(uri) }.getOrNull()
                     if (ins != null) {
                         viewModel.importCsv(ins) { imported, skipped ->
                             scope.launch {
@@ -324,7 +345,7 @@ class MainActivity : FragmentActivity() {
                 contract = ActivityResultContracts.PickMultipleVisualMedia()
             ) { uris: List<Uri> ->
                 if (uris.isNotEmpty()) {
-                    viewModel.grantFilePickerImmunity()
+                    viewModel.clearFilePickerImmunity()
                     viewModel.importVisualMedia(uris) { imported, failed ->
                         scope.launch {
                             val msg = "Imported $imported media item(s)" + if (failed > 0) " ($failed failed)" else ""
@@ -338,7 +359,7 @@ class MainActivity : FragmentActivity() {
                 contract = ActivityResultContracts.OpenMultipleDocuments()
             ) { uris: List<Uri> ->
                 if (uris.isNotEmpty()) {
-                    viewModel.grantFilePickerImmunity()
+                    viewModel.clearFilePickerImmunity()
                     viewModel.importDocuments(uris) { imported, failed ->
                         scope.launch {
                             val msg = "Imported $imported document(s)" + if (failed > 0) " ($failed failed)" else ""
@@ -456,7 +477,7 @@ class MainActivity : FragmentActivity() {
                                                     snackbarHostState.showSnackbar("Biometric cipher unavailable")
                                                 }
                                             } else {
-                                                snackbarHostState.showSnackbar("Biometrics not enrolled for Slot 0")
+                                                snackbarHostState.showSnackbar("Biometric unlock is not enrolled")
                                             }
                                         }
                                     }
@@ -556,10 +577,12 @@ class MainActivity : FragmentActivity() {
                                                 pendingBackupScope = scopeVal
                                                 pendingBackupPassword = pwd
                                                 val df = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                                                viewModel.grantFilePickerImmunity()
                                                 createBackupLauncher.launch("private_vault_backup_$df.pvault")
                                             },
                                             onTriggerOpenBackupDocument = { pwd ->
                                                 pendingRestorePassword = pwd
+                                                viewModel.grantFilePickerImmunity()
                                                 openBackupLauncher.launch(arrayOf("*/*"))
                                             },
                                             onConfirmRestore = { mode ->
@@ -586,7 +609,9 @@ class MainActivity : FragmentActivity() {
                                             uiState = uiState,
                                             isDriveConfigured = GoogleDriveAuthHelper.isGoogleDriveConfigured(),
                                             onConnectGoogle = {
-                                                if (!GoogleDriveAuthHelper.isPlayServicesAvailable(this@MainActivity)) {
+                                                if (uiState.activeSlotId != 0 || !uiState.isUnlocked) {
+                                                    scope.launch { snackbarHostState.showSnackbar("Unlock your main vault first.") }
+                                                } else if (!GoogleDriveAuthHelper.isPlayServicesAvailable(this@MainActivity)) {
                                                     scope.launch {
                                                         snackbarHostState.showSnackbar("Google Play Services is unavailable on this device.")
                                                     }
@@ -698,7 +723,7 @@ class MainActivity : FragmentActivity() {
                                             onSetAutoLockTimeout = { viewModel.setAutoLockTimeout(it) },
                                             onSetClipboardTtl = { viewModel.setClipboardTtl(it) },
                                             onEnableBiometrics = {
-                                                val cipher = BiometricKeystoreManager.getEncryptCipherForEnrollment()
+                                                val cipher = if (viewModel.canEnrollBiometrics()) BiometricKeystoreManager.getEncryptCipherForEnrollment() else null
                                                 if (cipher != null) {
                                                     val prompt = BiometricPrompt(
                                                         this@MainActivity,
@@ -707,7 +732,7 @@ class MainActivity : FragmentActivity() {
                                                             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                                                                 val authCipher = result.cryptoObject?.cipher ?: cipher
                                                                 scope.launch {
-                                                                    val ok = viewModel.enrollBiometrics(authCipher)
+                                                                    val ok = runCatching { viewModel.enrollBiometrics(authCipher) }.getOrDefault(false)
                                                                     snackbarHostState.showSnackbar(if (ok) "Biometric quick-unlock enrolled" else "Enrollment failed")
                                                                 }
                                                             }
@@ -718,7 +743,7 @@ class MainActivity : FragmentActivity() {
                                                     )
                                                     val promptInfo = BiometricPrompt.PromptInfo.Builder()
                                                         .setTitle("Enroll Biometric Quick-Unlock")
-                                                        .setSubtitle("Confirm your biometric identity to protect Vault Slot 0")
+                                                        .setSubtitle("Confirm your biometric identity to protect your vault")
                                                         .setNegativeButtonText("Cancel")
                                                         .build()
                                                     prompt.authenticate(promptInfo, BiometricPrompt.CryptoObject(cipher))
@@ -802,17 +827,19 @@ class MainActivity : FragmentActivity() {
                                                 onRestoreCredential = { viewModel.restoreCredentialFromTrash(it) },
                                                 onCopyPassword = { l, p -> viewModel.copySensitivePassword(l, p) },
                                                 onSearchChange = { viewModel.setSearchQuery(it) },
-                                                onPickCsvFile = { pickCsvLauncher.launch(arrayOf("*/*")) }
+                                                onPickCsvFile = { viewModel.grantFilePickerImmunity(); pickCsvLauncher.launch(arrayOf("*/*")) }
                                             )
                                             PrimaryTab.MEDIA -> MediaScreen(
                                                 uiState = uiState,
                                                 onNavigateToSecondary = { viewModel.navigateToSecondary(it) },
                                                 onPickMedia = {
+                                                    viewModel.grantFilePickerImmunity()
                                                     pickVisualMediaLauncher.launch(
                                                         PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
                                                     )
                                                 },
                                                 onPickDocument = {
+                                                    viewModel.grantFilePickerImmunity()
                                                     pickDocumentLauncher.launch(arrayOf("*/*"))
                                                 },
                                                 onDeleteMedia = { viewModel.deleteMedia(it) },
@@ -835,10 +862,10 @@ class MainActivity : FragmentActivity() {
                             }
                         }
 
-                        if (showFirstLaunchRestoreDialog) {
+                        if (showFirstLaunchRestoreDialog && !uiState.isVaultInitialized) {
                             var pwdError by remember { mutableStateOf<String?>(null) }
                             AlertDialog(
-                                onDismissRequest = { showFirstLaunchRestoreDialog = false },
+                                onDismissRequest = { showFirstLaunchRestoreDialog = false; firstLaunchRestorePassword = "" },
                                 title = { Text("Restore Vault from Backup") },
                                 text = {
                                     androidx.compose.foundation.layout.Column(verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(10.dp)) {
@@ -863,7 +890,9 @@ class MainActivity : FragmentActivity() {
                                                 pwdError = "Backup password cannot be empty"
                                             } else {
                                                 pendingRestorePassword = firstLaunchRestorePassword.toCharArray()
+                                                firstLaunchRestorePassword = ""
                                                 showFirstLaunchRestoreDialog = false
+                                                viewModel.grantFilePickerImmunity()
                                                 openBackupLauncher.launch(arrayOf("*/*"))
                                             }
                                         }
@@ -872,14 +901,14 @@ class MainActivity : FragmentActivity() {
                                     }
                                 },
                                 dismissButton = {
-                                    TextButton(onClick = { showFirstLaunchRestoreDialog = false }) {
+                                    TextButton(onClick = { showFirstLaunchRestoreDialog = false; firstLaunchRestorePassword = "" }) {
                                         Text("Cancel")
                                     }
                                 }
                             )
                         }
 
-                        if (showCloudBackupPasswordDialog) {
+                        if (showCloudBackupPasswordDialog && uiState.isUnlocked && uiState.activeSlotId == 0) {
                             var cloudPwdError by remember { mutableStateOf<String?>(null) }
                             val strengthReport = remember(cloudBackupPassword) {
                                 if (cloudBackupPassword.isNotEmpty()) OfflinePasswordStrengthEstimator.evaluate(cloudBackupPassword) else null
@@ -976,7 +1005,7 @@ class MainActivity : FragmentActivity() {
                             )
                         }
 
-                        if (showCloudRestorePasswordDialog) {
+                        if (showCloudRestorePasswordDialog && uiState.isUnlocked && uiState.activeSlotId == 0) {
                             var restorePwdError by remember { mutableStateOf<String?>(null) }
                             AlertDialog(
                                 onDismissRequest = {
@@ -1098,7 +1127,7 @@ class MainActivity : FragmentActivity() {
                             )
                         }
 
-                        if (showRetryRestorePasswordDialog) {
+                        if (showRetryRestorePasswordDialog && (!uiState.isVaultInitialized || uiState.isUnlocked)) {
                             var retryError by remember { mutableStateOf<String?>(null) }
                             AlertDialog(
                                 onDismissRequest = {

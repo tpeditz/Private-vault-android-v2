@@ -99,7 +99,6 @@ object EncryptedBackupV2Engine {
 
             var totalEstimatedBytes = HEADER_BYTES.toLong()
 
-            val baseCanonical = appFilesDir.canonicalPath
             val mediaEntriesArray = JSONArray()
             val mediaFileList = mutableListOf<Pair<File, File>>()
             for (media in mediaRecords) {
@@ -112,7 +111,7 @@ object EncryptedBackupV2Engine {
                     add(File(appFilesDir, "encrypted_media_${media.id}.pvm"))
                 }
                 val mediaFile = mediaCandidates.firstOrNull { it.exists() } ?: mediaCandidates.first()
-                require(mediaFile.canonicalPath.startsWith(baseCanonical)) {
+                require(VaultFileSafety.isWithin(appFilesDir, mediaFile)) {
                     "Backup aborted: media asset path escapes private directory."
                 }
                 require(mediaFile.exists() && mediaFile.length() > 0L) {
@@ -127,7 +126,7 @@ object EncryptedBackupV2Engine {
                     add(File(appFilesDir, "encrypted_thumb_${media.id}.pvt"))
                 }
                 val thumbFile = thumbCandidates.firstOrNull { it.exists() } ?: thumbCandidates.first()
-                require(thumbFile.canonicalPath.startsWith(baseCanonical)) {
+                require(VaultFileSafety.isWithin(appFilesDir, thumbFile)) {
                     "Backup aborted: thumbnail asset path escapes private directory."
                 }
                 require(thumbFile.exists() && thumbFile.length() > 0L) {
@@ -165,7 +164,7 @@ object EncryptedBackupV2Engine {
                     add(File(appFilesDir, "encrypted_doc_${doc.id}.pvm"))
                 }
                 val docFile = docCandidates.firstOrNull { it.exists() } ?: docCandidates.first()
-                require(docFile.canonicalPath.startsWith(baseCanonical)) {
+                require(VaultFileSafety.isWithin(appFilesDir, docFile)) {
                     "Backup aborted: document asset path escapes private directory."
                 }
                 require(docFile.exists() && docFile.length() > 0L) {
@@ -263,6 +262,7 @@ object EncryptedBackupV2Engine {
                     }
                 }
             }
+            require(totalBytesWritten == totalEstimatedBytes) { "Backup assets changed while exporting. Please retry." }
             outputStream.flush()
         } finally {
             Arrays.fill(backupKek, 0.toByte())
@@ -368,6 +368,7 @@ object EncryptedBackupV2Engine {
             if (mediaEntries != null) {
                 for (i in 0 until mediaEntries.length()) {
                     val m = mediaEntries.getJSONObject(i)
+                    VaultFileSafety.requireAssetId(m.getString("mediaId"))
                     mediaPayloadDescs.add(
                         MediaPayloadEntry(
                             mediaId = m.getString("mediaId"),
@@ -386,6 +387,7 @@ object EncryptedBackupV2Engine {
             if (docEntries != null) {
                 for (i in 0 until docEntries.length()) {
                     val d = docEntries.getJSONObject(i)
+                    VaultFileSafety.requireAssetId(d.getString("documentId"))
                     docPayloadDescs.add(
                         DocPayloadEntry(
                             documentId = d.getString("documentId"),
@@ -410,10 +412,11 @@ object EncryptedBackupV2Engine {
                 docEntries = docPayloadDescs
             )
 
-            val totalDeclaredPayloadBytes = HEADER_BYTES.toLong() +
-                manifestLen.toLong() +
-                mediaPayloadDescs.sumOf { it.mediaSizeBytes + it.thumbSizeBytes } +
-                docPayloadDescs.sumOf { it.docSizeBytes }
+            val totalDeclaredPayloadBytes = VaultFileSafety.checkedSizeTotal(
+                listOf(HEADER_BYTES.toLong(), manifestLen.toLong()) +
+                    mediaPayloadDescs.flatMap { listOf(it.mediaSizeBytes, it.thumbSizeBytes) } +
+                    docPayloadDescs.map { it.docSizeBytes }, MAX_SUPPORTED_BACKUP_BYTES
+            )
             require(totalDeclaredPayloadBytes <= MAX_SUPPORTED_BACKUP_BYTES) {
                 "Backup container exceeds maximum supported size (2 GiB). Declared: $totalDeclaredPayloadBytes bytes."
             }
@@ -440,9 +443,10 @@ object EncryptedBackupV2Engine {
         try {
             val (payload, details) = decryptAndVerifyManifest(inputStream, backupPasswordChars)
 
-            val totalExpectedPayloadBytes = HEADER_BYTES.toLong() +
-                details.mediaEntries.sumOf { it.mediaSizeBytes + it.thumbSizeBytes } +
-                details.docEntries.sumOf { it.docSizeBytes }
+            val totalExpectedPayloadBytes = VaultFileSafety.checkedSizeTotal(
+                listOf(HEADER_BYTES.toLong()) + details.mediaEntries.flatMap { listOf(it.mediaSizeBytes, it.thumbSizeBytes) } +
+                    details.docEntries.map { it.docSizeBytes }, MAX_SUPPORTED_BACKUP_BYTES
+            )
 
             require(totalExpectedPayloadBytes <= MAX_SUPPORTED_BACKUP_BYTES) {
                 "Backup container exceeds maximum supported size (2 GiB)."
@@ -450,7 +454,7 @@ object EncryptedBackupV2Engine {
 
             val availableSpace = stagingDir.usableSpace
             val requiredSpace = totalExpectedPayloadBytes + 10L * 1024L * 1024L // 10 MiB safety margin
-            if (availableSpace in 1 until requiredSpace) {
+            if (availableSpace < requiredSpace) {
                 throw java.io.IOException(
                     "Insufficient device storage to stage backup. Available: ${availableSpace / (1024 * 1024)} MiB, required: ${requiredSpace / (1024 * 1024)} MiB."
                 )
@@ -467,7 +471,7 @@ object EncryptedBackupV2Engine {
             for (mEntry in details.mediaEntries) {
                 if (isCancelled()) throw java.util.concurrent.CancellationException("Backup staging cancelled by user.")
                 if (mEntry.mediaSizeBytes > 0L) {
-                    val stagedMediaFile = File(mediaStagingDir, "${mEntry.mediaId}.pvmedia")
+                    val stagedMediaFile = VaultFileSafety.requireWithin(mediaStagingDir, File(mediaStagingDir, "${mEntry.mediaId}.pvmedia"))
                     copyExactBytesAndVerifySha256(
                         inputStream = inputStream,
                         targetFile = stagedMediaFile,
@@ -481,7 +485,7 @@ object EncryptedBackupV2Engine {
                 }
                 if (mEntry.thumbSizeBytes > 0L) {
                     if (isCancelled()) throw java.util.concurrent.CancellationException("Backup staging cancelled by user.")
-                    val stagedThumbFile = File(thumbStagingDir, "${mEntry.mediaId}.pvthumb")
+                    val stagedThumbFile = VaultFileSafety.requireWithin(thumbStagingDir, File(thumbStagingDir, "${mEntry.mediaId}.pvthumb"))
                     if (mEntry.thumbSha256.isNotBlank()) {
                         copyExactBytesAndVerifySha256(
                             inputStream = inputStream,
@@ -509,7 +513,7 @@ object EncryptedBackupV2Engine {
             for (dEntry in details.docEntries) {
                 if (isCancelled()) throw java.util.concurrent.CancellationException("Backup staging cancelled by user.")
                 if (dEntry.docSizeBytes > 0L) {
-                    val stagedDocFile = File(docStagingDir, "${dEntry.documentId}.pvdoc")
+                    val stagedDocFile = VaultFileSafety.requireWithin(docStagingDir, File(docStagingDir, "${dEntry.documentId}.pvdoc"))
                     copyExactBytesAndVerifySha256(
                         inputStream = inputStream,
                         targetFile = stagedDocFile,

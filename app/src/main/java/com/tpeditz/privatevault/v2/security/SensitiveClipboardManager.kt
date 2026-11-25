@@ -55,6 +55,7 @@ class SensitiveClipboardManager(
         private const val PENDING_CLEAR_RETENTION_MS = 15 * 60 * 1000L // 15 minutes
     }
 
+    @Synchronized
     fun copySensitiveSecret(
         label: String,
         secretValue: String,
@@ -95,10 +96,13 @@ class SensitiveClipboardManager(
                 remaining--
             }
             _activeCountdownSeconds.value = null
-            clearIfStillOwned()
+            synchronized(this@SensitiveClipboardManager) {
+                if (lastCopiedDigest === digest) clearIfStillOwned()
+            }
         }
     }
 
+    @Synchronized
     fun copyPublicText(label: String, text: String) {
         if (text.isEmpty()) return
         clearJob?.cancel()
@@ -113,10 +117,20 @@ class SensitiveClipboardManager(
         clipboardManager.setPrimaryClip(clip)
     }
 
+    @Synchronized
     fun clearIfStillOwned(): Boolean {
         val expected = lastCopiedDigest ?: return false
         val clip = runCatching { clipboardManager.primaryClip }.getOrNull()
-        if (clip == null || clip.itemCount == 0) {
+        if (clip == null) {
+            // Android may deny clipboard reads in the background. Keep only the digest.
+            wipeDigest(pendingClearDigest)
+            pendingClearDigest = expected.copyOf()
+            pendingClearExpiresAtMs = System.currentTimeMillis() + PENDING_CLEAR_RETENTION_MS
+            wipeDigest(lastCopiedDigest)
+            lastCopiedDigest = null
+            return false
+        }
+        if (clip.itemCount == 0) {
             wipeDigest(lastCopiedDigest)
             lastCopiedDigest = null
             return false
@@ -124,14 +138,18 @@ class SensitiveClipboardManager(
         val currentText = clip.getItemAt(0)?.text?.toString().orEmpty()
         val currentDigest = sha256(currentText)
         return if (MessageDigest.isEqual(expected, currentDigest)) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                clipboardManager.clearPrimaryClip()
-            } else {
-                clipboardManager.setPrimaryClip(ClipData.newPlainText("", ""))
+            val cleared = runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) clipboardManager.clearPrimaryClip()
+                else clipboardManager.setPrimaryClip(ClipData.newPlainText("", ""))
+            }.isSuccess
+            if (!cleared) {
+                wipeDigest(pendingClearDigest)
+                pendingClearDigest = expected.copyOf()
+                pendingClearExpiresAtMs = System.currentTimeMillis() + PENDING_CLEAR_RETENTION_MS
             }
             wipeDigest(lastCopiedDigest)
             lastCopiedDigest = null
-            true
+            cleared
         } else {
             wipeDigest(lastCopiedDigest)
             lastCopiedDigest = null
@@ -139,17 +157,20 @@ class SensitiveClipboardManager(
         }
     }
 
+    @Synchronized
     fun onAppForegrounded() {
         val pending = pendingClearDigest ?: return
-        if (System.currentTimeMillis() <= pendingClearExpiresAtMs) {
-            lastCopiedDigest = pending
-            clearIfStillOwned()
-        }
-        wipeDigest(pendingClearDigest)
+        val expires = pendingClearExpiresAtMs
         pendingClearDigest = null
         pendingClearExpiresAtMs = 0L
+        if (System.currentTimeMillis() <= expires) {
+            wipeDigest(lastCopiedDigest)
+            lastCopiedDigest = pending
+            clearIfStillOwned()
+        } else wipeDigest(pending)
     }
 
+    @Synchronized
     fun onLock() {
         clearIfStillOwned()
         clearJob?.cancel()

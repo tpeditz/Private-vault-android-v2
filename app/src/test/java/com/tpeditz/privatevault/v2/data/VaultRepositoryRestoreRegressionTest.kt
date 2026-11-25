@@ -49,6 +49,18 @@ class VaultRepositoryRestoreRegressionTest {
         )
     }
 
+    @Test
+    fun initializationDoesNotReplaceAnExistingVault() = runBlocking {
+        val repository = VaultRepository(dao, sessionManager, filesDir, cacheDir)
+        val params = CryptoEngine.KdfParams(memoryKb = 4096, iterations = 1, parallelism = 1)
+        val first = repository.createInitialVault("Fixture First Password".toCharArray(), params)
+        assertTrue(first is AuthResult.Success)
+        repository.saveItem(NoteRecord(title = "A saved note", body = "Synthetic test note"))
+        val second = repository.createInitialVault("Fixture Second Password".toCharArray(), params)
+        assertTrue(second is AuthResult.Error)
+        assertEquals("A saved note", repository.getAllItemsForActiveSlot().filterIsInstance<NoteRecord>().single().title)
+    }
+
     /**
      * Requirement 1 & 10:
      * Exercise the ACTUAL VaultRepository.commitRestore() in REPLACE mode.
