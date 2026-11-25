@@ -257,12 +257,13 @@ object LegacyV1BackupReader {
             val thumbStagingDir = java.io.File(stagingDir, "thumbs").apply { mkdirs() }
 
             for ((mediaId, blob) in payload.mediaPayloads) {
+                VaultFileSafety.requireAssetId(mediaId)
                 if (blob.mediaCiphertextBytes.isNotEmpty()) {
-                    val mediaFile = java.io.File(mediaStagingDir, "$mediaId.pvmedia")
+                    val mediaFile = VaultFileSafety.requireWithin(mediaStagingDir, java.io.File(mediaStagingDir, "$mediaId.pvmedia"))
                     mediaFile.writeBytes(blob.mediaCiphertextBytes)
                 }
                 if (blob.thumbCiphertextBytes.isNotEmpty()) {
-                    val thumbFile = java.io.File(thumbStagingDir, "$mediaId.pvthumb")
+                    val thumbFile = VaultFileSafety.requireWithin(thumbStagingDir, java.io.File(thumbStagingDir, "$mediaId.pvthumb"))
                     thumbFile.writeBytes(blob.thumbCiphertextBytes)
                 }
             }

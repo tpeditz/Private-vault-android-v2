@@ -169,9 +169,8 @@ interface VaultDao {
         envelopes: List<VaultEnvelopeEntity>,
         initialRecords: List<EncryptedRecordEntity>
     ) {
-        deleteAllRecords()
-        deleteAllMediaFiles()
-        deleteAllDocumentFiles()
+        // Setup is creation only, never a reset operation.
+        check(getEnvelopeForSlot(0) == null && getEnvelopeForSlot(1) == null) { "A vault already exists." }
         upsertEnvelopes(envelopes)
         if (initialRecords.isNotEmpty()) {
             upsertRecords(initialRecords)

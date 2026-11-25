@@ -25,7 +25,7 @@ object PasswordPolicy {
         passwordChars: CharArray,
         fieldLabel: String = "Password"
     ): ValidationResult {
-        if (passwordChars.isEmpty()) {
+        if (passwordChars.isEmpty() || passwordChars.all { it.isWhitespace() }) {
             return ValidationResult(
                 isValid = false,
                 errorMessage = "$fieldLabel cannot be empty."

@@ -30,6 +30,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -68,7 +69,7 @@ class AutofillAuthActivity : ComponentActivity() {
         val targetPackage = intent.getStringExtra("packageName").orEmpty()
         val rawDomain = intent.getStringExtra("targetDomain").orEmpty()
         val targetScheme = intent.getStringExtra("targetScheme").orEmpty()
-        val displayTarget = rawDomain.ifBlank { targetPackage.ifBlank { "this app" } }
+        val displayTarget = if (rawDomain.isNotBlank()) "$rawDomain — reported by $targetPackage (website not verified)" else targetPackage.ifBlank { "this app" }
 
         val usernameId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent.getParcelableExtra("usernameId", AutofillId::class.java)
@@ -109,9 +110,11 @@ class AutofillAuthActivity : ComponentActivity() {
                             var isAuthenticating by remember { mutableStateOf(false) }
                             var unlockedManualList by remember { mutableStateOf<List<CredentialRecord>?>(null) }
                             var searchQuery by remember { mutableStateOf("") }
+                            var pickerSessionId by remember { mutableStateOf<Long?>(null) }
+                            var pendingCredential by remember { mutableStateOf<CredentialRecord?>(null) }
                             val scope = rememberCoroutineScope()
 
-                            suspend fun finishWithCredentials(selected: List<CredentialRecord>) {
+                            suspend fun finishWithCredentials(selected: List<CredentialRecord>, expectedId: Long) {
                                 val fillResponse = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                                     PrivateVaultAutofillService.buildFillResponseForCredentials(
                                         context = applicationContext,
@@ -128,25 +131,35 @@ class AutofillAuthActivity : ComponentActivity() {
                                             putExtra(AutofillManager.EXTRA_AUTHENTICATION_RESULT, fillResponse)
                                         }
                                     }
-                                    setResult(Activity.RESULT_OK, replyIntent)
-                                    finish()
+                                    val delivered = app?.sessionManager?.runIfCurrentSession(expectedId) {
+                                        if (fillResponse != null) setResult(Activity.RESULT_OK, replyIntent)
+                                        else setResult(Activity.RESULT_CANCELED)
+                                        finish()
+                                    } == true
+                                    if (!delivered) {
+                                        setResult(Activity.RESULT_CANCELED)
+                                        finish()
+                                    }
                                 }
                             }
 
                             LaunchedEffect(Unit) {
                                 if (app != null && app.sessionManager.isUnlocked()) {
                                     withContext(Dispatchers.IO) {
-                                        val creds = app.repository.getAllItemsForActiveSlot()
+                                        val expectedId = app.sessionManager.getCurrentSessionId() ?: return@withContext
+                                        val creds = app.repository.getAllItemsForActiveSlot(expectedId)
                                             .filterIsInstance<CredentialRecord>()
                                             .filter { !it.isArchived && !it.isTrashed }
                                         val cleanTarget = AutofillHelper.normalizeDomain(rawDomain)
                                         val directMatches = creds.filter {
-                                            AutofillHelper.matchesTarget(it, cleanTarget, targetPackage, targetScheme.ifBlank { null })
+                                            (rawDomain.isBlank() || cleanTarget.isNotBlank()) &&
+                                                AutofillHelper.matchesTarget(it, cleanTarget, targetPackage, targetScheme.ifBlank { null })
                                         }
                                         if (directMatches.isNotEmpty()) {
-                                            finishWithCredentials(directMatches)
+                                            finishWithCredentials(directMatches, expectedId)
                                         } else {
                                             withContext(Dispatchers.Main) {
+                                                pickerSessionId = expectedId
                                                 unlockedManualList = creds
                                             }
                                         }
@@ -154,6 +167,34 @@ class AutofillAuthActivity : ComponentActivity() {
                                 }
                             }
 
+                            LaunchedEffect(pickerSessionId) {
+                                val expectedId = pickerSessionId ?: return@LaunchedEffect
+                                val manager = app?.sessionManager ?: return@LaunchedEffect
+                                manager.sessionState.collect {
+                                    if (manager.getCurrentSessionId() != expectedId) {
+                                        pendingCredential = null
+                                        unlockedManualList = null
+                                        setResult(Activity.RESULT_CANCELED)
+                                        finish()
+                                    }
+                                }
+                            }
+
+                            pendingCredential?.let { cred ->
+                                AlertDialog(
+                                    onDismissRequest = { pendingCredential = null },
+                                    title = { Text("Confirm filling this login") },
+                                    text = { Text("Fill ${cred.serviceName.ifBlank { "this login" }} in $displayTarget? Check the destination before continuing.") },
+                                    confirmButton = {
+                                        TextButton(onClick = {
+                                            pendingCredential = null
+                                            val expectedId = pickerSessionId
+                                            if (expectedId != null) scope.launch { finishWithCredentials(listOf(cred), expectedId) }
+                                        }) { Text("Fill once") }
+                                    },
+                                    dismissButton = { TextButton(onClick = { pendingCredential = null }) { Text("Cancel") } }
+                                )
+                            }
                             val pickerList = unlockedManualList
                             if (pickerList != null) {
                                 val filtered = remember(pickerList, searchQuery) {
@@ -172,7 +213,7 @@ class AutofillAuthActivity : ComponentActivity() {
                                     )
                                     Spacer(modifier = Modifier.height(4.dp))
                                     Text(
-                                        text = "No saved login matched $displayTarget automatically. Select one below to fill it once:",
+                                        text = "Select a login for $displayTarget. Only continue if you trust the destination.",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -199,9 +240,7 @@ class AutofillAuthActivity : ComponentActivity() {
                                                     modifier = Modifier
                                                         .fillMaxWidth()
                                                         .clickable {
-                                                            scope.launch(Dispatchers.IO) {
-                                                                finishWithCredentials(listOf(cred))
-                                                            }
+                                                            pendingCredential = cred
                                                         }
                                                         .padding(vertical = 10.dp, horizontal = 4.dp)
                                                 ) {
@@ -291,20 +330,23 @@ class AutofillAuthActivity : ComponentActivity() {
                                                         val authResult = application.repository.unlockVault(pwdChars)
                                                         when (authResult) {
                                                             is AuthResult.Success -> {
-                                                                val allItems = application.repository.getAllItemsForActiveSlot()
+                                                                val expectedId = application.sessionManager.getCurrentSessionId() ?: error("Vault is locked.")
+                                                                val allItems = application.repository.getAllItemsForActiveSlot(expectedId)
                                                                 val credentials = allItems.filterIsInstance<CredentialRecord>()
                                                                     .filter { !it.isArchived && !it.isTrashed }
 
                                                                 val cleanTarget = AutofillHelper.normalizeDomain(rawDomain)
                                                                 val directMatches = credentials.filter {
-                                                                    AutofillHelper.matchesTarget(it, cleanTarget, targetPackage, targetScheme.ifBlank { null })
+                                                                    (rawDomain.isBlank() || cleanTarget.isNotBlank()) &&
+                                                AutofillHelper.matchesTarget(it, cleanTarget, targetPackage, targetScheme.ifBlank { null })
                                                                 }
                                                                 if (directMatches.isNotEmpty()) {
-                                                                    finishWithCredentials(directMatches)
+                                                                    finishWithCredentials(directMatches, expectedId)
                                                                 } else {
                                                                     withContext(Dispatchers.Main) {
                                                                         password = ""
                                                                         isAuthenticating = false
+                                                                        pickerSessionId = expectedId
                                                                         unlockedManualList = credentials
                                                                     }
                                                                 }
