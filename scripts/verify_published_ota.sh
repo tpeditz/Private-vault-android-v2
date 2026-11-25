@@ -18,7 +18,28 @@ download() {
     --output "$output" "$url"
 }
 
-download "$BASE/latest/download/update.json" "$WORK/latest.json" 1048576
+# GitHub may briefly serve a previous release with HTTP 200 after promotion.
+# Retry the byte comparison as well as HTTP failures; never accept stale bytes.
+download_matching() {
+  local url=$1 output=$2 limit=$3 expected=$4
+  local attempt
+  for attempt in {1..8}; do
+    download "$url" "$output" "$limit"
+    if cmp -s "$expected" "$output"; then
+      return 0
+    fi
+    printf 'Published asset does not yet match expected bytes (attempt %s/8)\n' "$attempt"
+    if [ "$attempt" -lt 8 ]; then sleep 10; fi
+  done
+  printf 'Published asset did not match expected bytes after retries: %s\n' "$url" >&2
+  return 1
+}
+
+if [ "$#" -gt 0 ]; then
+  download_matching "$BASE/latest/download/update.json" "$WORK/latest.json" 1048576 "$1"
+else
+  download "$BASE/latest/download/update.json" "$WORK/latest.json" 1048576
+fi
 VERSION=$(python3 - "$WORK/latest.json" "$BASE" "$EXPECTED_CERT" <<'PY'
 import json, re, sys
 
@@ -37,15 +58,10 @@ print(m['versionName'])
 PY
 )
 
-download "$BASE/download/v$VERSION/update.json" "$WORK/versioned.json" 1048576
-cmp "$WORK/latest.json" "$WORK/versioned.json"
-if [ "$#" -gt 0 ]; then
-  cmp "$1" "$WORK/latest.json"
-fi
+download_matching "$BASE/download/v$VERSION/update.json" "$WORK/versioned.json" 1048576 "$WORK/latest.json"
 
 download "$BASE/download/v$VERSION/private-vault.apk" "$WORK/versioned.apk" 262144000
-download "$BASE/latest/download/private-vault.apk" "$WORK/latest.apk" 262144000
-cmp "$WORK/versioned.apk" "$WORK/latest.apk"
+download_matching "$BASE/latest/download/private-vault.apk" "$WORK/latest.apk" 262144000 "$WORK/versioned.apk"
 
 python3 - "$WORK/latest.json" "$WORK/versioned.apk" <<'PY'
 import hashlib, json, sys
