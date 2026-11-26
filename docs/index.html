@@ -3,74 +3,119 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Private Vault is a personal Android vault for passwords, notes, photos, documents and secure links, with optional encrypted Google Drive backup.">
-  <meta name="theme-color" content="#091219">
-  <title>Private Vault — Your digital life, kept private.</title>
+  <meta name="description" content="Private Vault for Android. Organize your passwords, notes, media, documents and links in a locally encrypted vault, with optional encrypted Google Drive backup.">
+  <meta name="theme-color" content="#0b151b">
+  <title>Private Vault — A private space for what matters</title>
   <link rel="icon" href="logo.png" type="image/png">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<a href="#main" class="skip">Skip to content</a>
-<header><div class="wrapper nav">
-  <a class="brand" href="./"><img src="logo.png" alt="" width="40" height="40">Private Vault</a>
-  <nav aria-label="Main navigation"><a href="./" aria-current="page">Home</a><a href="privacy.html">Privacy</a><a href="terms.html">Terms</a></nav>
-</div></header>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="wrapper nav">
+    <a class="brand" href="./" aria-label="Private Vault home"><img src="logo.png" alt="" width="40" height="40"><span>Private Vault<span class="brand-sub">BY TP EDITZ</span></span></a>
+    <nav aria-label="Main navigation">
+      <a href="#features">Features</a><a href="#how-it-works">How it works</a><a href="privacy.html">Privacy</a>
+      <a class="nav-download" href="https://github.com/tpeditz/Private-vault-android-v2/releases/latest">Get the app <span aria-hidden="true">↗</span></a>
+    </nav>
+  </div>
+</header>
 <main id="main">
-  <div class="hero">
+  <section class="hero">
     <div class="wrapper hero-grid">
-      <div>
-        <div class="eyebrow">Personal privacy · Android</div>
-        <h1>Your digital life.<br><span>Kept private.</span></h1>
-        <p class="lede">A personal vault for your passwords, notes, photos, documents and important links. Keep what matters organized in one place, with local encryption and optional cloud backup.</p>
+      <div class="hero-copy">
+        <div class="pill"><span class="status-dot"></span> Built for Android <span class="pill-divider"></span> Privacy first</div>
+        <h1>Make room for<br>what matters.<br><span>Keep it private.</span></h1>
+        <p class="lede">Your passwords, personal notes, photos and important files deserve a place of their own. Private Vault keeps them organized in an encrypted vault on your device.</p>
         <div class="button-row">
-          <a class="button primary" href="https://github.com/tpeditz/Private-vault-android-v2/releases">View Android releases <span aria-hidden="true">↗</span></a>
-          <a class="button secondary" href="privacy.html">Privacy policy</a>
+          <a class="button primary" href="https://github.com/tpeditz/Private-vault-android-v2/releases/latest">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4"/></svg> Download for Android
+          </a>
+          <a class="button secondary" href="#features">Explore features <span aria-hidden="true">↓</span></a>
         </div>
-        <p class="meta">Android app · Developed by Tp Editz</p>
+        <p class="meta">Android 7.0+ <span aria-hidden="true">·</span> Official APK on GitHub <span aria-hidden="true">·</span> No Google account required for local use</p>
       </div>
-      <div class="vault-art" aria-hidden="true">
-        <div class="orbit"><div class="logo-card"><img src="logo.png" alt="" width="192" height="192"></div></div>
-        <div class="art-label top"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M12 2 4 6v5c0 5 4 9 8 11 4-2 8-6 8-11V6z"/><path d="m8 12 3 3 5-6"/></svg>Encrypted storage</div>
-        <div class="art-label bottom"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 17a5 5 0 0 1-1-9.9 7 7 0 0 1 13 1.5A4.5 4.5 0 0 1 18 17"/><path d="M12 11v10m-4-4 4 4 4-4"/></svg>Optional backup</div>
+      <div class="hero-art" aria-hidden="true">
+        <div class="art-grid"></div>
+        <div class="orb orb-one"></div><div class="orb orb-two"></div>
+        <div class="vault-preview">
+          <div class="preview-header"><div class="preview-identity"><img src="logo.png" alt="" width="42" height="42"><div><strong>Private Vault</strong><small>Your personal space</small></div></div><span class="preview-lock"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="10" width="14" height="11" rx="3"/><path d="M8 10V7a4 4 0 1 1 8 0v3m-4 4v3"/></svg></span></div>
+          <div class="preview-status"><span class="status-dot"></span> Local encrypted storage</div>
+          <div class="preview-mosaic">
+            <div class="preview-tile"><span class="tile-icon blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 1 1 8 0v3"/></svg></span><span>Passwords</span></div>
+            <div class="preview-tile"><span class="tile-icon mint"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 3h9l3 3v15H6zM9 10h6m-6 4h6m-6 4h4"/></svg></span><span>Notes</span></div>
+            <div class="preview-tile"><span class="tile-icon violet"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="8" cy="9" r="2"/><path d="m4 18 5-5 4 4 4-4 4 4"/></svg></span><span>Media</span></div>
+            <div class="preview-tile"><span class="tile-icon amber"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7h7l2 3h9v10H3zM3 7V4h7l2 3h7v3"/></svg></span><span>Documents</span></div>
+          </div>
+          <div class="preview-backup"><div class="backup-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 17a5 5 0 0 1-1-9.9 7 7 0 0 1 13 1.5A4.5 4.5 0 0 1 18 17M12 11v10m-4-4 4 4 4-4"/></svg></div><div><strong>Backup &amp; restore</strong><small>Local or optional Google Drive</small></div><span>↗</span></div>
+        </div>
+        <div class="art-caption"><span class="status-dot"></span> Your vault. Your choices. <small>Illustration</small></div>
       </div>
     </div>
-  </div>
-  <section class="wrapper features" aria-labelledby="features-heading">
-    <div class="eyebrow">Made for everyday use</div>
-    <h2 class="section-title" id="features-heading">Everything important, together.</h2>
-    <p class="section-desc">Simple tools for organizing and protecting your personal information.</p>
+  </section>
+  <section class="wrapper trust-strip" aria-label="Privacy foundations">
+    <div><span class="trust-number">01</span><strong>Local encryption</strong><small>Vault content stays on your device unless you choose to export or back it up.</small></div>
+    <div><span class="trust-number">02</span><strong>Offline access</strong><small>Open your vault without depending on an internet connection.</small></div>
+    <div><span class="trust-number">03</span><strong>Optional cloud backup</strong><small>Connect your own Google Drive account only if you want to.</small></div>
+  </section>
+  <section class="wrapper features" id="features" aria-labelledby="features-heading">
+    <div class="eyebrow">Everything important, together</div>
+    <h2 class="section-title" id="features-heading">One vault. Many possibilities.</h2>
+    <p class="section-desc">Thoughtful tools designed to keep your personal information within reach.</p>
     <div class="cards">
-      <article class="card">
-        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 1 1 8 0v3m-4 4v3"/></svg></div>
-        <h3>Passwords &amp; notes</h3><p>Organize credentials, private notes, folders and password history in your vault.</p>
+      <article class="card card-featured">
+        <span class="card-icon blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 1 1 8 0v3m-4 4v3"/></svg></span>
+        <h3>Passwords &amp; notes</h3><p>Keep credentials, private notes and important details together, organized in folders. Generate passwords and see strength guidance.</p>
+        <span class="card-tag">Organize your digital life</span>
       </article>
       <article class="card">
-        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8" cy="9" r="2"/><path d="m3 17 5-5 5 5 3-3 5 5"/></svg></div>
-        <h3>Photos &amp; documents</h3><p>Keep personal images, videos, files and important bookmarks in one organized space.</p>
+        <span class="card-icon violet"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8" cy="9" r="2"/><path d="m3 17 5-5 5 5 3-3 5 5"/></svg></span>
+        <h3>Photos &amp; files</h3><p>Organize private media, documents, albums and secure links in your vault.</p>
       </article>
       <article class="card">
-        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 17a5 5 0 0 1 0-10 7 7 0 0 1 13-1 5 5 0 0 1 0 11"/><path d="M12 12v9m-3-3 3 3 3-3"/></svg></div>
-        <h3>Back up on your terms</h3><p>Export an encrypted backup locally, or connect your Google Drive account for optional backup and restore.</p>
+        <span class="card-icon mint"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 17a5 5 0 0 1 0-10 7 7 0 0 1 13-1 5 5 0 0 1 0 11M12 12v9m-3-3 3 3 3-3"/></svg></span>
+        <h3>Encrypted backups</h3><p>Export a local backup or enable optional Google Drive backup and restore.</p>
       </article>
       <article class="card">
-        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 6v5c0 5 4 9 8 11 4-2 8-6 8-11V6z"/><path d="m8 12 3 3 5-6"/></svg></div>
-        <h3>Privacy controls</h3><p>Manage vault locking, screen capture protection, biometrics and clipboard preferences.</p>
+        <span class="card-icon mint"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2 4 6v5c0 5 4 9 8 11 4-2 8-6 8-11V6zM8 12l3 3 5-6"/></svg></span>
+        <h3>Privacy controls</h3><p>Manage app locking, optional biometric unlock, screenshot protection and clipboard preferences.</p>
       </article>
       <article class="card">
-        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="4"/><path d="m11 11 9 9m-1-6-3 3m-2-5-3 3"/></svg></div>
-        <h3>Security tools</h3><p>Create passwords, review password strength and manage two-factor authentication codes.</p>
+        <span class="card-icon amber"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
+        <h3>Authenticator tools</h3><p>Generate time-based two-factor authentication codes locally, without needing internet access.</p>
       </article>
-      <article class="card">
-        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 9h10M7 15h6"/><path d="m15 15 2 2 4-4"/></svg></div>
-        <h3>Optional Android Autofill</h3><p>Use the Android Autofill service on supported devices to help enter your saved credentials.</p>
+      <article class="card card-featured">
+        <span class="card-icon blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12a9 9 0 1 1 3 7M3 12V5m0 7h7"/><path d="m12 8 4 4-4 4"/></svg></span>
+        <h3>Stay up to date</h3><p>Check for new official Android releases directly from the app. Review available updates before installing them.</p>
+        <span class="card-tag">Your choice to update</span>
       </article>
     </div>
   </section>
-  <section class="wrapper support" aria-label="Support">
-    <div><h2>Need a hand?</h2><p>Contact Tp Editz for app support or privacy questions.</p></div>
-    <div class="button-row"><a class="button secondary" href="https://t.me/Tp_Editz">Telegram ↗</a><a class="button secondary" href="https://www.instagram.com/tp_ediitz/">Instagram ↗</a></div>
+  <section class="wrapper how" id="how-it-works" aria-labelledby="how-heading">
+    <div class="how-intro"><div class="eyebrow">Get started</div><h2 class="section-title" id="how-heading">Private by design.<br>Simple by choice.</h2><p class="section-desc">Set up your personal vault in three straightforward steps.</p><a class="text-link" href="privacy.html">Read how your information is handled ↗</a></div>
+    <div class="steps">
+      <article class="step"><span>01</span><div><h3>Download and install</h3><p>Get the latest official APK from GitHub. Review Android's installation prompt.</p></div></article>
+      <article class="step"><span>02</span><div><h3>Create your vault</h3><p>Choose a strong master password, then add the items you want to keep private.</p></div></article>
+      <article class="step"><span>03</span><div><h3>Back up on your terms</h3><p>Keep a verified encrypted backup somewhere safe. Cloud backup is optional.</p></div></article>
+    </div>
+  </section>
+  <section class="wrapper faq" aria-labelledby="faq-heading">
+    <div class="eyebrow">Good to know</div><h2 class="section-title" id="faq-heading">Frequently asked questions</h2>
+    <div class="faq-list">
+      <details><summary>Do I need a Google account?</summary><p>No. Local vault features work without Google sign-in. Connecting Google Drive is optional and used for backup and restore.</p></details>
+      <details><summary>Where are my vault records stored?</summary><p>Records are encrypted on your device. If you choose to export or upload a backup, that creates a separate encrypted copy.</p></details>
+      <details><summary>Can I use Private Vault offline?</summary><p>Yes. Local vault access does not require internet. Online services such as update checks and cloud backups require a connection.</p></details>
+      <details><summary>How do I update the app?</summary><p>Use the in-app update checker or the official GitHub releases page. Keep a verified backup before updating.</p></details>
+      <details><summary>What happens if I forget my master password?</summary><p>Keep your vault and backup passwords somewhere safe. Losing a required password can prevent recovery of encrypted information.</p></details>
+    </div>
+  </section>
+  <section class="wrapper download" aria-labelledby="download-heading">
+    <div><div class="eyebrow">Make it yours</div><h2 id="download-heading">Give your important things a home.</h2><p>Start with the latest official Android release.</p></div>
+    <a class="button primary" href="https://github.com/tpeditz/Private-vault-android-v2/releases/latest">Download for Android <span aria-hidden="true">↗</span></a>
   </section>
 </main>
-<footer><div class="wrapper footer-grid"><span>© 2026 Tp Editz · Private Vault</span><div class="footer-links"><a href="privacy.html">Privacy policy</a><a href="terms.html">Terms of service</a><a href="https://github.com/tpeditz/Private-vault-android-v2/releases">Releases</a></div></div></footer>
+<footer>
+  <div class="wrapper footer-grid"><div><a class="brand" href="./"><img src="logo.png" alt="" width="36" height="36">Private Vault</a><p>Developed by Tp Editz · © 2026</p></div><div class="footer-links"><a href="privacy.html">Privacy policy</a><a href="terms.html">Terms of service</a><a href="https://github.com/tpeditz/Private-vault-android-v2/releases">Releases</a></div><div class="footer-links"><a href="https://t.me/Tp_Editz">Telegram support ↗</a><a href="https://www.instagram.com/tp_ediitz/">Instagram ↗</a></div></div>
+</footer>
 </body>
 </html>
