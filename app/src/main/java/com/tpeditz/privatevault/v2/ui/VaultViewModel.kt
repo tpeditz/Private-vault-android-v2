@@ -33,6 +33,16 @@ import com.tpeditz.privatevault.v2.data.filterItemsForBackupScope
 import com.tpeditz.privatevault.v2.ota.OtaState
 import com.tpeditz.privatevault.v2.ota.OtaUpdateManager
 import com.tpeditz.privatevault.v2.ota.isPendingInstallation
+import com.tpeditz.privatevault.v2.policy.AllowlistedFeatureFlags
+import com.tpeditz.privatevault.v2.policy.AnnouncementPresentation
+import com.tpeditz.privatevault.v2.policy.AnnouncementRecord
+import com.tpeditz.privatevault.v2.policy.AnnouncementRepeatMode
+import com.tpeditz.privatevault.v2.policy.OtaPolicyScheduler
+import com.tpeditz.privatevault.v2.policy.PolicyEvaluator
+import com.tpeditz.privatevault.v2.policy.PolicyFeedbackState
+import com.tpeditz.privatevault.v2.policy.PolicySyncResult
+import com.tpeditz.privatevault.v2.policy.SupabaseFeedbackClient
+import com.tpeditz.privatevault.v2.policy.TrustedControlPolicySnapshot
 import com.tpeditz.privatevault.v2.security.BiometricKeystoreManager
 import com.tpeditz.privatevault.v2.security.OfflinePasswordStrengthEstimator
 import com.tpeditz.privatevault.v2.security.PasswordGeneratorEngine
@@ -102,6 +112,13 @@ class VaultViewModel(
     private var otaForeground = false
     private val _showPendingUpdateReminder = MutableStateFlow(true)
     val showPendingUpdateReminder: StateFlow<Boolean> = _showPendingUpdateReminder.asStateFlow()
+    private val _policySnapshot = MutableStateFlow<TrustedControlPolicySnapshot?>(
+        otaUpdateManager.currentCachedPolicySnapshot()
+    )
+    private val _sessionDismissedRepeatAnnouncementIds = MutableStateFlow<Set<String>>(emptySet())
+    private var lastDismissedOnceAnnouncementIds: Set<String> = emptySet()
+    private val feedbackClient by lazy { SupabaseFeedbackClient() }
+    private var submitFeedbackJob: Job? = null
 
     // Bounded volatile cache for decrypted media thumbnails (12 MiB max), strictly cleared and wiped on eviction, lock, or session change.
     private val thumbnailCacheLock = Any()
@@ -158,6 +175,7 @@ class VaultViewModel(
                     }
                     is VaultSessionManager.SessionState.Locked -> {
                         lastActiveSessionId = null
+                        _sessionDismissedRepeatAnnouncementIds.value = emptySet()
                         clearVolatileThumbnailCache()
                         loadItemsJob?.cancel()
                         cancelBackup()
@@ -311,6 +329,33 @@ class VaultViewModel(
         viewModelScope.launch {
             preferencesRepository.lastOtaCheckEpochMs.collect { epoch ->
                 _uiState.update { it.copy(lastOtaCheckEpochMs = epoch) }
+            }
+        }
+        viewModelScope.launch {
+            preferencesRepository.betaChannelOptIn.collect { optIn ->
+                _uiState.update { it.copy(betaChannelOptIn = optIn) }
+                recomputeControlCenterPolicyUi()
+            }
+        }
+        viewModelScope.launch {
+            preferencesRepository.dismissedAnnouncementIds.collect { ids ->
+                lastDismissedOnceAnnouncementIds = ids
+                recomputeControlCenterPolicyUi()
+            }
+        }
+        viewModelScope.launch {
+            preferencesRepository.lastPolicySyncEpochMs.collect { epoch ->
+                _uiState.update { it.copy(lastPolicySyncEpochMs = epoch) }
+            }
+        }
+        viewModelScope.launch {
+            preferencesRepository.effectiveOtaCheckIntervalHours.collect { hours ->
+                _uiState.update { it.copy(otaCheckIntervalHours = hours) }
+            }
+        }
+        viewModelScope.launch {
+            _policySnapshot.collect {
+                recomputeControlCenterPolicyUi()
             }
         }
         viewModelScope.launch {
@@ -2455,6 +2500,103 @@ class VaultViewModel(
         }
     }
 
+    private fun recomputeControlCenterPolicyUi() {
+        val snapshot = _policySnapshot.value
+        val now = System.currentTimeMillis()
+        val flags = PolicyEvaluator.effectiveFeatureFlags(snapshot, now)
+        val betaOptIn = _uiState.value.betaChannelOptIn
+        val effectiveAnnouncements = PolicyEvaluator.selectEffectiveAnnouncements(
+            snapshot = snapshot,
+            currentVersionCode = BuildConfig.VERSION_CODE,
+            betaChannelOptIn = betaOptIn,
+            dismissedOnceIds = lastDismissedOnceAnnouncementIds,
+            sessionDismissedRepeatIds = _sessionDismissedRepeatAnnouncementIds.value,
+            nowEpochMs = now
+        )
+        val banners = effectiveAnnouncements.filter { it.presentation == AnnouncementPresentation.BANNER }
+        val activeDialog = effectiveAnnouncements.firstOrNull { it.presentation == AnnouncementPresentation.DIALOG }
+        val feedbackState = PolicyFeedbackState(
+            isSupportedByBuild = BuildConfig.FEEDBACK_SUBMISSION_ENABLED,
+            isEnabledByServer = flags.feedbackEnabled,
+            isMaintenanceActive = flags.onlineMaintenance
+        )
+        _uiState.update {
+            it.copy(
+                betaEnrollmentAllowed = flags.betaEnrollmentEnabled,
+                onlineMaintenanceActive = flags.onlineMaintenance,
+                otaCheckIntervalHours = flags.updateCheckIntervalHours,
+                activeAnnouncements = banners,
+                activeDialogAnnouncement = activeDialog,
+                feedbackState = feedbackState
+            )
+        }
+    }
+
+    fun setBetaChannelOptIn(enabled: Boolean) {
+        viewModelScope.launch {
+            preferencesRepository.setBetaChannelOptIn(enabled)
+            if (enabled) {
+                otaUpdateManager.syncPolicySnapshot(forceRefresh = true)
+                    ?.anySnapshotForDisplay
+                    ?.let { _policySnapshot.value = it }
+                recomputeControlCenterPolicyUi()
+            }
+        }
+    }
+
+    fun dismissAnnouncement(announcement: AnnouncementRecord) {
+        viewModelScope.launch {
+            when (announcement.repeatMode) {
+                AnnouncementRepeatMode.ONCE -> {
+                    preferencesRepository.dismissAnnouncementId(announcement.id)
+                }
+
+                AnnouncementRepeatMode.REPEAT -> {
+                    _sessionDismissedRepeatAnnouncementIds.value =
+                        _sessionDismissedRepeatAnnouncementIds.value + announcement.id
+                    recomputeControlCenterPolicyUi()
+                }
+            }
+        }
+    }
+
+    fun submitFeedback(
+        category: String,
+        message: String,
+        contact: String?,
+        consentChecked: Boolean,
+        onComplete: (Boolean, String) -> Unit
+    ) {
+        if (submitFeedbackJob?.isActive == true) return
+        val state = _uiState.value.feedbackState
+        if (!state.isSubmissionAllowed) {
+            onComplete(
+                false,
+                state.disabledReason ?: "Feedback submission is disabled pending server endpoint deployment."
+            )
+            return
+        }
+        submitFeedbackJob = viewModelScope.launch {
+            when (val res = feedbackClient.submitFeedback(category, message, contact, consentChecked)) {
+                is SupabaseFeedbackClient.SubmitResult.Accepted -> {
+                    onComplete(true, "Saved successfully. Thank you for your feedback.")
+                }
+
+                is SupabaseFeedbackClient.SubmitResult.Rejected -> {
+                    onComplete(false, res.message)
+                }
+
+                is SupabaseFeedbackClient.SubmitResult.NetworkError -> {
+                    onComplete(false, res.message)
+                }
+            }
+        }
+    }
+
+    fun notifyFeedbackStatus(message: String) {
+        _uiState.update { it.copy(activeSnackbarMessage = message) }
+    }
+
     /**
      * Called on activity resume, result from Android Settings, and vault unlock.
      * Recover the current download before considering a new network request.
@@ -2463,8 +2605,28 @@ class VaultViewModel(
         if (!otaForeground || foregroundOtaJob?.isActive == true) return
         foregroundOtaJob = viewModelScope.launch {
             otaUpdateManager.recheckInstallPermissionAndVerifyCandidate()
-            if (!otaForeground || !_uiState.value.isUnlocked || BuildConfig.DEBUG) return@launch
+            if (!otaForeground || !_uiState.value.isUnlocked) return@launch
+
+            val syncResult = otaUpdateManager.syncPolicySnapshot(forceRefresh = false)
+            val displaySnapshot = syncResult?.anySnapshotForDisplay
+            if (displaySnapshot != null) {
+                _policySnapshot.value = displaySnapshot
+                if (syncResult is PolicySyncResult.Fresh) {
+                    val currentInterval = preferencesRepository.effectiveOtaCheckIntervalHours.first()
+                    val targetInterval = displaySnapshot.featureFlags.updateCheckIntervalHours
+                    if (targetInterval != currentInterval) {
+                        preferencesRepository.setEffectiveOtaCheckIntervalHours(targetInterval)
+                        if (preferencesRepository.automaticOtaCheckEnabled.first()) {
+                            OtaPolicyScheduler.schedulePeriodicPolicyCheck(context, targetInterval)
+                        }
+                    }
+                }
+            }
+
+            if (BuildConfig.DEBUG) return@launch
             if (!preferencesRepository.automaticOtaCheckEnabled.first()) return@launch
+            val effectiveFlags = PolicyEvaluator.effectiveFeatureFlags(_policySnapshot.value, System.currentTimeMillis())
+            if (effectiveFlags.onlineMaintenance) return@launch
             val current = otaUpdateManager.otaState.value
             if (current.isPendingInstallation || current is OtaState.Downloading || current is OtaState.Verifying || current is OtaState.Checking) {
                 return@launch
@@ -2474,6 +2636,7 @@ class VaultViewModel(
             if (last != null && now - last < 15 * 60 * 1000L) return@launch
             lastAutomaticOtaAttemptElapsed = now
             val result = otaUpdateManager.checkForUpdates(isUserInitiated = false)
+            otaUpdateManager.currentCachedPolicySnapshot()?.let { _policySnapshot.value = it }
             if (result is OtaState.UpdateAvailable || result is OtaState.UpToDate) {
                 runCatching { preferencesRepository.setLastOtaCheckEpochMs() }
             }
@@ -2484,9 +2647,12 @@ class VaultViewModel(
         viewModelScope.launch {
             preferencesRepository.setAutomaticOtaCheckEnabled(enabled)
             if (enabled) {
+                val interval = preferencesRepository.effectiveOtaCheckIntervalHours.first()
+                OtaPolicyScheduler.schedulePeriodicPolicyCheck(context, interval)
                 lastAutomaticOtaAttemptElapsed = null
                 refreshOtaOnForeground()
             } else {
+                OtaPolicyScheduler.cancelPeriodicPolicyCheck(context)
                 otaUpdateManager.dismissUpdatePrompt()
             }
         }
@@ -2497,6 +2663,7 @@ class VaultViewModel(
             val recovered = otaUpdateManager.recheckInstallPermissionAndVerifyCandidate()
             if (recovered.isPendingInstallation) return@launch
             val result = otaUpdateManager.checkForUpdates(isUserInitiated = manual)
+            _policySnapshot.value = otaUpdateManager.currentCachedPolicySnapshot()
             if (result is OtaState.UpdateAvailable || result is OtaState.UpToDate) {
                 lastAutomaticOtaAttemptElapsed = SystemClock.elapsedRealtime()
                 runCatching { preferencesRepository.setLastOtaCheckEpochMs() }

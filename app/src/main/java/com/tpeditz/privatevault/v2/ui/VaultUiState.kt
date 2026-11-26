@@ -85,6 +85,19 @@ data class VaultUiState(
     // OTA State
     val automaticOtaCheckEnabled: Boolean = true,
     val lastOtaCheckEpochMs: Long = 0L,
+    val betaChannelOptIn: Boolean = false,
+    val betaEnrollmentAllowed: Boolean = false,
+    val onlineMaintenanceActive: Boolean = false,
+    val otaCheckIntervalHours: Int = 12,
+    val lastPolicySyncEpochMs: Long = 0L,
+    val activeAnnouncements: List<com.tpeditz.privatevault.v2.policy.AnnouncementRecord> = emptyList(),
+    val activeDialogAnnouncement: com.tpeditz.privatevault.v2.policy.AnnouncementRecord? = null,
+    val feedbackState: com.tpeditz.privatevault.v2.policy.PolicyFeedbackState =
+        com.tpeditz.privatevault.v2.policy.PolicyFeedbackState(
+            isSupportedByBuild = com.tpeditz.privatevault.v2.BuildConfig.FEEDBACK_SUBMISSION_ENABLED,
+            isEnabledByServer = false,
+            isMaintenanceActive = false
+        ),
 
     // Incoming Share-to-Vault State
     val pendingSharedText: String? = null,

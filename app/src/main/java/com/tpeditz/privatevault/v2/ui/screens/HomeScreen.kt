@@ -23,8 +23,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PhotoLibrary
@@ -82,7 +84,8 @@ fun HomeScreen(
     uiState: VaultUiState,
     onNavigateToTab: (PrimaryTab) -> Unit,
     onNavigateToSecondary: (SecondaryDestination) -> Unit,
-    onLockVault: () -> Unit
+    onLockVault: () -> Unit,
+    onDismissAnnouncement: (com.tpeditz.privatevault.v2.policy.AnnouncementRecord) -> Unit = {}
 ) {
     Column(
         modifier = Modifier
@@ -279,6 +282,63 @@ fun HomeScreen(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            if (uiState.onlineMaintenanceActive) {
+                item {
+                    OutlinedCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.Info, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                "Online services are in maintenance. Your local offline vault works normally.",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (uiState.activeAnnouncements.isNotEmpty()) {
+                items(uiState.activeAnnouncements, key = { "ann_${it.id}" }) { ann ->
+                    OutlinedCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    ann.title,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                IconButton(
+                                    onClick = { onDismissAnnouncement(ann) },
+                                    modifier = Modifier.size(28.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.Close,
+                                        contentDescription = "Dismiss announcement",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+                            Text(ann.message, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            }
+
             // Privacy Summary Card (One tap to open Privacy Dashboard)
             item {
                 ElevatedCard(

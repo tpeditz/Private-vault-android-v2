@@ -6,8 +6,12 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.tpeditz.privatevault.v2.policy.AllowlistedFeatureFlags
+import com.tpeditz.privatevault.v2.policy.PolicyEvaluator
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 
 enum class ThemePreference {
@@ -45,6 +49,11 @@ class AppPreferencesRepository(private val context: Context) {
         val KEY_AUTO_CLOUD_BACKUP_STATUS = stringPreferencesKey("auto_cloud_backup_status")
         val KEY_AUTO_OTA_CHECK = booleanPreferencesKey("automatic_ota_check_enabled")
         val KEY_LAST_OTA_CHECK = longPreferencesKey("last_ota_check_epoch_ms")
+        val KEY_ROLLOUT_COHORT_BUCKET = intPreferencesKey("ota_rollout_cohort_bucket")
+        val KEY_BETA_CHANNEL_OPT_IN = booleanPreferencesKey("ota_beta_channel_opt_in")
+        val KEY_DISMISSED_ANNOUNCEMENT_IDS = stringSetPreferencesKey("dismissed_announcement_ids")
+        val KEY_LAST_POLICY_SYNC = longPreferencesKey("last_policy_sync_epoch_ms")
+        val KEY_EFFECTIVE_OTA_INTERVAL_HOURS = intPreferencesKey("effective_ota_interval_hours")
     }
 
     val themePreference: Flow<ThemePreference> = context.dataStore.data.map { prefs ->
@@ -218,5 +227,63 @@ class AppPreferencesRepository(private val context: Context) {
 
     suspend fun setLastOtaCheckEpochMs(timestamp: Long = System.currentTimeMillis()) {
         context.dataStore.edit { it[KEY_LAST_OTA_CHECK] = timestamp }
+    }
+
+    val betaChannelOptIn: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[KEY_BETA_CHANNEL_OPT_IN] ?: false
+    }
+
+    val dismissedAnnouncementIds: Flow<Set<String>> = context.dataStore.data.map { prefs ->
+        prefs[KEY_DISMISSED_ANNOUNCEMENT_IDS] ?: emptySet()
+    }
+
+    val lastPolicySyncEpochMs: Flow<Long> = context.dataStore.data.map { prefs ->
+        prefs[KEY_LAST_POLICY_SYNC] ?: 0L
+    }
+
+    val effectiveOtaCheckIntervalHours: Flow<Int> = context.dataStore.data.map { prefs ->
+        AllowlistedFeatureFlags.clampIntervalHours(
+            prefs[KEY_EFFECTIVE_OTA_INTERVAL_HOURS] ?: AllowlistedFeatureFlags.DEFAULT_UPDATE_CHECK_INTERVAL_HOURS
+        )
+    }
+
+    suspend fun setBetaChannelOptIn(enabled: Boolean) {
+        context.dataStore.edit { it[KEY_BETA_CHANNEL_OPT_IN] = enabled }
+    }
+
+    suspend fun dismissAnnouncementId(id: String) {
+        context.dataStore.edit { prefs ->
+            val current = prefs[KEY_DISMISSED_ANNOUNCEMENT_IDS] ?: emptySet()
+            prefs[KEY_DISMISSED_ANNOUNCEMENT_IDS] = current + id
+        }
+    }
+
+    suspend fun setLastPolicySyncEpochMs(timestamp: Long = System.currentTimeMillis()) {
+        context.dataStore.edit { it[KEY_LAST_POLICY_SYNC] = timestamp }
+    }
+
+    suspend fun setEffectiveOtaCheckIntervalHours(hours: Int) {
+        context.dataStore.edit {
+            it[KEY_EFFECTIVE_OTA_INTERVAL_HOURS] = AllowlistedFeatureFlags.clampIntervalHours(hours)
+        }
+    }
+
+    suspend fun getOrCreateRolloutCohortBucket(): Int {
+        val current = context.dataStore.data.first()[KEY_ROLLOUT_COHORT_BUCKET]
+        if (current != null && current in 0 until PolicyEvaluator.COHORT_BUCKET_COUNT) {
+            return current
+        }
+        val generated = PolicyEvaluator.generateRolloutCohortBucket()
+        var resolved = generated
+        context.dataStore.edit { prefs ->
+            val existing = prefs[KEY_ROLLOUT_COHORT_BUCKET]
+            if (existing != null && existing in 0 until PolicyEvaluator.COHORT_BUCKET_COUNT) {
+                resolved = existing
+            } else {
+                prefs[KEY_ROLLOUT_COHORT_BUCKET] = generated
+                resolved = generated
+            }
+        }
+        return resolved
     }
 }

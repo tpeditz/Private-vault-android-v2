@@ -16,8 +16,8 @@ android {
         applicationId = "com.tpeditz.privatevault.v2"
         minSdk = 24
         targetSdk = 36
-        versionCode = 5
-        versionName = "2.0.4"
+        versionCode = 6
+        versionName = "2.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -26,6 +26,9 @@ android {
         buildConfigField("String", "UPDATE_MANIFEST_URL", "\"https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/update.json\"")
         buildConfigField("String", "UPDATE_APK_URL", "\"https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/private-vault.apk\"")
         buildConfigField("String", "RELEASE_CERT_SHA256", "\"3B:EE:FF:13:8B:71:61:68:B2:F1:66:98:3D:42:49:6B:9D:24:F6:29:B7:5E:E2:5B:DA:FD:16:67:6F:06:A7:70\"")
+        buildConfigField("String", "SUPABASE_URL", "\"https://lszjacrrqthhdapzvjok.supabase.co\"")
+        buildConfigField("String", "SUPABASE_PUBLISHABLE_KEY", "\"sb_publishable_-9CyCkZpssMM_PJt2q3PYw_ybXtYnA_\"")
+        buildConfigField("Boolean", "FEEDBACK_SUBMISSION_ENABLED", "false")
         buildConfigField("String", "DEVELOPER_TELEGRAM", "\"https://t.me/Tp_Editz\"")
         buildConfigField("String", "DEVELOPER_INSTAGRAM", "\"https://www.instagram.com/tp_ediitz/\"")
     }

@@ -1,5 +1,7 @@
 package com.tpeditz.privatevault.v2.ota
 
+import com.tpeditz.privatevault.v2.policy.ReleaseChannel
+import com.tpeditz.privatevault.v2.policy.ReleasePriority
 import java.io.File
 
 data class UpdateManifest(
@@ -21,7 +23,15 @@ sealed interface OtaState {
     data class UpToDate(val currentVersionName: String, val currentVersionCode: Long) : OtaState
     data class UpdateAvailable(
         val manifest: UpdateManifest,
-        val showPromptDialog: Boolean = true
+        val showPromptDialog: Boolean = true,
+        val channel: ReleaseChannel = ReleaseChannel.STABLE,
+        val priority: ReleasePriority = ReleasePriority.OPTIONAL
+    ) : OtaState
+    data class PolicyDeferred(
+        val title: String,
+        val detail: String,
+        val channel: ReleaseChannel? = null,
+        val versionName: String? = null
     ) : OtaState
     data class Downloading(
         val manifest: UpdateManifest,

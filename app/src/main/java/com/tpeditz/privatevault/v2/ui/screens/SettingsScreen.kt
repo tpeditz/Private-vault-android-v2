@@ -25,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.Feedback
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Palette
@@ -191,7 +192,7 @@ fun SettingsScreen(
                         SettingsRow(
                             icon = Icons.Default.SystemUpdate,
                             title = "App Updates",
-                            subtitle = "Version ${BuildConfig.VERSION_NAME} (Check official releases)",
+                            subtitle = "Version ${BuildConfig.VERSION_NAME} • Channel: ${if (uiState.betaChannelOptIn && uiState.betaEnrollmentAllowed) "Beta" else "Stable"}",
                             onClick = { onNavigateToSecondary(SecondaryDestination.OtaUpdates) }
                         )
                     }
@@ -211,6 +212,17 @@ fun SettingsScreen(
                             title = "About Private Vault",
                             subtitle = "Developed by Tp Editz • Support & Privacy",
                             onClick = { onNavigateToSecondary(SecondaryDestination.About) }
+                        )
+                        HorizontalDivider()
+                        SettingsRow(
+                            icon = Icons.Default.Feedback,
+                            title = "Send Feedback",
+                            subtitle = if (uiState.feedbackState.isSubmissionAllowed) {
+                                "Optional private feedback"
+                            } else {
+                                "Privacy-first preview (Disabled pending server deployment)"
+                            },
+                            onClick = { onNavigateToSecondary(SecondaryDestination.Feedback) }
                         )
                         HorizontalDivider()
                         SettingsRow(

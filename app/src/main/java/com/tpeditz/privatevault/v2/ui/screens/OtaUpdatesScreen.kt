@@ -18,6 +18,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDownload
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material3.Button
@@ -56,6 +57,11 @@ fun OtaUpdatesScreen(
     onDownloadUpdate: (com.tpeditz.privatevault.v2.ota.UpdateManifest) -> Unit = {},
     automaticCheckEnabled: Boolean = true,
     onSetAutomaticCheck: (Boolean) -> Unit = {},
+    betaChannelOptIn: Boolean = false,
+    betaEnrollmentAllowed: Boolean = true,
+    onlineMaintenanceActive: Boolean = false,
+    otaCheckIntervalHours: Int = 12,
+    onSetBetaChannelOptIn: (Boolean) -> Unit = {},
     onInstallNow: (File) -> Unit = {},
     onCancelDownload: () -> Unit = {},
     onOpenUnknownSources: () -> Unit = {},
@@ -111,9 +117,50 @@ fun OtaUpdatesScreen(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text("Automatically check for updates", fontWeight = FontWeight.SemiBold)
-                                Text("Notify me when a new version is available.", style = MaterialTheme.typography.bodySmall)
+                                Text(
+                                    "Background checks run every $otaCheckIntervalHours hours when enabled.",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
                             }
                             Switch(checked = automaticCheckEnabled, onCheckedChange = onSetAutomaticCheck)
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Beta release channel (opt-in)", fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    if (!betaEnrollmentAllowed) {
+                                        "Beta enrollment is currently disabled by release policy."
+                                    } else if (betaChannelOptIn) {
+                                        "Receiving pre-release Beta updates alongside Stable."
+                                    } else {
+                                        "Receiving Stable releases only."
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = betaChannelOptIn && betaEnrollmentAllowed,
+                                enabled = betaEnrollmentAllowed,
+                                onCheckedChange = onSetBetaChannelOptIn
+                            )
+                        }
+
+                        if (onlineMaintenanceActive) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Info, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    "Online update services are currently paused for maintenance. Local vault data remains unaffected.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
                         }
                         Spacer(modifier = Modifier.height(6.dp))
                         Button(
@@ -165,6 +212,11 @@ fun OtaUpdatesScreen(
                         ) {
                             Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                                 Text("Update Available: v${state.manifest.versionName}", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                                Text(
+                                    "${state.channel.label} Channel • ${state.priority.label}",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.secondary
+                                )
                                 if (state.manifest.releaseNotes.isNotBlank()) {
                                     Text("Release Notes:\n${state.manifest.releaseNotes}", style = MaterialTheme.typography.bodySmall)
                                 }
@@ -280,6 +332,25 @@ fun OtaUpdatesScreen(
                                 }
                                 OutlinedButton(onClick = onRefreshPermission, modifier = Modifier.fillMaxWidth()) {
                                     Text("I've allowed permission — check again")
+                                }
+                            }
+                        }
+                    }
+
+                    is OtaState.PolicyDeferred -> {
+                        OutlinedCard(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.Info, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Text(state.title, fontWeight = FontWeight.Bold)
+                                }
+                                Text(state.detail, style = MaterialTheme.typography.bodySmall)
+                                OutlinedButton(onClick = onCheckForUpdates, modifier = Modifier.fillMaxWidth()) {
+                                    Text("Re-check Policy")
                                 }
                             }
                         }

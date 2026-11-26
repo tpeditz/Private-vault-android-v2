@@ -1,0 +1,8 @@
+# Supabase Edge Functions Configuration for Private Vault V2.1.0
+# Do not deploy live without owner/ChatGPT review.
+
+[functions.release-control]
+verify_jwt = false
+
+[functions.submit-feedback]
+verify_jwt = false

@@ -1,81 +1,54 @@
-# Private Vault Android V2.0.4 — Verification & Test Report
+# Private Vault V2.1.0 — Verification & Test Report
 
-**Build Target:** `com.tpeditz.privatevault.v2` (`versionName = 2.0.4`, `versionCode = 5`, `minSdk = 24`, `targetSdk = 36`)  
-**Workspace:** `Private-vault-android-v2-0-4-candidate` (built on `Private-vault-android-v2.0.4-backup-privacy-repair-source.zip`, SHA-256 `5e1580a4a403b9d73f955edeb570c0b844a8dbdd932f65bb22c325d2160ca0fe`)  
-**Environment:** Windows, Java `openjdk version "25.0.5.1" 2026-11-17 LTS`, Gradle `9.3.1` (`--no-daemon`), Android `compileSdk = 36`
-
----
-
-## 1. Command Execution Summary
-
-Executed cleanly after all R1–R6 source, documentation, and test edits:
-
-```powershell
-.\gradlew.bat :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:compileDebugAndroidTestKotlin :app:assembleRelease --no-daemon
-```
-
-- **Build Result:** `BUILD SUCCESSFUL in 10m 11s` (`112` actionable tasks: `31` executed, `81` up-to-date)
-- **JVM Unit Tests (`:app:testDebugUnitTest`):** `21` suites, `126` tests run, `126` passed, `0` failed, `0` errors, `0` skipped (`121` carried forward + `5` new R1–R5 tests; zero tests weakened or removed).
-- **Android Lint (`:app:lintDebug`):** `0` errors / fatals, `74` warnings, `0` info (`app/build/reports/lint-results-debug.html` / `.xml`).
-- **Debug APK (`:app:assembleDebug`):** Built (`25,974,609` bytes).
-- **Release APK (`:app:assembleRelease`):** Built with R8 minification (`4,414,877` bytes, **unsigned** ready for CI/private keystore signing).
-- **Android Instrumentation Compilation (`:app:compileDebugAndroidTestKotlin`):** Compiled cleanly.
-- **Physical Device / Emulator Instrumentation (`connectedDebugAndroidTest`):** **Pending — NOT executed locally** (`adb.exe devices -l` reported `0` attached devices). Live device UI runs, SAF document providers, Google Drive live network upload/download, and hardware BiometricPrompt unlock remain to be executed on a real phone/emulator.
+**Project Root:** `Private-vault-android-v2-1-0-work`  
+**Verification Scope:** Local automated unit tests, static analysis/linting, debug & release APK compilation/packaging, instrumentation Kotlin compilation, Admin Control Center linting/tests/build, and Deno Edge Function tests. Live authenticated Supabase end-to-end execution and on-device instrumentation tests were not run in this environment (no Android device or emulator connected via ADB, and no live Supabase Edge Function deployment executed).
 
 ---
 
-## 2. JVM Unit Test Suite Breakdown (126 / 126 Passing)
+## 1. Automated Test Summary
 
-| Test Suite | Tests | Passed | Failed | Skipped | Time |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| `BackupPrivacyAndIntegrityV3RegressionTest` *(4 prior + 5 R1–R5 tests)* | 9 | 9 | 0 | 0 | 4.127s |
-| `EncryptedBackupV2EngineTest` | 4 | 4 | 0 | 0 | 0.423s |
-| `LegacyV1BackupReaderTest` | 5 | 5 | 0 | 0 | 2.932s |
-| `LocalBackupAndRestoreIntegrationTest` | 7 | 7 | 0 | 0 | 0.717s |
-| `V204HardeningRegressionTest` | 8 | 8 | 0 | 0 | 2.114s |
-| `VaultFileSafetyTest` | 2 | 2 | 0 | 0 | 0.029s |
-| `VaultRecordCodecTest` | 9 | 9 | 0 | 0 | 0.028s |
-| `VaultRepositoryRestoreRegressionTest` | 11 | 11 | 0 | 0 | 0.982s |
-| `VaultRepositorySafetyHardeningTest` | 2 | 2 | 0 | 0 | 0.121s |
-| `OtaManifestTest` | 10 | 10 | 0 | 0 | 1.072s |
-| `CryptoEngineTest` | 12 | 12 | 0 | 0 | 0.241s |
-| `OfflinePasswordStrengthEstimatorTest` | 6 | 6 | 0 | 0 | 0.011s |
-| `PasswordGeneratorEngineTest` | 5 | 5 | 0 | 0 | 0.141s |
-| `PasswordPolicyTest` | 2 | 2 | 0 | 0 | 0.139s |
-| `StreamingMediaCryptoEngineTest` | 7 | 7 | 0 | 0 | 0.791s |
-| `TotpEngineTest` | 9 | 9 | 0 | 0 | 0.052s |
-| `VaultSessionPolicyTest` | 2 | 2 | 0 | 0 | 0.008s |
-| `CloudBackupSchedulerAndSyncTest` *(incl. Drive 308 regressions)* | 9 | 9 | 0 | 0 | 2.107s |
-| `AutofillRemovalAndPasswordManagerRegressionTest` | 2 | 2 | 0 | 0 | 0.100s |
-| `DocumentExportCleanupTest` *(preserved)* | 3 | 3 | 0 | 0 | 0.008s |
-| `VaultErrorMapperTest` | 2 | 2 | 0 | 0 | 0.028s |
-| **TOTAL (21 Suites)** | **126** | **126** | **0** | **0** | — |
+| Layer | Command | Result | Scope & Exact Counts |
+| --- | --- | --- | --- |
+| **Android Unit Tests** | `.\gradlew.bat :app:testDebugUnitTest --no-daemon` | **PASSED** | `26` suites, `145` tests, `0` failures, `0` errors, `0` skipped (`130` V2.0.4 baseline tests + `15` new V2.1.0 policy/OTA/announcement/feedback tests) |
+| **Android Lint** | `.\gradlew.bat :app:lintDebug --rerun-tasks --no-daemon` | **PASSED** | `0` errors, `66` warnings |
+| **Android Instrumentation Compile** | `.\gradlew.bat :app:compileDebugAndroidTestKotlin --no-daemon` | **PASSED** | All `androidTest` Kotlin sources compile cleanly against V2.1.0 code (not executed on device; `adb devices -l` empty) |
+| **Android Debug Build** | `.\gradlew.bat :app:assembleDebug --no-daemon` | **PASSED** | Generated `app-debug.apk` (`25,519,459` bytes) |
+| **Android Release Build (R8)** | `.\gradlew.bat :app:assembleRelease --no-daemon` | **PASSED** | Generated `app-release-unsigned.apk` (`4,447,645` bytes); `lintVitalRelease` passed |
+| **Admin Control Center Lint** | `npm run lint` (in `admin-web/`) | **PASSED** | ESLint `0` errors, `0` warnings |
+| **Admin Control Center Tests** | `npm run test` (Vitest in `admin-web/`) | **PASSED** | `1` file, `3` tests passed (unauthenticated block / no sign-up, AAL1 -> AAL2 MFA gate, AAL2 dashboard & disabled live publish state) |
+| **Admin Control Center Build** | `npm run build` (`tsc -b && vite build` in `admin-web/`) | **PASSED** | Clean TypeScript & Vite production bundle written to `docs/admin/` (`docs/admin/index.html`, `0.48 kB`) |
+| **Supabase Edge Function Tests** | `deno test supabase/functions/tests/edge_functions_test.ts --no-check=remote` | **PASSED** | `5` tests passed, `0` failed (manifest/repo/HTTPS URL checks, JWT AAL decoding, feedback validation) |
 
 ---
 
-## 3. Compiled Instrumentation Tests (Pending Device Execution)
+## 2. Detailed Android Unit Test Suites (`app/build/test-results/testDebugUnitTest/`)
 
-Compiled cleanly via `:app:compileDebugAndroidTestKotlin` (not yet run on Android hardware):
-- `PrivacyAndSecurityUiAndroidTest.kt`: now includes Notes explicit-save, pending checklist input preservation across Save & Unsaved-Changes Dialog, `BackupRestoreScreen` partial-backup Replace disablement, and unknown-scope `"Merge (Recommended)"` verification in addition to prior About/Settings/Cloud/PasswordHistory/No-Autofill tests.
-- `RoomVaultRepositoryRecoveryAndroidTest.kt`
-- `PreferencesPersistenceAndroidTest.kt`
-- `ShareToVaultAndScreensAndroidTest.kt`
+### New V2.1.0 Suites (`15` tests)
+- `com.tpeditz.privatevault.v2.policy.ControlPolicyAndRolloutTest` (`6` tests, `0` failed): API-24–safe ISO-8601 UTC parsing, snapshot validation rejecting spoofed cert / unofficial repo / drafts, deterministic cohort bucketing `0..99`, stable vs beta channel gating (`betaEnrollmentEnabled`), fail-closed schedule/pause/withdrawn/stale cache gating, `PolicyCacheStore` atomic round-trip & TTL expiry.
+- `com.tpeditz.privatevault.v2.policy.AnnouncementsAndFeatureFlagsTest` (`4` tests, `0` failed): strict allowlist & `6..72h` clamping ignoring unknown flags, plain-text control-character sanitization, announcement channel/version/schedule/`once` vs `repeat` selection, safe defaults fallback on stale snapshot.
+- `com.tpeditz.privatevault.v2.policy.OtaPolicyGateTest` (`3` tests, `0` failed): missing Supabase policy fail-closed with `0` requests to GitHub `/releases/latest/`, exact tagged manifest fetch for eligible `10%` cohort (`bucket = 5`) and deferral for `bucket = 50`, paused/withdrawn downloaded candidate blocking installer/download without corrupting staged file.
+- `com.tpeditz.privatevault.v2.policy.FeedbackValidationTest` (`2` tests, `0` failed): `BuildConfig.FEEDBACK_SUBMISSION_ENABLED == false` enforcement and consent/category/length boundary checks.
+
+### Preserved V2.0.4 Baseline Suites (`130` tests across `22` suites, all passing)
+- `BackupPrivacyAndIntegrityV3RegressionTest` (`9`), `EncryptedBackupV2EngineTest` (`4`), `LegacyV1BackupReaderTest` (`5`), `LocalBackupAndRestoreIntegrationTest` (`7`), `V204HardeningRegressionTest` (`8`), `VaultFileSafetyTest` (`2`), `VaultRecordCodecTest` (`9`), `VaultRepositoryRestoreRegressionTest` (`11`), `VaultRepositorySafetyHardeningTest` (`2`), `OtaManifestTest` (`10`), `CryptoEngineTest` (`12`), `OfflinePasswordStrengthEstimatorTest` (`6`), `PasswordGeneratorEngineTest` (`5`), `PasswordPolicyTest` (`2`), `StreamingMediaCryptoEngineTest` (`7`), `TotpEngineTest` (`9`), `VaultSessionPolicyTest` (`2`), `CloudBackupSchedulerAndSyncTest` (`9`), `AutofillRemovalAndPasswordManagerRegressionTest` (`2`), `BackupOperationCompletionTest` (`4`), `DocumentExportCleanupTest` (`3`), `VaultErrorMapperTest` (`2`).
 
 ---
 
-## 4. Build Artifacts & Static Verification
+## 3. APK Packaging & Badging Verification (`aapt2 dump badging`)
 
-- **Debug APK (`app-debug.apk`):**
-  - Path: `app/build/outputs/apk/debug/app-debug.apk`
-  - Size: `25,974,609` bytes
-  - Signing: Android debug signing certificate
-  - SHA-256: `6847603025f0cafb625a33903b5102888c9615058c5e0c24b227c1abe82f4018`
-- **Release APK (`app-release-unsigned.apk`):**
-  - Path: `app/build/outputs/apk/release/app-release-unsigned.apk`
-  - Size: `4,414,877` bytes
-  - Signing: **Unsigned** (no production keystore used locally; intended for CI/owner keystore signing)
-  - SHA-256: `df7dcb6a4b6e6e56a28a25ef5fc4da18c184672e8bfb836fe3b8bee2ba78feaf`
-- **Badging (`aapt2 dump badging` on Release APK):**
-  - `package: name='com.tpeditz.privatevault.v2' versionCode='5' versionName='2.0.4' platformBuildVersionName='16' platformBuildVersionCode='36' compileSdkVersion='36' compileSdkVersionCodename='16'`
-  - `targetSdkVersion:'36'`
-- **Autofill Removal Check (`app/src/main`):** `0` references to `AutofillService` or `android.service.autofill`.
+- **Debug APK:** `app/build/outputs/apk/debug/app-debug.apk`
+  - Size: `25,519,459` bytes
+  - SHA-256: `604646AF2E092FE539881804D8764A3245FFFE14A7E827199FA90223C569E906`
+  - Package: `com.tpeditz.privatevault.v2.debug`, `versionCode='6'`, `versionName='2.1.0-debug'`, `minSdkVersion='24'`, `targetSdkVersion='36'`
+- **Unsigned Release APK:** `app/build/outputs/apk/release/app-release-unsigned.apk`
+  - Size: `4,447,645` bytes
+  - SHA-256: `18FA768F20846C3E94214F7CB9862DC7D1225F4191E921C17D21E88C04C682E0`
+  - Package: `com.tpeditz.privatevault.v2`, `versionCode='6'`, `versionName='2.1.0'`, `minSdkVersion='24'`, `targetSdkVersion='36'`
+
+---
+
+## 4. Static Security & Hygiene Checks
+
+- `AutofillService|autofill` scan across `app/src/main`: `0` matches.
+- `service_role|eyJhbGci` scan across `app/src/main`, `admin-web/src`, `docs/admin`: only `1` documentation comment match (`admin-web/src/lib/supabaseClient.ts:3`, warning never to embed `service_role`); `0` secrets, tokens, or JWT strings in shipped code/assets.
+- Connected devices check (`adb devices -l`): `List of devices attached` empty (on-device instrumentation & physical manual QA pending hardware availability).

@@ -22,5 +22,6 @@ sealed interface SecondaryDestination {
     data object CloudBackup : SecondaryDestination
     data object SecuritySettings : SecondaryDestination
     data object OtaUpdates : SecondaryDestination
+    data object Feedback : SecondaryDestination
     data object About : SecondaryDestination
 }

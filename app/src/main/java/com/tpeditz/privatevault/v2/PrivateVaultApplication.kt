@@ -5,9 +5,14 @@ import com.tpeditz.privatevault.v2.data.AppPreferencesRepository
 import com.tpeditz.privatevault.v2.data.PrivateVaultDatabase
 import com.tpeditz.privatevault.v2.data.VaultRepository
 import com.tpeditz.privatevault.v2.ota.OtaUpdateManager
+import com.tpeditz.privatevault.v2.policy.OtaPolicyScheduler
+import com.tpeditz.privatevault.v2.policy.PolicyCacheStore
+import com.tpeditz.privatevault.v2.policy.SupabaseOtaPolicyGate
+import com.tpeditz.privatevault.v2.policy.SupabasePolicyClient
 import com.tpeditz.privatevault.v2.security.SensitiveClipboardManager
 import com.tpeditz.privatevault.v2.security.VaultSessionManager
 import com.tpeditz.privatevault.v2.sync.GoogleDriveSyncManager
+import java.io.File
 
 /**
  * Application container for PRIVATE VAULT V2.
@@ -37,6 +42,15 @@ class PrivateVaultApplication : Application() {
     lateinit var googleDriveSyncManager: GoogleDriveSyncManager
         private set
 
+    lateinit var policyCacheStore: PolicyCacheStore
+        private set
+
+    lateinit var supabasePolicyClient: SupabasePolicyClient
+        private set
+
+    lateinit var otaPolicyGate: SupabaseOtaPolicyGate
+        private set
+
     override fun onCreate() {
         super.onCreate()
         instance = this
@@ -53,8 +67,20 @@ class PrivateVaultApplication : Application() {
             preferencesRepository = preferencesRepository
         )
 
-        otaUpdateManager = OtaUpdateManager(this)
+        policyCacheStore = PolicyCacheStore(File(File(filesDir, "ota_updates"), "control-policy-cache.json"))
+        supabasePolicyClient = SupabasePolicyClient()
+        otaPolicyGate = SupabaseOtaPolicyGate(
+            preferencesRepository = preferencesRepository,
+            policyClient = supabasePolicyClient,
+            cacheStore = policyCacheStore,
+            installedVersionCodeProvider = { OtaUpdateManager.getInstalledVersionCode(this) }
+        )
+        otaUpdateManager = OtaUpdateManager(
+            context = this,
+            policyGate = otaPolicyGate
+        )
         googleDriveSyncManager = GoogleDriveSyncManager()
+        OtaPolicyScheduler.schedulePeriodicPolicyCheck(this)
     }
 
     companion object {

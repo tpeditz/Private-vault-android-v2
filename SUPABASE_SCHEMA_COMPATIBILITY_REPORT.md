@@ -1,0 +1,26 @@
+# Private Vault V2.1.0 — Supabase Schema Compatibility Report
+
+**Authoritative Reference:** [20261126120731_private_vault_v210_control_center_foundation.sql](file:///supabase/migrations/20261126120731_private_vault_v210_control_center_foundation.sql)  
+**Follow-Up & Corrective Migrations:** [20261126130000_v210_release_control_and_feedback_rpc.sql](file:///supabase/migrations/20261126130000_v210_release_control_and_feedback_rpc.sql), [20261126140000_v210_corrective_rpc_bridges_and_audit_attribution.sql](file:///supabase/migrations/20261126140000_v210_corrective_rpc_bridges_and_audit_attribution.sql)
+
+---
+
+## 1. Schema Alignment Matrix Across All Layers
+
+| Table | Foundation Schema Columns & Constraints | Android (`SupabasePolicyClient` / Models) | Admin Control Center (`admin-web`) | Edge Functions & RPCs |
+| --- | --- | --- | --- | --- |
+| `public.admin_roles` | `user_id`, `role IN ('owner','admin')`, `active`, `created_at` | Not accessed directly by Android client | Reads `user_id, role, active, created_at` for AAL2 verification | Enforced in `release-control` & `pv_private.admin_transition_release` |
+| `public.client_policy_state` | `singleton` (boolean PK), `revision` (bigint >= 1), `updated_at` | Fixed: queries `?select=singleton,revision,updated_at&singleton=eq.true` (removed non-existent `id`, `latest_stable_version_code`, `latest_beta_version_code`, `feedback_enabled`, `active_flag_version`) | Queries `singleton, revision, updated_at` | Auto-bumped by `pv_private.bump_policy_revision()` triggers |
+| `public.releases` | `id`, `version_name`, `version_code`, `channel` (`stable`\|`beta`), `priority` (`optional`\|`recommended`\|`critical`), `state` (`draft`\|`published`\|`paused`\|`withdrawn`), `rollout_percent` (`0..100`), `release_notes`, `manifest_url`, `apk_sha256`, `apk_size_bytes`, `signing_cert_sha256`, `verified_at`, `available_from`, `available_until`, `created_at`, `updated_at` | Fixed: exact column list, `ReleasePriority` = `OPTIONAL`/`RECOMMENDED`/`CRITICAL`, rejects `published` rows missing `apk_sha256`/`apk_size_bytes`/`verified_at`, validates GitHub `update.json` parity against `apk_sha256` & `apk_size_bytes` | Draft CRUD (`version_name`, `version_code`, `channel`, `priority`, `rollout_percent`, `release_notes`, `available_from`, `available_until`); server transition calls cleanly gated | `release-control` verifies `update.json`, streams real APK binary to verify SHA-256 + byte length + ZIP + APK Sig Block magic, updates via `public.admin_transition_release` |
+| `public.announcements` | `id`, `title`, `message`, `presentation` (`banner`\|`dialog`), `target_channel` (`all`\|`stable`\|`beta`), `min_version_code`, `max_version_code`, `state` (`draft`\|`published`\|`archived`), `repeat_mode` (`once`\|`repeat`), `starts_at`, `ends_at`, `created_at`, `updated_at` | Fixed: queries exact column names (`message`, `presentation`, `target_channel`, `state`, `repeat_mode`, `starts_at`, `ends_at`), renders both `banner` and `dialog` UI | Exact match on all columns, Edit + Preview + Publish/Archive/Delete | Audited & bumps policy revision cleanly |
+| `public.feature_flags` | `flag_key IN ('beta_enrollment_enabled','feedback_enabled','online_maintenance','update_check_interval_hours')`, `boolean_value`, `integer_value` (`6..72`), `is_published`, `updated_at` | Fixed: exact 4 keys & safe defaults (`false`, `false`, `false`, `12`h), removing invented keys | Strict 4-key management matching exact DB check constraints | `submit_verified_feedback` reads `feedback_enabled` flag |
+| `public.feedback` | `id`, `category` (`bug`\|`suggestion`\|`other`), `message` (`1..3000`), `contact` (`<=254`), `app_version` (`<=30`), `consent` (`true`), `status` (`open`\|`reviewing`\|`resolved`), `created_at`, `updated_at` | `SupabaseFeedbackClient` matches exact payload limits & `FEEDBACK_SUBMISSION_ENABLED = false` | Read/triage/delete via AAL2 admin RLS | `submit-feedback` invokes `public.submit_verified_feedback` (service-role only) |
+| `public.admin_audit_log` | `id`, `occurred_at`, `actor_user_id`, `event`, `entity`, `entity_key`, `before_state`, `after_state` | Not queried by Android client | Read-only chronological table (`AuditLogView`) | Triggered cleanly; corrective migration sets both `request.jwt.claim.sub` and `request.jwt.claims` |
+
+---
+
+## 2. Backend RPC Schema Boundary Repair
+
+- **Previous Problem:** `release-control` and `submit-feedback` invoked `adminClient.rpc("admin_transition_release", ...)` and `adminClient.rpc("submit_verified_feedback", ...)`, which target PostgREST's default `public` schema, while the functions were defined inside `pv_private` (which is rightly unexposed in PostgREST).
+- **Resolution:** Corrective migration `20261126140000_v210_corrective_rpc_bridges_and_audit_attribution.sql` creates thin `SECURITY DEFINER` bridges in `public` whose execution is **revoked from `PUBLIC`, `anon`, and `authenticated` and granted exclusively to `service_role`**, keeping `pv_private` private while allowing official Supabase PostgREST RPC invocation cleanly.
+- **Verification Status:** Verified SQL syntax, Android schema contract (`SupabaseSchemaContractTest`), Deno Edge Function tests, and `admin-web` build/tests locally. Live PostgreSQL/Supabase migration execution was not performed in this workspace per authorization boundaries.

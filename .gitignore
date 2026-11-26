@@ -56,3 +56,9 @@ Thumbs.db
 captures/
 .externalNativeBuild/
 .cxx/
+
+# Admin frontend dependencies & local overrides
+admin-web/node_modules/
+admin-web/dist/
+admin-web/.env
+admin-web/.env.local

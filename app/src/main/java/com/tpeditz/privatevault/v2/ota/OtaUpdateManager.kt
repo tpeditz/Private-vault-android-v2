@@ -10,6 +10,16 @@ import android.provider.Settings
 import androidx.core.content.FileProvider
 import com.android.apksig.ApkVerifier
 import com.tpeditz.privatevault.v2.BuildConfig
+import com.tpeditz.privatevault.v2.policy.InstallAuthorizationDecision
+import com.tpeditz.privatevault.v2.policy.OtaCheckPolicyResolution
+import com.tpeditz.privatevault.v2.policy.OtaPolicyGate
+import com.tpeditz.privatevault.v2.policy.PolicyFormatters
+import com.tpeditz.privatevault.v2.policy.PolicySyncResult
+import com.tpeditz.privatevault.v2.policy.ReleaseChannel
+import com.tpeditz.privatevault.v2.policy.ReleasePriority
+import com.tpeditz.privatevault.v2.policy.TrustedControlPolicySnapshot
+import com.tpeditz.privatevault.v2.policy.UNABLE_PAUSED_MESSAGE
+import com.tpeditz.privatevault.v2.policy.UNABLE_TO_VERIFY_UPDATE_MESSAGE
 import com.tpeditz.privatevault.v2.security.SafeVaultLogger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -66,7 +76,8 @@ class OtaUpdateManager(
         .readTimeout(30, TimeUnit.SECONDS)
         .followRedirects(false)
         .followSslRedirects(false)
-        .build()
+        .build(),
+    private val policyGate: OtaPolicyGate? = null
 ) {
 
     private val _otaState = MutableStateFlow<OtaState>(OtaState.Idle)
@@ -159,6 +170,12 @@ class OtaUpdateManager(
         }
     }
 
+    suspend fun syncPolicySnapshot(forceRefresh: Boolean = true): PolicySyncResult? =
+        policyGate?.syncPolicySnapshot(forceRefresh)
+
+    fun currentCachedPolicySnapshot(): TrustedControlPolicySnapshot? =
+        policyGate?.currentCachedSnapshot()
+
     suspend fun checkForUpdates(
         manifestUrl: String = BuildConfig.UPDATE_MANIFEST_URL,
         isUserInitiated: Boolean = true
@@ -174,10 +191,54 @@ class OtaUpdateManager(
             _otaState.value = OtaState.Checking
 
             try {
-                validateManifestUrl(manifestUrl)
-                val request = Request.Builder().url(manifestUrl).get().build()
+                val gateResolution = policyGate?.resolveEligibleCheckTarget()
+                var targetManifestUrl = manifestUrl
+                var approvedChannel = ReleaseChannel.STABLE
+                var approvedPriority = ReleasePriority.OPTIONAL
+                var expectedRelease: com.tpeditz.privatevault.v2.policy.ApprovedReleaseRecord? = null
+
+                when (gateResolution) {
+                    is OtaCheckPolicyResolution.Deferred -> {
+                        val deferred = OtaState.PolicyDeferred(
+                            title = gateResolution.title,
+                            detail = gateResolution.detail,
+                            channel = gateResolution.channel,
+                            versionName = gateResolution.versionName
+                        )
+                        _otaState.value = deferred
+                        return@withContext deferred
+                    }
+
+                    is OtaCheckPolicyResolution.NoUpdateNeeded -> {
+                        val upToDate = OtaState.UpToDate(
+                            BuildConfig.VERSION_NAME,
+                            installedVersionCodeProvider()
+                        )
+                        _otaState.value = upToDate
+                        return@withContext upToDate
+                    }
+
+                    is OtaCheckPolicyResolution.FetchApprovedManifest -> {
+                        expectedRelease = gateResolution.release
+                        targetManifestUrl = gateResolution.release.manifestUrl
+                        approvedChannel = gateResolution.release.channel
+                        approvedPriority = gateResolution.release.priority
+                    }
+
+                    null -> Unit
+                }
+
+                validateManifestUrl(targetManifestUrl)
+                val request = Request.Builder().url(targetManifestUrl).get().build()
                 val manifestJsonString = executeWithRedirects(request, maxHops = 3)
                 val manifest = parseAndValidateManifest(manifestJsonString)
+
+                if (expectedRelease != null) {
+                    val parityErr = verifyManifestMatchesApprovedRelease(manifest, expectedRelease)
+                    if (parityErr != null) {
+                        throw IllegalArgumentException(parityErr)
+                    }
+                }
 
                 val currentVersionCode = installedVersionCodeProvider()
                 val currentVersionName = BuildConfig.VERSION_NAME
@@ -188,7 +249,12 @@ class OtaUpdateManager(
                             previous.manifest.versionCode != manifest.versionCode ||
                             previous.showPromptDialog
                         )
-                    val state = OtaState.UpdateAvailable(manifest = manifest, showPromptDialog = showPrompt)
+                    val state = OtaState.UpdateAvailable(
+                        manifest = manifest,
+                        showPromptDialog = showPrompt,
+                        channel = approvedChannel,
+                        priority = approvedPriority
+                    )
                     _otaState.value = state
                     state
                 } else {
@@ -243,14 +309,98 @@ class OtaUpdateManager(
         }
     }
 
+    private fun verifyManifestMatchesApprovedRelease(
+        manifest: UpdateManifest,
+        release: com.tpeditz.privatevault.v2.policy.ApprovedReleaseRecord
+    ): String? {
+        if (manifest.applicationId != OFFICIAL_APPLICATION_ID) {
+            return "Release manifest application ID does not match Private Vault."
+        }
+        if (manifest.versionCode != release.versionCode || manifest.versionName != release.versionName) {
+            return "Release metadata version does not match approved release policy."
+        }
+        val expectedSha = release.apkSha256?.trim()?.lowercase(Locale.US)
+        if (expectedSha.isNullOrBlank() || manifest.sha256.lowercase(Locale.US) != expectedSha) {
+            return "Release APK SHA-256 checksum does not match freshly approved release metadata."
+        }
+        val expectedSize = release.apkSizeBytes
+        if (expectedSize == null || expectedSize <= 0L || manifest.sizeBytes != expectedSize) {
+            return "Release APK byte size does not match freshly approved release metadata."
+        }
+        val manifestCert = PolicyFormatters.normalizeSha256(manifest.signingCertSha256)
+        val approvedCert = PolicyFormatters.normalizeSha256(release.signingCertSha256)
+        if (manifestCert != approvedCert || manifestCert != PolicyFormatters.normalizeSha256(EXPECTED_RELEASE_SIGNER_CERT_SHA256)) {
+            return "Release signing certificate does not match approved certificate."
+        }
+        val expectedApkPrefix = "https://github.com/$OFFICIAL_REPO/releases/download/v${release.versionName}/"
+        if (!manifest.apkUrl.startsWith(expectedApkPrefix)) {
+            return "Release APK URL does not match official tagged release path."
+        }
+        return null
+    }
+
+    private fun handlePolicyAuthorizationFailure(
+        auth: InstallAuthorizationDecision,
+        fallbackVersionName: String,
+        store: PendingOtaDownloadStore
+    ): OtaState.PolicyDeferred {
+        return when (auth) {
+            is InstallAuthorizationDecision.Paused -> OtaState.PolicyDeferred(
+                title = "Update Unavailable",
+                detail = UNABLE_PAUSED_MESSAGE,
+                channel = auth.release.channel,
+                versionName = auth.release.versionName
+            )
+            is InstallAuthorizationDecision.Withdrawn -> {
+                store.clear()
+                OtaState.PolicyDeferred(
+                    title = "Update Withdrawn",
+                    detail = auth.detail,
+                    channel = auth.release.channel,
+                    versionName = auth.release.versionName
+                )
+            }
+            is InstallAuthorizationDecision.VerificationUnavailable -> OtaState.PolicyDeferred(
+                title = auth.title,
+                detail = UNABLE_TO_VERIFY_UPDATE_MESSAGE,
+                versionName = fallbackVersionName
+            )
+            is InstallAuthorizationDecision.Deferred -> OtaState.PolicyDeferred(
+                title = auth.title,
+                detail = auth.detail,
+                channel = auth.blockedRelease?.channel,
+                versionName = auth.blockedRelease?.versionName ?: fallbackVersionName
+            )
+            is InstallAuthorizationDecision.Authorized -> error("Authorized state passed to failure handler")
+        }
+    }
+
     suspend fun startDownload(manifest: UpdateManifest): Unit = withContext(Dispatchers.IO) {
         operationMutex.lock()
         try {
             if (_otaState.value.isPendingInstallation) return@withContext
+            val store = pendingStore
+            if (policyGate != null) {
+                when (val auth = policyGate.authorizeDownloadOrInstall(manifest.versionCode, forceRefresh = true)) {
+                    is InstallAuthorizationDecision.Authorized -> {
+                        val parityErr = verifyManifestMatchesApprovedRelease(manifest, auth.release)
+                        if (parityErr != null) {
+                            _otaState.value = OtaState.Error(
+                                title = "Update Could Not Be Verified",
+                                detail = parityErr
+                            )
+                            return@withContext
+                        }
+                    }
+                    else -> {
+                        _otaState.value = handlePolicyAuthorizationFailure(auth, manifest.versionName, store)
+                        return@withContext
+                    }
+                }
+            }
             isDownloadCancelled = false
             _otaState.value = OtaState.Downloading(manifest, 0L, manifest.sizeBytes)
 
-            val store = pendingStore
             store.clear()
             val targetApk = store.apkFile(manifest.versionCode)
             targetApk.parentFile?.mkdirs()
@@ -370,7 +520,9 @@ class OtaUpdateManager(
     suspend fun recheckInstallPermissionAndVerifyCandidate(): OtaState = withContext(Dispatchers.IO) {
         operationMutex.withLock {
             val current = _otaState.value
-            if (!current.isPendingInstallation && current !is OtaState.Idle) return@withLock current
+            if (!current.isPendingInstallation && current !is OtaState.Idle && current !is OtaState.PolicyDeferred) {
+                return@withLock current
+            }
             val store = pendingStore
             var manifest: UpdateManifest? = null
             try {
@@ -396,6 +548,27 @@ class OtaUpdateManager(
                     store.clear()
                     _otaState.value = OtaState.Idle
                     return@withLock OtaState.Idle
+                }
+                if (policyGate != null) {
+                    when (val auth = policyGate.authorizeDownloadOrInstall(parsed.versionCode, forceRefresh = true)) {
+                        is InstallAuthorizationDecision.Authorized -> {
+                            val parityErr = verifyManifestMatchesApprovedRelease(parsed, auth.release)
+                            if (parityErr != null) {
+                                store.clear()
+                                val errState = OtaState.Error(
+                                    title = "Update Could Not Be Verified",
+                                    detail = parityErr
+                                )
+                                _otaState.value = errState
+                                return@withLock errState
+                            }
+                        }
+                        else -> {
+                            val deferred = handlePolicyAuthorizationFailure(auth, parsed.versionName, store)
+                            _otaState.value = deferred
+                            return@withLock deferred
+                        }
+                    }
                 }
                 val next = pendingInstallState(parsed, apk, cert, canRequestPackageInstallsProvider())
                 _otaState.value = next
@@ -449,6 +622,25 @@ class OtaUpdateManager(
                 if (isDownloadCancelled) {
                     store.clear()
                     return@withLock
+                }
+                if (policyGate != null) {
+                    when (val auth = policyGate.authorizeDownloadOrInstall(manifest.versionCode, forceRefresh = true)) {
+                        is InstallAuthorizationDecision.Authorized -> {
+                            val parityErr = verifyManifestMatchesApprovedRelease(manifest, auth.release)
+                            if (parityErr != null) {
+                                store.clear()
+                                _otaState.value = OtaState.Error(
+                                    title = "Update Could Not Be Verified",
+                                    detail = parityErr
+                                )
+                                return@withLock
+                            }
+                        }
+                        else -> {
+                            _otaState.value = handlePolicyAuthorizationFailure(auth, manifest.versionName, store)
+                            return@withLock
+                        }
+                    }
                 }
                 if (!canRequestPackageInstallsProvider()) {
                     _otaState.value = pendingInstallState(manifest, expectedApk, cert, false)

@@ -87,6 +87,7 @@ import com.tpeditz.privatevault.v2.ui.screens.AboutScreen
 import com.tpeditz.privatevault.v2.ui.screens.BackupRestoreScreen
 import com.tpeditz.privatevault.v2.ui.screens.CloudBackupScreen
 import com.tpeditz.privatevault.v2.ui.screens.DocumentViewerScreen
+import com.tpeditz.privatevault.v2.ui.screens.FeedbackScreen
 import com.tpeditz.privatevault.v2.ui.screens.HomeScreen
 import com.tpeditz.privatevault.v2.ui.screens.LinkEditorScreen
 import com.tpeditz.privatevault.v2.ui.screens.MediaScreen
@@ -821,6 +822,11 @@ class MainActivity : FragmentActivity() {
                                             onDownloadUpdate = { viewModel.startUpdateDownload(it) },
                                             automaticCheckEnabled = uiState.automaticOtaCheckEnabled,
                                             onSetAutomaticCheck = { viewModel.setAutomaticOtaCheckEnabled(it) },
+                                            betaChannelOptIn = uiState.betaChannelOptIn,
+                                            betaEnrollmentAllowed = uiState.betaEnrollmentAllowed,
+                                            onlineMaintenanceActive = uiState.onlineMaintenanceActive,
+                                            otaCheckIntervalHours = uiState.otaCheckIntervalHours,
+                                            onSetBetaChannelOptIn = { viewModel.setBetaChannelOptIn(it) },
                                             onInstallNow = { viewModel.launchPackageInstaller(it) },
                                             onCancelDownload = { viewModel.cancelUpdateDownload() },
                                             onOpenUnknownSources = {
@@ -838,6 +844,17 @@ class MainActivity : FragmentActivity() {
                                             onBack = { viewModel.navigateBack() }
                                         )
                                     }
+                                    is SecondaryDestination.Feedback -> {
+                                        FeedbackScreen(
+                                            feedbackState = uiState.feedbackState,
+                                            betaChannelOptIn = uiState.betaChannelOptIn,
+                                            onBack = { viewModel.navigateBack() },
+                                            onSubmitFeedback = { cat, msg, contact, consent, cb ->
+                                                viewModel.submitFeedback(cat, msg, contact, consent, cb)
+                                            },
+                                            onSubmitDisabledNotice = { msg -> viewModel.notifyFeedbackStatus(msg) }
+                                        )
+                                    }
                                     is SecondaryDestination.About -> {
                                         AboutScreen(
                                             onCopyText = { l, t -> viewModel.copyPublicText(l, t) },
@@ -850,7 +867,8 @@ class MainActivity : FragmentActivity() {
                                                 uiState = uiState,
                                                 onNavigateToTab = { viewModel.navigateToTab(it) },
                                                 onNavigateToSecondary = { viewModel.navigateToSecondary(it) },
-                                                onLockVault = { viewModel.lockVault() }
+                                                onLockVault = { viewModel.lockVault() },
+                                                onDismissAnnouncement = { viewModel.dismissAnnouncement(it) }
                                             )
                                             PrimaryTab.NOTES -> NotesScreen(
                                                 uiState = uiState,
@@ -1249,6 +1267,11 @@ class MainActivity : FragmentActivity() {
                                     text = {
                                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             Text("Private Vault ${available.manifest.versionName} is ready to download.")
+                                            Text(
+                                                "${available.channel.label} Channel • ${available.priority.label}",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
                                             if (available.manifest.releaseNotes.isNotBlank()) {
                                                 Text(available.manifest.releaseNotes.take(1200))
                                             }
@@ -1285,6 +1308,20 @@ class MainActivity : FragmentActivity() {
                                     },
                                     dismissButton = {
                                         TextButton(onClick = { viewModel.dismissUpdateReminder() }) { Text("Later") }
+                                    }
+                                )
+                            } else if (uiState.activeDialogAnnouncement != null &&
+                                uiState.currentSecondary is SecondaryDestination.None
+                            ) {
+                                val dlg = uiState.activeDialogAnnouncement!!
+                                AlertDialog(
+                                    onDismissRequest = { viewModel.dismissAnnouncement(dlg) },
+                                    title = { Text(dlg.title) },
+                                    text = { Text(dlg.message) },
+                                    confirmButton = {
+                                        Button(onClick = { viewModel.dismissAnnouncement(dlg) }) {
+                                            Text("OK")
+                                        }
                                     }
                                 )
                             }
