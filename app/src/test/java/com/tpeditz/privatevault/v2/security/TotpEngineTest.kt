@@ -155,4 +155,35 @@ class TotpEngineTest {
             TotpEngine.parseOtpAuthUri("otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&algorithm=MD5")
         )
     }
+
+    @Test
+    fun testOtpAuthPreservesPlusAndUnicodeLabels() {
+        val uri =
+            "otpauth://totp/Acme%20Corp:alice%2Bwork@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Acme%20%2B%20Co%20%F0%9F%94%90"
+        val res = TotpEngine.parseOtpAuthUriWithDetails(uri)
+        assertTrue(res is TotpEngine.ParseOtpAuthResult.Success)
+        val parsed = (res as TotpEngine.ParseOtpAuthResult.Success).parsed
+        assertEquals("alice+work@example.com", parsed.accountName)
+        assertEquals("Acme + Co \uD83D\uDD10", parsed.serviceName)
+    }
+
+    @Test
+    fun testOtpAuthRejectsExplicitlyInvalidOptionalParams() {
+        val invalidUris = listOf(
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&digits=abc",
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&digits=5",
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&digits=",
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&period=abc",
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&period=0",
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&algorithm=SHA384",
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&algorithm="
+        )
+        for (invalid in invalidUris) {
+            org.junit.Assert.assertNull("Expected null for $invalid", TotpEngine.parseOtpAuthUri(invalid))
+            assertTrue(
+                "Expected Invalid result for $invalid",
+                TotpEngine.parseOtpAuthUriWithDetails(invalid) is TotpEngine.ParseOtpAuthResult.Invalid
+            )
+        }
+    }
 }

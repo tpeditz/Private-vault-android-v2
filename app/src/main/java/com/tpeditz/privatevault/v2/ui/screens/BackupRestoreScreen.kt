@@ -250,7 +250,7 @@ fun BackupRestoreScreen(
                 Text("Restore Backup", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    "Restore records and media from a .pvault file (supports Private Vault V2 and Legacy V1 backups).",
+                    "Restore records and media from a .pvault file (supports Private Vault V2/V3 and Legacy V1 backups).",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -304,8 +304,33 @@ fun BackupRestoreScreen(
                     ) {
                         Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text("Backup Validated Successfully", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                            Text("Backup Scope: ${payload.scopeDisplayLabel}", fontWeight = FontWeight.SemiBold)
                             Text("Source Version: ${payload.appVersionName} (${payload.applicationId})")
                             Text("Exported: ${SimpleDateFormat("MMM d, yyyy HH:mm", Locale.getDefault()).format(Date(payload.exportedAtEpochMs))}")
+
+                            when {
+                                payload.isPartialCategoryBackup -> {
+                                    Text(
+                                        text = "Partial category backup. Restoring merges these items into your vault while preserving unrelated categories and folders. Full replacement is disabled.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                !payload.isExportScopeKnown -> {
+                                    Text(
+                                        text = "Backup scope unknown (older format or missing scope marker). Merge is recommended so existing records in other categories are kept safe.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.tertiary
+                                    )
+                                }
+                                else -> {
+                                    Text(
+                                        text = "Merge adds/updates newer items non-destructively. Replace Active overwrites your active vault with this verified full backup.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
 
                             Spacer(modifier = Modifier.height(4.dp))
                             Text("Contents:")
@@ -325,10 +350,11 @@ fun BackupRestoreScreen(
                                     onClick = { onConfirmRestore(RestoreMode.MERGE_KEEP_NEWEST) },
                                     modifier = Modifier.weight(1f)
                                 ) {
-                                    Text("Merge (Keep Newest)")
+                                    Text(if (!payload.isExportScopeKnown) "Merge (Recommended)" else "Merge (Keep Newest)")
                                 }
                                 OutlinedButton(
                                     onClick = { showReplaceConfirmDialog = true },
+                                    enabled = !payload.isPartialCategoryBackup,
                                     modifier = Modifier.weight(1f),
                                     colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
                                 ) {
@@ -342,12 +368,18 @@ fun BackupRestoreScreen(
         }
     }
 
-    if (showReplaceConfirmDialog) {
+    val dialogPayload = uiState.pendingRestorePayload
+    if (showReplaceConfirmDialog && dialogPayload != null && !dialogPayload.isPartialCategoryBackup) {
+        val replaceWarning = if (!dialogPayload.isExportScopeKnown) {
+            "Because this backup's scope is unknown, replacing your active vault will permanently erase ALL current notes, passwords, media, documents, and folders — even items missing from this backup. This cannot be undone."
+        } else {
+            "This will permanently overwrite existing records in the currently active vault with the records from the backup file. This cannot be undone."
+        }
         AlertDialog(
             onDismissRequest = { showReplaceConfirmDialog = false },
             icon = { Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
             title = { Text("Replace Active Vault?") },
-            text = { Text("This will permanently overwrite existing records in the currently active vault with the records from the backup file. This cannot be undone.") },
+            text = { Text(replaceWarning) },
             confirmButton = {
                 Button(
                     onClick = {

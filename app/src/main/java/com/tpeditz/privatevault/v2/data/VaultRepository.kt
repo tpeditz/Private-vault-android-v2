@@ -308,6 +308,278 @@ class VaultRepository(
     }
 
     /**
+     * Atomically initializes a fresh vault and commits a validated staged backup in one coherent
+     * operation (R4). Staged assets are validated and durable copies are synced before the single
+     * Room transaction initializes envelopes, default folders, and restored records; if anything
+     * fails or cancels before commit, uncommitted durable files are rolled back while the database
+     * remains uninitialized and the staged backup stays ready for safe retry.
+     */
+    suspend fun initializeVaultAndCommitRestore(
+        masterPasswordChars: CharArray,
+        staged: StagedBackupRestore,
+        mode: RestoreMode = if (staged.payload.isVerifiedFullBackup) RestoreMode.REPLACE_ACTIVE_VAULT else RestoreMode.MERGE_KEEP_NEWEST,
+        allowUnknownScopeReplace: Boolean = true,
+        kdfParams: CryptoEngine.KdfParams = CryptoEngine.KdfParams(),
+        isCancelled: () -> Boolean = { false }
+    ): AuthResult = withContext(Dispatchers.IO) {
+        vaultMutationMutex.withLock {
+            kdfMutex.withLock {
+                if (isCancelled()) throw CancellationException("First-launch restore cancelled before initialization.")
+                if (dao.getEnvelopeForSlot(VaultSessionManager.REAL_SLOT) != null ||
+                    dao.getEnvelopeForSlot(VaultSessionManager.DECOY_SLOT) != null
+                ) {
+                    return@withLock AuthResult.Error("A vault already exists. Unlock the existing vault to restore.")
+                }
+                val policy = PasswordPolicy.validateNewPassword(masterPasswordChars, "Master password")
+                if (!policy.isValid) {
+                    return@withLock AuthResult.Error(policy.errorMessage ?: "Invalid master password.")
+                }
+                kdfParams.validateBounds()
+                enforceRestoreModeScopePolicy(staged.payload, mode, allowUnknownScopeReplace)
+
+                validateStagedAssetsForSlot(staged, VaultSessionManager.REAL_SLOT, isCancelled)
+                if (isCancelled()) throw CancellationException("First-launch restore cancelled during asset validation.")
+
+                val now = System.currentTimeMillis()
+                val realSalt = CryptoEngine.generateSalt()
+                val realNonce = CryptoEngine.generateNonce()
+                val realDek = CryptoEngine.generateDek()
+                var realKek: ByteArray? = null
+
+                val recoveryJournalDir = File(filesDir, RECOVERY_JOURNAL_DIR_NAME)
+                val journalFile = File(recoveryJournalDir, RECOVERY_MANIFEST_FILE_NAME)
+                if (journalFile.exists()) {
+                    check(executeRecoveryRollback(recoveryJournalDir, journalFile)) { "Previous restore recovery is still pending." }
+                }
+
+                var journalWritten = false
+                try {
+                    realKek = CryptoEngine.deriveKeyArgon2id(
+                        passwordChars = masterPasswordChars,
+                        salt = realSalt,
+                        params = kdfParams,
+                        normalizeUnicodeNfc = true
+                    )
+                    if (isCancelled()) throw CancellationException("First-launch restore cancelled during key derivation.")
+
+                    val realPayload = CryptoEngine.UnwrappedEnvelopePayload(
+                        slotRoleFlag = CryptoEngine.SLOT_ROLE_ACTIVE,
+                        decoyPolicyFlag = CryptoEngine.DECOY_POLICY_DISABLED,
+                        createdAtEpochMs = now,
+                        rotatedAtEpochMs = now,
+                        dekBytes = realDek
+                    )
+                    val wrappedReal = CryptoEngine.wrapEnvelopePayload(
+                        kekBytes = realKek,
+                        nonce = realNonce,
+                        slotId = VaultSessionManager.REAL_SLOT,
+                        envelopeVersion = CryptoEngine.ENVELOPE_VERSION,
+                        params = kdfParams,
+                        payload = realPayload
+                    )
+                    val realEnvelope = VaultEnvelopeEntity(
+                        slotId = VaultSessionManager.REAL_SLOT,
+                        envelopeVersion = CryptoEngine.ENVELOPE_VERSION,
+                        kdfAlgorithm = kdfParams.algorithm,
+                        kdfSalt = realSalt,
+                        kdfMemoryKb = kdfParams.memoryKb,
+                        kdfIterations = kdfParams.iterations,
+                        kdfParallelism = kdfParams.parallelism,
+                        envelopeNonce = realNonce,
+                        wrappedPayloadCiphertext = wrappedReal
+                    )
+
+                    val decoySalt = CryptoEngine.generateSalt()
+                    val decoyNonce = CryptoEngine.generateNonce()
+                    val dummyDek = CryptoEngine.generateDek()
+                    val dummyKek = CryptoEngine.randomBytes(CryptoEngine.DEK_BYTES)
+                    val dummyPayload = CryptoEngine.UnwrappedEnvelopePayload(
+                        slotRoleFlag = CryptoEngine.SLOT_ROLE_DUMMY,
+                        decoyPolicyFlag = CryptoEngine.DECOY_POLICY_DISABLED,
+                        createdAtEpochMs = now,
+                        rotatedAtEpochMs = now,
+                        dekBytes = dummyDek
+                    )
+                    val wrappedDecoy = CryptoEngine.wrapEnvelopePayload(
+                        kekBytes = dummyKek,
+                        nonce = decoyNonce,
+                        slotId = VaultSessionManager.DECOY_SLOT,
+                        envelopeVersion = CryptoEngine.ENVELOPE_VERSION,
+                        params = kdfParams,
+                        payload = dummyPayload
+                    )
+                    Arrays.fill(dummyDek, 0.toByte())
+                    Arrays.fill(dummyKek, 0.toByte())
+                    val decoyEnvelope = VaultEnvelopeEntity(
+                        slotId = VaultSessionManager.DECOY_SLOT,
+                        envelopeVersion = CryptoEngine.ENVELOPE_VERSION,
+                        kdfAlgorithm = kdfParams.algorithm,
+                        kdfSalt = decoySalt,
+                        kdfMemoryKb = kdfParams.memoryKb,
+                        kdfIterations = kdfParams.iterations,
+                        kdfParallelism = kdfParams.parallelism,
+                        envelopeNonce = decoyNonce,
+                        wrappedPayloadCiphertext = wrappedDecoy
+                    )
+
+                    val restoredIds = staged.payload.items.mapTo(HashSet(staged.payload.items.size)) { it.id }
+                    val defaultFolders = listOf(
+                        VaultFolder(
+                            id = VaultFolder.DEFAULT_NOTE_FOLDER_ID,
+                            name = VaultFolder.DEFAULT_FOLDER_NAME,
+                            scope = FolderScope.NOTES,
+                            createdAtEpochMs = now,
+                            updatedAtEpochMs = now
+                        ),
+                        VaultFolder(
+                            id = VaultFolder.DEFAULT_CREDENTIAL_FOLDER_ID,
+                            name = VaultFolder.DEFAULT_FOLDER_NAME,
+                            scope = FolderScope.CREDENTIALS,
+                            createdAtEpochMs = now,
+                            updatedAtEpochMs = now
+                        ),
+                        VaultFolder(
+                            id = VaultFolder.DEFAULT_DOCUMENT_FOLDER_ID,
+                            name = VaultFolder.DEFAULT_FOLDER_NAME,
+                            scope = FolderScope.DOCUMENTS,
+                            createdAtEpochMs = now,
+                            updatedAtEpochMs = now
+                        )
+                    ).filterNot { restoredIds.contains(it.id) }
+
+                    val initialSeedRecords = defaultFolders.map { folder ->
+                        val encoded = VaultRecordCodec.encode(folder)
+                        val nonce = CryptoEngine.generateNonce()
+                        val aad = CryptoEngine.buildRecordAad(VaultSessionManager.REAL_SLOT, folder.id)
+                        val cipher = CryptoEngine.encryptAesGcm(realDek, nonce, encoded, aad)
+                        EncryptedRecordEntity(
+                            recordId = folder.id,
+                            vaultSlot = VaultSessionManager.REAL_SLOT,
+                            schemaVersion = CryptoEngine.RECORD_SCHEMA_VERSION,
+                            nonce = nonce,
+                            ciphertext = cipher
+                        )
+                    }
+
+                    val mediaDir = File(filesDir, "media").apply { mkdirs() }
+                    val thumbDir = File(filesDir, "thumbs").apply { mkdirs() }
+                    val docDir = File(filesDir, "documents").apply { mkdirs() }
+                    val stagedMediaDir = File(staged.stagingDir, "media")
+                    val stagedThumbDir = File(staged.stagingDir, "thumbs")
+                    val stagedDocDir = resolveStagedDocDir(staged.stagingDir)
+
+                    val commitToken = UUID.randomUUID().toString().replace("-", "").take(12)
+                    val writtenDurableFiles = collectPlannedDurableFiles(
+                        itemsToRestore = staged.payload.items,
+                        commitToken = commitToken,
+                        mediaDir = mediaDir,
+                        thumbDir = thumbDir,
+                        docDir = docDir
+                    )
+
+                    writeRecoveryJournal(
+                        recoveryJournalDir = recoveryJournalDir,
+                        journalFile = journalFile,
+                        slotId = VaultSessionManager.REAL_SLOT,
+                        mode = mode,
+                        state = STATE_PREPARING,
+                        stagingDir = staged.stagingDir,
+                        writtenAssetFiles = writtenDurableFiles,
+                        filesToDeleteAfterCommit = emptyList()
+                    )
+                    journalWritten = true
+
+                    val durableMediaRelPaths = mutableMapOf<String, Pair<String, String>>()
+                    val durableDocRelPaths = mutableMapOf<String, String>()
+                    copyDurableRestoreAssets(
+                        itemsToRestore = staged.payload.items,
+                        commitToken = commitToken,
+                        mediaDir = mediaDir,
+                        thumbDir = thumbDir,
+                        docDir = docDir,
+                        stagedMediaDir = stagedMediaDir,
+                        stagedThumbDir = stagedThumbDir,
+                        stagedDocDir = stagedDocDir,
+                        durableMediaRelPaths = durableMediaRelPaths,
+                        durableDocRelPaths = durableDocRelPaths,
+                        isCancelled = isCancelled
+                    )
+
+                    writeRecoveryJournal(
+                        recoveryJournalDir = recoveryJournalDir,
+                        journalFile = journalFile,
+                        slotId = VaultSessionManager.REAL_SLOT,
+                        mode = mode,
+                        state = STATE_STAGED,
+                        stagingDir = staged.stagingDir,
+                        writtenAssetFiles = writtenDurableFiles,
+                        filesToDeleteAfterCommit = emptyList()
+                    )
+
+                    if (isCancelled()) throw CancellationException("First-launch restore cancelled before vault commit.")
+
+                    var dbCommitted = false
+                    try {
+                        runInTransaction {
+                            check(
+                                dao.getEnvelopeForSlot(VaultSessionManager.REAL_SLOT) == null &&
+                                    dao.getEnvelopeForSlot(VaultSessionManager.DECOY_SLOT) == null
+                            ) { "A vault was initialized concurrently. Unlock it instead." }
+                            dao.initializeVaultAtomically(
+                                envelopes = listOf(realEnvelope, decoyEnvelope),
+                                initialRecords = initialSeedRecords
+                            )
+                            persistRestoredItemsInTransaction(
+                                slotId = VaultSessionManager.REAL_SLOT,
+                                dek = realDek,
+                                itemsToRestore = staged.payload.items,
+                                durableMediaRelPaths = durableMediaRelPaths,
+                                durableDocRelPaths = durableDocRelPaths
+                            )
+                        }
+                        dbCommitted = true
+                    } catch (e: Exception) {
+                        if (!dbCommitted && journalWritten && journalFile.exists()) {
+                            executeRecoveryRollback(recoveryJournalDir, journalFile)
+                        }
+                        throw e
+                    }
+
+                    runCatching {
+                        writeRecoveryJournal(
+                            recoveryJournalDir = recoveryJournalDir,
+                            journalFile = journalFile,
+                            slotId = VaultSessionManager.REAL_SLOT,
+                            mode = mode,
+                            state = STATE_COMMITTED,
+                            stagingDir = staged.stagingDir,
+                            writtenAssetFiles = writtenDurableFiles,
+                            filesToDeleteAfterCommit = emptyList()
+                        )
+                        recoveryJournalDir.deleteRecursively()
+                    }
+                    runCatching { staged.stagingDir.deleteRecursively() }
+
+                    sessionManager.openSession(
+                        slotId = VaultSessionManager.REAL_SLOT,
+                        dekBytes = realDek,
+                        isDecoyConfiguredInRealVault = false
+                    )
+                    AuthResult.Success(VaultSessionManager.REAL_SLOT, false)
+                } catch (e: Exception) {
+                    if (journalWritten && journalFile.exists()) {
+                        runCatching { executeRecoveryRollback(recoveryJournalDir, journalFile) }
+                    }
+                    throw e
+                } finally {
+                    realKek?.let { Arrays.fill(it, 0.toByte()) }
+                    Arrays.fill(realDek, 0.toByte())
+                }
+            }
+        }
+    }
+
+    /**
      * Unlocks the vault using the supplied password. Checks Slot 0 first, then Slot 1.
      */
     suspend fun unlockVault(passwordChars: CharArray): AuthResult = withContext(Dispatchers.IO) {
@@ -926,6 +1198,21 @@ class VaultRepository(
         getAllItemsForActiveSlotWithAudit(expectedSessionId).items
     }
 
+    /**
+     * Loads all vault records for backup and fails clearly if any record cannot be authenticated
+     * or decoded so callers never silently produce incomplete backups.
+     */
+    suspend fun getAllItemsForBackupOrThrow(expectedSessionId: Long? = null): List<VaultItem> = withContext(Dispatchers.IO) {
+        val loaded = getAllItemsForActiveSlotWithAudit(expectedSessionId)
+        if (loaded.corruptedCount > 0) {
+            throw CorruptedVaultRecordsException(
+                corruptedCount = loaded.corruptedCount,
+                message = "Some vault items could not be read. Your backup was not replaced."
+            )
+        }
+        loaded.items
+    }
+
     suspend fun saveItem(item: VaultItem, expectedSessionId: Long? = null): Unit = withContext(Dispatchers.IO) {
         vaultMutationMutex.withLock {
             saveItemLocked(item, expectedSessionId)
@@ -1147,6 +1434,7 @@ class VaultRepository(
                 vaultSlot = slotId,
                 thumbKey = thumbnailKey
             )
+            Arrays.fill(thumbBytes, 0.toByte())
             FileOutputStream(tempThumbFile).use { fos ->
                 fos.write(encThumb)
                 fos.flush()
@@ -1160,10 +1448,9 @@ class VaultRepository(
                 fileMediaKey = fileMediaKey
             )
 
-            if (finalMediaFile.exists()) finalMediaFile.delete()
-            if (finalThumbFile.exists()) finalThumbFile.delete()
-            check(tempMediaFile.renameTo(finalMediaFile)) { "Failed to move verified media file" }
-            check(tempThumbFile.renameTo(finalThumbFile)) { "Failed to move verified thumbnail file" }
+            currentCoroutineContext().ensureActive()
+            atomicReplaceFile(tempMediaFile, finalMediaFile, "media")
+            atomicReplaceFile(tempThumbFile, finalThumbFile, "thumbnail")
 
             val mediaRecord = MediaRecord(
                 id = mediaId,
@@ -1302,8 +1589,8 @@ class VaultRepository(
                 fileMediaKey = fileKey
             )
 
-            if (finalDocFile.exists()) finalDocFile.delete()
-            check(tempDocFile.renameTo(finalDocFile)) { "Failed to move verified document file" }
+            currentCoroutineContext().ensureActive()
+            atomicReplaceFile(tempDocFile, finalDocFile, "document")
 
             val docRecord = DocumentRecord(
                 id = docId,
@@ -1399,6 +1686,7 @@ class VaultRepository(
         mediaRecord: MediaRecord
     ): StreamingMediaCryptoEngine.EncryptedChunkMediaDataSource = withContext(Dispatchers.IO) {
         val session = sessionManager.requireUnlockedSession()
+        val initialSessionId = session.sessionId
         val mediaEntity = dao.getMediaFileEntity(session.slotId, mediaRecord.id)
         val mediaFile = if (mediaEntity != null) {
             File(filesDir, mediaEntity.relativeMediaPath)
@@ -1412,11 +1700,23 @@ class VaultRepository(
                 mediaFile = mediaFile,
                 mediaId = mediaRecord.id,
                 vaultSlot = session.slotId,
-                fileMediaKey = fileMediaKey
+                fileMediaKey = fileMediaKey,
+                isSessionValid = {
+                    val active = sessionManager.getActiveSession()
+                    active != null && active.sessionId == initialSessionId && !active.isWiped
+                }
             )
         } finally {
             Arrays.fill(fileMediaKey, 0.toByte())
         }
+    }
+
+    private fun atomicReplaceFile(sourceTemp: File, targetFinal: File, label: String) {
+        if (sourceTemp.renameTo(targetFinal)) return
+        if (targetFinal.exists()) {
+            targetFinal.delete()
+        }
+        check(sourceTemp.renameTo(targetFinal)) { "Failed to move verified $label file" }
     }
 
     suspend fun loadDecryptedThumbnailBytes(mediaRecord: MediaRecord): ByteArray = withContext(Dispatchers.IO) {
@@ -1576,8 +1876,9 @@ class VaultRepository(
     }
 
     /**
-     * Exports a streaming encrypted V2 backup bound to the currently unlocked vault session,
-     * resolving authoritative database asset paths so restored/migrated assets are always located accurately.
+     * Exports an encrypted streaming backup bound to the currently unlocked vault session,
+     * verifying authoritative database asset status/size/integrity and using the `PVAULTB3`
+     * privacy-enhanced container by default.
      */
     suspend fun createAuthoritativeStreamingBackup(
         items: List<VaultItem>,
@@ -1587,7 +1888,9 @@ class VaultRepository(
         kdfParams: CryptoEngine.KdfParams = CryptoEngine.KdfParams(),
         isCancelled: () -> Boolean = { false },
         onProgress: (bytesWritten: Long, totalEstimatedBytes: Long) -> Unit = { _, _ -> },
-        expectedSessionId: Long? = null
+        expectedSessionId: Long? = null,
+        exportScope: BackupExportScope = BackupExportScope.ALL_DATA,
+        useLegacyV2Container: Boolean = false
     ) = withContext(Dispatchers.IO) {
         vaultMutationMutex.withLock {
             val session = sessionManager.requireUnlockedSession()
@@ -1600,27 +1903,96 @@ class VaultRepository(
             val docEntities = dao.getAllDocumentFileEntitiesForSlot(slotId).associateBy { it.documentId }
 
             val resolvedMap = HashMap<String, Pair<String?, String?>>(mediaEntities.size + docEntities.size)
-            for ((id, m) in mediaEntities) {
-                resolvedMap[id] = m.relativeMediaPath to m.relativeThumbPath
-            }
-            for ((id, d) in docEntities) {
-                resolvedMap[id] = d.relativeFilePath to null
+            val expectations = HashMap<String, EncryptedBackupV2Engine.AuthoritativeAssetExpectation>(items.size)
+
+            for (item in items) {
+                if (item is MediaRecord) {
+                    val m = mediaEntities[item.id]
+                    if (m != null) {
+                        require(m.importStatus == EncryptedMediaFileEntity.IMPORT_STATUS_COMMITTED) {
+                            "Backup aborted: media asset ${item.title.ifBlank { item.id }} is not in committed state."
+                        }
+                        resolvedMap[item.id] = m.relativeMediaPath to m.relativeThumbPath
+                        expectations[item.id] = EncryptedBackupV2Engine.AuthoritativeAssetExpectation(
+                            relativeMediaOrDocPath = m.relativeMediaPath,
+                            relativeThumbPath = m.relativeThumbPath,
+                            expectedEncryptedBytes = m.encryptedSizeBytes,
+                            expectedSha256Hex = m.ciphertextSha256,
+                            expectedChunkCount = m.chunkCount,
+                            verifyPvm1Integrity = true,
+                            vaultSlotForAuth = slotId
+                        )
+                    } else {
+                        expectations[item.id] = EncryptedBackupV2Engine.AuthoritativeAssetExpectation(
+                            expectedEncryptedBytes = item.encryptedSizeBytes.takeIf { it > 0L },
+                            expectedSha256Hex = item.ciphertextSha256Hex.takeIf { it.length == 64 },
+                            expectedChunkCount = item.chunkCount.takeIf { it > 0 },
+                            verifyPvm1Integrity = true,
+                            vaultSlotForAuth = slotId
+                        )
+                    }
+                } else if (item is DocumentRecord) {
+                    val d = docEntities[item.id]
+                    if (d != null) {
+                        require(d.importStatus == EncryptedDocumentFileEntity.IMPORT_STATUS_COMMITTED) {
+                            "Backup aborted: document asset ${item.title.ifBlank { item.id }} is not in committed state."
+                        }
+                        resolvedMap[item.id] = d.relativeFilePath to null
+                        expectations[item.id] = EncryptedBackupV2Engine.AuthoritativeAssetExpectation(
+                            relativeMediaOrDocPath = d.relativeFilePath,
+                            relativeThumbPath = null,
+                            expectedEncryptedBytes = d.encryptedSizeBytes,
+                            expectedSha256Hex = d.ciphertextSha256,
+                            expectedChunkCount = d.chunkCount,
+                            verifyPvm1Integrity = true,
+                            vaultSlotForAuth = slotId
+                        )
+                    } else {
+                        expectations[item.id] = EncryptedBackupV2Engine.AuthoritativeAssetExpectation(
+                            expectedEncryptedBytes = item.encryptedSizeBytes.takeIf { it > 0L },
+                            expectedSha256Hex = item.ciphertextSha256Hex.takeIf { it.length == 64 },
+                            expectedChunkCount = item.chunkCount.takeIf { it > 0 },
+                            verifyPvm1Integrity = true,
+                            vaultSlotForAuth = slotId
+                        )
+                    }
+                }
             }
 
-            EncryptedBackupV2Engine.createStreamingBackup(
-                items = items,
-                backupPasswordChars = backupPasswordChars,
-                outputStream = outputStream,
-                appFilesDir = filesDir,
-                appVersionName = appVersionName,
-                kdfParams = kdfParams,
-                assetPathResolver = { id -> resolvedMap[id] ?: (null to null) },
-                isCancelled = {
-                    val active = sessionManager.getActiveSession()
-                    isCancelled() || active == null || active.sessionId != initialSessionId || active.isWiped
-                },
-                onProgress = onProgress
-            )
+            val cancelledLambda = {
+                val active = sessionManager.getActiveSession()
+                isCancelled() || active == null || active.sessionId != initialSessionId || active.isWiped
+            }
+
+            if (useLegacyV2Container) {
+                EncryptedBackupV2Engine.createStreamingBackup(
+                    items = items,
+                    backupPasswordChars = backupPasswordChars,
+                    outputStream = outputStream,
+                    appFilesDir = filesDir,
+                    appVersionName = appVersionName,
+                    kdfParams = kdfParams,
+                    assetPathResolver = { id -> resolvedMap[id] ?: (null to null) },
+                    isCancelled = cancelledLambda,
+                    onProgress = onProgress,
+                    assetExpectations = expectations,
+                    exportScope = exportScope
+                )
+            } else {
+                EncryptedBackupV2Engine.createPrivacyEnhancedStreamingBackup(
+                    items = items,
+                    backupPasswordChars = backupPasswordChars,
+                    outputStream = outputStream,
+                    appFilesDir = filesDir,
+                    appVersionName = appVersionName,
+                    kdfParams = kdfParams,
+                    assetPathResolver = { id -> resolvedMap[id] ?: (null to null) },
+                    isCancelled = cancelledLambda,
+                    onProgress = onProgress,
+                    assetExpectations = expectations,
+                    exportScope = exportScope
+                )
+            }
         }
     }
 
@@ -2185,13 +2557,301 @@ class VaultRepository(
         }
     }
 
+    private fun resolveStagedDocDir(stagingDir: File): File = sequenceOf(
+        File(stagingDir, "documents"),
+        File(stagingDir, "docs")
+    ).firstOrNull { it.exists() } ?: File(stagingDir, "docs")
+
+    private fun enforceRestoreModeScopePolicy(
+        payload: BackupPayload,
+        mode: RestoreMode,
+        allowUnknownScopeReplace: Boolean
+    ) {
+        if (mode == RestoreMode.REPLACE_ACTIVE_VAULT) {
+            if (payload.isPartialCategoryBackup) {
+                throw IllegalArgumentException(
+                    "Replace Active Vault is not allowed for partial category backups (${payload.scopeDisplayLabel}). Use Merge instead."
+                )
+            }
+            if (!payload.isExportScopeKnown && !allowUnknownScopeReplace) {
+                throw IllegalArgumentException(
+                    "Backup scope is unknown. Confirm full replacement explicitly or use Merge to keep existing data."
+                )
+            }
+        }
+    }
+
+    private fun collectPlannedDurableFiles(
+        itemsToRestore: List<VaultItem>,
+        commitToken: String,
+        mediaDir: File,
+        thumbDir: File,
+        docDir: File
+    ): MutableList<File> {
+        val written = mutableListOf<File>()
+        for (item in itemsToRestore) {
+            if (item is MediaRecord) {
+                written.add(VaultFileSafety.requireWithin(mediaDir, File(mediaDir, "${item.id}_$commitToken.pvmedia")))
+                written.add(VaultFileSafety.requireWithin(thumbDir, File(thumbDir, "${item.id}_$commitToken.pvthumb")))
+            } else if (item is DocumentRecord) {
+                written.add(VaultFileSafety.requireWithin(docDir, File(docDir, "${item.id}_$commitToken.pvdoc")))
+            }
+        }
+        return written
+    }
+
+    private fun copyDurableRestoreAssets(
+        itemsToRestore: List<VaultItem>,
+        commitToken: String,
+        mediaDir: File,
+        thumbDir: File,
+        docDir: File,
+        stagedMediaDir: File,
+        stagedThumbDir: File,
+        stagedDocDir: File,
+        durableMediaRelPaths: MutableMap<String, Pair<String, String>>,
+        durableDocRelPaths: MutableMap<String, String>,
+        isCancelled: () -> Boolean
+    ) {
+        for (item in itemsToRestore) {
+            if (isCancelled()) throw CancellationException("Restore cancelled during file write.")
+            if (item is MediaRecord) {
+                val stagedMediaFile = sequenceOf(
+                    File(stagedMediaDir, "${item.id}.pvmedia"),
+                    File(stagedMediaDir, "${item.id}.pvm")
+                ).first { it.exists() }
+                val stagedThumbFile = sequenceOf(
+                    File(stagedThumbDir, "${item.id}.pvthumb"),
+                    File(stagedThumbDir, "${item.id}.pvt")
+                ).first { it.exists() }
+                val relMediaPath = "media/${item.id}_$commitToken.pvmedia"
+                val relThumbPath = "thumbs/${item.id}_$commitToken.pvthumb"
+                val destMediaFile = File(filesDir, relMediaPath)
+                val destThumbFile = File(filesDir, relThumbPath)
+                VaultFileSafety.requireWithin(mediaDir, destMediaFile)
+                VaultFileSafety.requireWithin(thumbDir, destThumbFile)
+                copyStreamWithSync(stagedMediaFile, destMediaFile)
+                copyStreamWithSync(stagedThumbFile, destThumbFile)
+                durableMediaRelPaths[item.id] = relMediaPath to relThumbPath
+            }
+            if (item is DocumentRecord) {
+                val stagedDocFile = sequenceOf(
+                    File(stagedDocDir, "${item.id}.pvdoc"),
+                    File(stagedDocDir, "${item.id}.pvm")
+                ).first { it.exists() }
+                val relDocPath = "documents/${item.id}_$commitToken.pvdoc"
+                val destDocFile = File(filesDir, relDocPath)
+                VaultFileSafety.requireWithin(docDir, destDocFile)
+                copyStreamWithSync(stagedDocFile, destDocFile)
+                durableDocRelPaths[item.id] = relDocPath
+            }
+        }
+    }
+
+    private suspend fun persistRestoredItemsInTransaction(
+        slotId: Int,
+        dek: ByteArray,
+        itemsToRestore: List<VaultItem>,
+        durableMediaRelPaths: Map<String, Pair<String, String>>,
+        durableDocRelPaths: Map<String, String>
+    ): RestoreReport {
+        var restoredItems = 0
+        var restoredMedia = 0
+        var restoredDocs = 0
+        for (item in itemsToRestore) {
+            val rawBytes = VaultRecordCodec.encode(item)
+            val nonce = CryptoEngine.generateNonce()
+            val aad = CryptoEngine.buildRecordAad(vaultSlot = slotId, recordId = item.id, schemaVersion = CryptoEngine.RECORD_SCHEMA_VERSION)
+            val ciphertext = CryptoEngine.encryptAesGcm(dek, nonce, rawBytes, aad)
+            val recordEntity = EncryptedRecordEntity(
+                recordId = item.id,
+                vaultSlot = slotId,
+                schemaVersion = CryptoEngine.RECORD_SCHEMA_VERSION,
+                nonce = nonce,
+                ciphertext = ciphertext
+            )
+            dao.upsertRecord(recordEntity)
+            restoredItems++
+
+            if (item is MediaRecord) {
+                val (relMedia, relThumb) = durableMediaRelPaths.getValue(item.id)
+                val mediaFile = File(filesDir, relMedia)
+                dao.upsertMediaFileEntity(
+                    EncryptedMediaFileEntity(
+                        vaultSlot = slotId,
+                        mediaId = item.id,
+                        formatVersion = item.formatVersion,
+                        relativeMediaPath = relMedia,
+                        relativeThumbPath = relThumb,
+                        encryptedSizeBytes = mediaFile.length(),
+                        chunkCount = item.chunkCount,
+                        ciphertextSha256 = item.ciphertextSha256Hex,
+                        importStatus = EncryptedMediaFileEntity.IMPORT_STATUS_COMMITTED,
+                        createdAtEpochMs = item.createdAtEpochMs
+                    )
+                )
+                restoredMedia++
+            }
+
+            if (item is DocumentRecord) {
+                val relDoc = durableDocRelPaths.getValue(item.id)
+                val docFile = File(filesDir, relDoc)
+                dao.upsertDocumentFileEntity(
+                    EncryptedDocumentFileEntity(
+                        vaultSlot = slotId,
+                        documentId = item.id,
+                        formatVersion = item.formatVersion,
+                        relativeFilePath = relDoc,
+                        encryptedSizeBytes = docFile.length(),
+                        chunkCount = item.chunkCount,
+                        ciphertextSha256 = item.ciphertextSha256Hex,
+                        importStatus = EncryptedDocumentFileEntity.IMPORT_STATUS_COMMITTED,
+                        createdAtEpochMs = item.createdAtEpochMs
+                    )
+                )
+                restoredDocs++
+            }
+        }
+        return RestoreReport(restoredItems, restoredMedia, restoredDocs)
+    }
+
+    /**
+     * Validates all staged records, keys, SHA-256 digests, and `PVM1`/thumbnail AEAD payloads
+     * for `slotId` without requiring an unlocked vault or mutating any vault state.
+     */
+    suspend fun validateStagedAssetsForSlot(
+        staged: StagedBackupRestore,
+        slotId: Int,
+        isCancelled: () -> Boolean = { false }
+    ) = withContext(Dispatchers.IO) {
+        val stagedMediaDir = File(staged.stagingDir, "media")
+        val stagedThumbDir = File(staged.stagingDir, "thumbs")
+        val stagedDocDir = resolveStagedDocDir(staged.stagingDir)
+        val pvm1Magic = "PVM1".toByteArray(StandardCharsets.US_ASCII)
+
+        val seenIds = HashSet<String>(staged.payload.items.size)
+        for (item in staged.payload.items) {
+            if (isCancelled()) throw CancellationException("Restore cancelled during validation.")
+            require(item.id.isNotBlank()) { "Restore rejected: Encountered record with blank ID." }
+            if (item is MediaRecord || item is DocumentRecord) VaultFileSafety.requireAssetId(item.id)
+            require(seenIds.add(item.id)) { "Restore rejected: Duplicate record ID ${item.id} in backup manifest." }
+
+            if (item is MediaRecord) {
+                val stagedMediaFile = sequenceOf(
+                    File(stagedMediaDir, "${item.id}.pvmedia"),
+                    File(stagedMediaDir, "${item.id}.pvm")
+                ).firstOrNull { it.exists() }
+                    ?: throw IllegalArgumentException("Restore rejected: Missing media payload file for record ${item.id} (${item.title}).")
+                require(stagedMediaFile.length() > 0L) {
+                    "Restore rejected: Empty media payload file for ${item.id}."
+                }
+                require(item.fileMediaKeyBase64.isNotBlank() && item.thumbnailKeyBase64.isNotBlank()) {
+                    "Restore rejected: Missing authentic encryption keys for media ${item.id}."
+                }
+                val mediaKey = runCatching { Base64.decode(item.fileMediaKeyBase64) }.getOrNull()
+                require(mediaKey != null && mediaKey.size == 32) {
+                    "Restore rejected: Invalid 256-bit media encryption key for ${item.id}."
+                }
+                val thumbKey = runCatching { Base64.decode(item.thumbnailKeyBase64) }.getOrNull()
+                require(thumbKey != null && thumbKey.size == 32) {
+                    "Restore rejected: Invalid 256-bit thumbnail encryption key for ${item.id}."
+                }
+                try {
+                    if (item.ciphertextSha256Hex.length == 64) {
+                        val computedSha = computeFileSha256Hex(stagedMediaFile)
+                        require(computedSha.equals(item.ciphertextSha256Hex, ignoreCase = true)) {
+                            "Restore rejected: SHA-256 digest mismatch on media payload for ${item.id}."
+                        }
+                    }
+                    val headerBytes = ByteArray(4)
+                    stagedMediaFile.inputStream().use { it.read(headerBytes) }
+                    require(headerBytes.contentEquals(pvm1Magic)) {
+                        "Restore rejected: Media payload for ${item.id} lacks valid PVM1 encrypted header."
+                    }
+                    StreamingMediaCryptoEngine.verifyEncryptedMediaFileEveryChunk(
+                        encryptedFile = stagedMediaFile,
+                        mediaId = item.id,
+                        vaultSlot = slotId,
+                        fileMediaKey = mediaKey,
+                        isCancelled = isCancelled
+                    )
+
+                    val stagedThumbFile = sequenceOf(
+                        File(stagedThumbDir, "${item.id}.pvthumb"),
+                        File(stagedThumbDir, "${item.id}.pvt")
+                    ).firstOrNull { it.exists() }
+                    require(stagedThumbFile != null && stagedThumbFile.exists() && stagedThumbFile.length() > 0L) {
+                        "Restore rejected: Missing thumbnail payload file for ${item.id}."
+                    }
+                    runCatching {
+                        StreamingMediaCryptoEngine.verifyEncryptedThumbnailFile(
+                            thumbFile = stagedThumbFile,
+                            mediaId = item.id,
+                            vaultSlot = slotId,
+                            thumbKey = thumbKey,
+                            isCancelled = isCancelled
+                        )
+                    }.onFailure {
+                        if (it is CancellationException) throw it
+                        throw IllegalArgumentException("Restore rejected: Thumbnail authentication failed for ${item.id}: ${it.message}", it)
+                    }
+                } finally {
+                    Arrays.fill(mediaKey, 0.toByte())
+                    Arrays.fill(thumbKey, 0.toByte())
+                }
+            }
+
+            if (item is DocumentRecord) {
+                val stagedDocFile = sequenceOf(
+                    File(stagedDocDir, "${item.id}.pvdoc"),
+                    File(stagedDocDir, "${item.id}.pvm")
+                ).firstOrNull { it.exists() }
+                    ?: throw IllegalArgumentException("Restore rejected: Missing document payload file for record ${item.id} (${item.title}).")
+                require(stagedDocFile.length() > 0L) {
+                    "Restore rejected: Empty document payload file for ${item.id}."
+                }
+                require(item.fileKeyBase64.isNotBlank()) {
+                    "Restore rejected: Missing authentic encryption key for document ${item.id}."
+                }
+                val docKey = runCatching { Base64.decode(item.fileKeyBase64) }.getOrNull()
+                require(docKey != null && docKey.size == 32) {
+                    "Restore rejected: Invalid 256-bit document encryption key for ${item.id}."
+                }
+                try {
+                    if (item.ciphertextSha256Hex.length == 64) {
+                        val computedSha = computeFileSha256Hex(stagedDocFile)
+                        require(computedSha.equals(item.ciphertextSha256Hex, ignoreCase = true)) {
+                            "Restore rejected: SHA-256 digest mismatch on document payload for ${item.id}."
+                        }
+                    }
+                    val docHeader = ByteArray(4)
+                    stagedDocFile.inputStream().use { it.read(docHeader) }
+                    require(docHeader.contentEquals(pvm1Magic)) {
+                        "Restore rejected: Document payload for ${item.id} lacks valid PVM1 encrypted header."
+                    }
+                    StreamingMediaCryptoEngine.verifyEncryptedMediaFileEveryChunk(
+                        encryptedFile = stagedDocFile,
+                        mediaId = item.id,
+                        vaultSlot = slotId,
+                        fileMediaKey = docKey,
+                        isCancelled = isCancelled
+                    )
+                } finally {
+                    Arrays.fill(docKey, 0.toByte())
+                }
+            }
+        }
+    }
+
     suspend fun commitRestore(
         staged: StagedBackupRestore,
         mode: RestoreMode,
-        isCancelled: () -> Boolean = { false }
+        isCancelled: () -> Boolean = { false },
+        allowUnknownScopeReplace: Boolean = true
     ): RestoreReport = withContext(Dispatchers.IO) {
         vaultMutationMutex.withLock {
             if (isCancelled()) throw CancellationException("Restore cancelled before execution.")
+            enforceRestoreModeScopePolicy(staged.payload, mode, allowUnknownScopeReplace)
 
             val session = sessionManager.requireUnlockedSession()
             val initialSessionId = session.sessionId
@@ -2204,137 +2864,12 @@ class VaultRepository(
 
             val stagedMediaDir = File(staged.stagingDir, "media")
             val stagedThumbDir = File(staged.stagingDir, "thumbs")
-            val stagedDocDir = sequenceOf(
-                File(staged.stagingDir, "documents"),
-                File(staged.stagingDir, "docs")
-            ).firstOrNull { it.exists() } ?: File(staged.stagingDir, "docs")
-
-            val pvm1Magic = "PVM1".toByteArray(StandardCharsets.US_ASCII)
+            val stagedDocDir = resolveStagedDocDir(staged.stagingDir)
 
             // 1. Strict Upfront Pre-flight Validation & Authentication of All Payloads and Keys
-            val seenIds = HashSet<String>(staged.payload.items.size)
-            for (item in staged.payload.items) {
-                if (isCancelled()) throw CancellationException("Restore cancelled during validation.")
-                require(item.id.isNotBlank()) { "Restore rejected: Encountered record with blank ID." }
-                if (item is MediaRecord || item is DocumentRecord) VaultFileSafety.requireAssetId(item.id)
-                require(seenIds.add(item.id)) { "Restore rejected: Duplicate record ID ${item.id} in backup manifest." }
-
-                if (item is MediaRecord) {
-                    val stagedMediaFile = sequenceOf(
-                        File(stagedMediaDir, "${item.id}.pvmedia"),
-                        File(stagedMediaDir, "${item.id}.pvm")
-                    ).firstOrNull { it.exists() }
-                        ?: throw IllegalArgumentException("Restore rejected: Missing media payload file for record ${item.id} (${item.title}).")
-
-                    require(stagedMediaFile.length() > 0L) {
-                        "Restore rejected: Empty media payload file for ${item.id}."
-                    }
-
-                    require(item.fileMediaKeyBase64.isNotBlank() && item.thumbnailKeyBase64.isNotBlank()) {
-                        "Restore rejected: Missing authentic encryption keys for media ${item.id}."
-                    }
-                    val mediaKey = runCatching { Base64.decode(item.fileMediaKeyBase64) }.getOrNull()
-                    require(mediaKey != null && mediaKey.size == 32) {
-                        "Restore rejected: Invalid 256-bit media encryption key for ${item.id}."
-                    }
-                    val thumbKey = runCatching { Base64.decode(item.thumbnailKeyBase64) }.getOrNull()
-                    require(thumbKey != null && thumbKey.size == 32) {
-                        "Restore rejected: Invalid 256-bit thumbnail encryption key for ${item.id}."
-                    }
-
-                    if (item.ciphertextSha256Hex.length == 64) {
-                        val computedSha = computeFileSha256Hex(stagedMediaFile)
-                        require(computedSha.equals(item.ciphertextSha256Hex, ignoreCase = true)) {
-                            "Restore rejected: SHA-256 digest mismatch on media payload for ${item.id}."
-                        }
-                    }
-
-                    // Authenticate encrypted PVM1 media frames via bounded streaming verification
-                    val headerBytes = ByteArray(4)
-                    stagedMediaFile.inputStream().use { it.read(headerBytes) }
-                    require(headerBytes.contentEquals(pvm1Magic)) {
-                        "Restore rejected: Media payload for ${item.id} lacks valid PVM1 encrypted header."
-                    }
-                    StreamingMediaCryptoEngine.verifyEncryptedMediaFileEveryChunk(
-                        encryptedFile = stagedMediaFile,
-                        mediaId = item.id,
-                        vaultSlot = slotId,
-                        fileMediaKey = mediaKey
-                    )
-
-                    val stagedThumbFile = sequenceOf(
-                        File(stagedThumbDir, "${item.id}.pvthumb"),
-                        File(stagedThumbDir, "${item.id}.pvt")
-                    ).firstOrNull { it.exists() }
-                    require(stagedThumbFile != null && stagedThumbFile.exists() && stagedThumbFile.length() > 0L) {
-                        "Restore rejected: Missing thumbnail payload file for ${item.id}."
-                    }
-
-                    val thumbHeader = ByteArray(4)
-                    stagedThumbFile.inputStream().use { it.read(thumbHeader) }
-                    if (thumbHeader.contentEquals(pvm1Magic)) {
-                        StreamingMediaCryptoEngine.verifyEncryptedMediaFileEveryChunk(
-                            encryptedFile = stagedThumbFile,
-                            mediaId = item.id,
-                            vaultSlot = slotId,
-                            fileMediaKey = thumbKey
-                        )
-                    } else {
-                        runCatching {
-                            StreamingMediaCryptoEngine.decryptThumbnail(
-                                encryptedThumbBytes = stagedThumbFile.readBytes(),
-                                mediaId = item.id,
-                                vaultSlot = slotId,
-                                thumbKey = thumbKey
-                            )
-                        }.onFailure {
-                            throw IllegalArgumentException("Restore rejected: Thumbnail authentication failed for ${item.id}: ${it.message}", it)
-                        }
-                    }
-                }
-
-                if (item is DocumentRecord) {
-                    val stagedDocFile = sequenceOf(
-                        File(stagedDocDir, "${item.id}.pvdoc"),
-                        File(stagedDocDir, "${item.id}.pvm")
-                    ).firstOrNull { it.exists() }
-                        ?: throw IllegalArgumentException("Restore rejected: Missing document payload file for record ${item.id} (${item.title}).")
-
-                    require(stagedDocFile.length() > 0L) {
-                        "Restore rejected: Empty document payload file for ${item.id}."
-                    }
-
-                    require(item.fileKeyBase64.isNotBlank()) {
-                        "Restore rejected: Missing authentic encryption key for document ${item.id}."
-                    }
-                    val docKey = runCatching { Base64.decode(item.fileKeyBase64) }.getOrNull()
-                    require(docKey != null && docKey.size == 32) {
-                        "Restore rejected: Invalid 256-bit document encryption key for ${item.id}."
-                    }
-
-                    if (item.ciphertextSha256Hex.length == 64) {
-                        val computedSha = computeFileSha256Hex(stagedDocFile)
-                        require(computedSha.equals(item.ciphertextSha256Hex, ignoreCase = true)) {
-                            "Restore rejected: SHA-256 digest mismatch on document payload for ${item.id}."
-                        }
-                    }
-
-                    val docHeader = ByteArray(4)
-                    stagedDocFile.inputStream().use { it.read(docHeader) }
-                    require(docHeader.contentEquals(pvm1Magic)) {
-                        "Restore rejected: Document payload for ${item.id} lacks valid PVM1 encrypted header."
-                    }
-                    StreamingMediaCryptoEngine.verifyEncryptedMediaFileEveryChunk(
-                        encryptedFile = stagedDocFile,
-                        mediaId = item.id,
-                        vaultSlot = slotId,
-                        fileMediaKey = docKey
-                    )
-                }
-            }
+            validateStagedAssetsForSlot(staged, slotId, isCancelled)
 
             // 2. Write Validated Restored Files to Unique Durable App-Private Paths BEFORE Database Commit.
-            //    This guarantees we never overwrite active vault files and never depend on post-commit file moves.
             val commitToken = UUID.randomUUID().toString().replace("-", "").take(12)
             val recoveryJournalDir = File(filesDir, RECOVERY_JOURNAL_DIR_NAME)
             val journalFile = File(recoveryJournalDir, RECOVERY_MANIFEST_FILE_NAME)
@@ -2342,8 +2877,6 @@ class VaultRepository(
                 check(executeRecoveryRollback(recoveryJournalDir, journalFile)) { "Previous restore recovery is still pending." }
             }
 
-            val writtenDurableFiles = mutableListOf<File>()
-            val filesToDeleteAfterCommit = mutableListOf<File>()
             var journalWritten = false
             val durableMediaRelPaths = mutableMapOf<String, Pair<String, String>>()
             val durableDocRelPaths = mutableMapOf<String, String>()
@@ -2378,7 +2911,7 @@ class VaultRepository(
                     itemsToRestore.add(item)
                 }
 
-                // Collect paths that will become obsolete if commit succeeds
+                val filesToDeleteAfterCommit = mutableListOf<File>()
                 if (mode == RestoreMode.REPLACE_ACTIVE_VAULT) {
                     val existingMedia = dao.getAllMediaFileEntitiesForSlot(slotId)
                     val existingDocs = dao.getAllDocumentFileEntitiesForSlot(slotId)
@@ -2404,15 +2937,13 @@ class VaultRepository(
                     }
                 }
 
-                // Persist planned destinations before copying, including partially written files.
-                for (item in itemsToRestore) {
-                    if (item is MediaRecord) {
-                        writtenDurableFiles.add(VaultFileSafety.requireWithin(mediaDir, File(mediaDir, "${item.id}_$commitToken.pvmedia")))
-                        writtenDurableFiles.add(VaultFileSafety.requireWithin(thumbDir, File(thumbDir, "${item.id}_$commitToken.pvthumb")))
-                    } else if (item is DocumentRecord) {
-                        writtenDurableFiles.add(VaultFileSafety.requireWithin(docDir, File(docDir, "${item.id}_$commitToken.pvdoc")))
-                    }
-                }
+                val writtenDurableFiles = collectPlannedDurableFiles(
+                    itemsToRestore = itemsToRestore,
+                    commitToken = commitToken,
+                    mediaDir = mediaDir,
+                    thumbDir = thumbDir,
+                    docDir = docDir
+                )
                 writeRecoveryJournal(
                     recoveryJournalDir = recoveryJournalDir,
                     journalFile = journalFile,
@@ -2425,53 +2956,20 @@ class VaultRepository(
                 )
                 journalWritten = true
 
-                for (item in itemsToRestore) {
-                    if (isCancelled()) throw CancellationException("Restore cancelled during file write.")
+                copyDurableRestoreAssets(
+                    itemsToRestore = itemsToRestore,
+                    commitToken = commitToken,
+                    mediaDir = mediaDir,
+                    thumbDir = thumbDir,
+                    docDir = docDir,
+                    stagedMediaDir = stagedMediaDir,
+                    stagedThumbDir = stagedThumbDir,
+                    stagedDocDir = stagedDocDir,
+                    durableMediaRelPaths = durableMediaRelPaths,
+                    durableDocRelPaths = durableDocRelPaths,
+                    isCancelled = isCancelled
+                )
 
-                    if (item is MediaRecord) {
-                        val stagedMediaFile = sequenceOf(
-                            File(stagedMediaDir, "${item.id}.pvmedia"),
-                            File(stagedMediaDir, "${item.id}.pvm")
-                        ).first { it.exists() }
-
-                        val stagedThumbFile = sequenceOf(
-                            File(stagedThumbDir, "${item.id}.pvthumb"),
-                            File(stagedThumbDir, "${item.id}.pvt")
-                        ).first { it.exists() }
-
-                        val relMediaPath = "media/${item.id}_$commitToken.pvmedia"
-                        val relThumbPath = "thumbs/${item.id}_$commitToken.pvthumb"
-                        val destMediaFile = File(filesDir, relMediaPath)
-                        val destThumbFile = File(filesDir, relThumbPath)
-                        VaultFileSafety.requireWithin(mediaDir, destMediaFile)
-                        VaultFileSafety.requireWithin(thumbDir, destThumbFile)
-
-                        copyStreamWithSync(stagedMediaFile, destMediaFile)
-
-                        copyStreamWithSync(stagedThumbFile, destThumbFile)
-
-
-                        durableMediaRelPaths[item.id] = relMediaPath to relThumbPath
-                    }
-
-                    if (item is DocumentRecord) {
-                        val stagedDocFile = sequenceOf(
-                            File(stagedDocDir, "${item.id}.pvdoc"),
-                            File(stagedDocDir, "${item.id}.pvm")
-                        ).first { it.exists() }
-
-                        val relDocPath = "documents/${item.id}_$commitToken.pvdoc"
-                        val destDocFile = File(filesDir, relDocPath)
-                        VaultFileSafety.requireWithin(docDir, destDocFile)
-
-                        copyStreamWithSync(stagedDocFile, destDocFile)
-
-
-                        durableDocRelPaths[item.id] = relDocPath
-                    }
-                }
-
-                // Update journal with complete list of written durable files before atomic DB commit
                 writeRecoveryJournal(
                     recoveryJournalDir = recoveryJournalDir,
                     journalFile = journalFile,
@@ -2490,9 +2988,7 @@ class VaultRepository(
                     "Vault operation rejected: Session changed or was locked before database commit."
                 }
 
-                var restoredItems = 0
-                var restoredMedia = 0
-                var restoredDocs = 0
+                var report = RestoreReport(0, 0, 0)
                 var dbCommitted = false
 
                 // 3. Atomically Commit Records and References to Already-Completed Durable Files
@@ -2509,59 +3005,13 @@ class VaultRepository(
                             dao.deleteAllDocumentFilesForSlot(slotId)
                         }
 
-                        for (item in itemsToRestore) {
-                            val rawBytes = VaultRecordCodec.encode(item)
-                            val nonce = CryptoEngine.generateNonce()
-                            val aad = CryptoEngine.buildRecordAad(vaultSlot = slotId, recordId = item.id, schemaVersion = CryptoEngine.RECORD_SCHEMA_VERSION)
-                            val ciphertext = CryptoEngine.encryptAesGcm(dek, nonce, rawBytes, aad)
-
-                            val recordEntity = EncryptedRecordEntity(
-                                recordId = item.id,
-                                vaultSlot = slotId,
-                                schemaVersion = CryptoEngine.RECORD_SCHEMA_VERSION,
-                                nonce = nonce,
-                                ciphertext = ciphertext
-                            )
-                            dao.upsertRecord(recordEntity)
-                            restoredItems++
-
-                            if (item is MediaRecord) {
-                                val (relMedia, relThumb) = durableMediaRelPaths.getValue(item.id)
-                                val mediaFile = File(filesDir, relMedia)
-                                val mediaEntity = EncryptedMediaFileEntity(
-                                    vaultSlot = slotId,
-                                    mediaId = item.id,
-                                    formatVersion = item.formatVersion,
-                                    relativeMediaPath = relMedia,
-                                    relativeThumbPath = relThumb,
-                                    encryptedSizeBytes = mediaFile.length(),
-                                    chunkCount = item.chunkCount,
-                                    ciphertextSha256 = item.ciphertextSha256Hex,
-                                    importStatus = EncryptedMediaFileEntity.IMPORT_STATUS_COMMITTED,
-                                    createdAtEpochMs = item.createdAtEpochMs
-                                )
-                                dao.upsertMediaFileEntity(mediaEntity)
-                                restoredMedia++
-                            }
-
-                            if (item is DocumentRecord) {
-                                val relDoc = durableDocRelPaths.getValue(item.id)
-                                val docFile = File(filesDir, relDoc)
-                                val docEntity = EncryptedDocumentFileEntity(
-                                    vaultSlot = slotId,
-                                    documentId = item.id,
-                                    formatVersion = item.formatVersion,
-                                    relativeFilePath = relDoc,
-                                    encryptedSizeBytes = docFile.length(),
-                                    chunkCount = item.chunkCount,
-                                    ciphertextSha256 = item.ciphertextSha256Hex,
-                                    importStatus = EncryptedDocumentFileEntity.IMPORT_STATUS_COMMITTED,
-                                    createdAtEpochMs = item.createdAtEpochMs
-                                )
-                                dao.upsertDocumentFileEntity(docEntity)
-                                restoredDocs++
-                            }
-                        }
+                        report = persistRestoredItemsInTransaction(
+                            slotId = slotId,
+                            dek = dek,
+                            itemsToRestore = itemsToRestore,
+                            durableMediaRelPaths = durableMediaRelPaths,
+                            durableDocRelPaths = durableDocRelPaths
+                        )
                     }
                     dbCommitted = true
 
@@ -2598,13 +3048,13 @@ class VaultRepository(
                     }
                     runCatching { staged.stagingDir.deleteRecursively() }
 
-                    RestoreReport(restoredItems, restoredMedia, restoredDocs)
+                    report
                 } catch (e: Exception) {
                     if (!dbCommitted) {
                         executeRecoveryRollback(recoveryJournalDir, journalFile)
                         throw e
                     }
-                    RestoreReport(restoredItems, restoredMedia, restoredDocs)
+                    report
                 }
             } catch (e: Exception) {
                 if (journalWritten && journalFile.exists()) {

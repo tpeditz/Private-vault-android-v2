@@ -131,6 +131,14 @@ fun SetupVaultScreen(
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Center
                 )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Scope: ${pendingRestorePayload.scopeDisplayLabel}",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.secondary,
+                    fontWeight = FontWeight.SemiBold,
+                    textAlign = TextAlign.Center
+                )
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
                     text = "${pendingRestorePayload.notesCount} Notes • ${pendingRestorePayload.credentialsCount} Passwords • ${pendingRestorePayload.mediaCount} Media • ${pendingRestorePayload.documentsCount} Documents",

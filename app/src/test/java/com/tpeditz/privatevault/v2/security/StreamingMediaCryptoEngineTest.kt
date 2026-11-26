@@ -203,4 +203,95 @@ class StreamingMediaCryptoEngineTest {
 
         dataSource.close()
     }
+
+    @Test
+    fun testEncryptStreamCleansPartialFileOnErrorAndCancellation() {
+        val key = CryptoEngine.randomBytes(CryptoEngine.DEK_BYTES)
+        val partialTarget = tempFolder.newFile("partial_error.pvmedia")
+        val failingStream = object : java.io.InputStream() {
+            var count = 0
+            override fun read(): Int {
+                val buf = ByteArray(1)
+                val n = read(buf, 0, 1)
+                return if (n == -1) -1 else buf[0].toInt() and 0xFF
+            }
+            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                if (count >= 1) throw java.io.IOException("Simulated stream read failure")
+                count++
+                val toWrite = minOf(len, 1024)
+                java.util.Arrays.fill(b, off, off + toWrite, 0x2A.toByte())
+                return toWrite
+            }
+        }
+
+        try {
+            StreamingMediaCryptoEngine.encryptStreamToMediaFile(
+                inputStream = failingStream,
+                expectedPlaintextSize = 4096L,
+                targetFile = partialTarget,
+                mediaId = "err-media-1",
+                vaultSlot = 0,
+                fileMediaKey = key
+            )
+            fail("Expected IOException")
+        } catch (_: java.io.IOException) {
+            assertFalse("Partial output file must be deleted on read failure", partialTarget.exists())
+        }
+
+        val cancelTarget = tempFolder.newFile("partial_cancel.pvmedia")
+        try {
+            StreamingMediaCryptoEngine.encryptStreamToMediaFile(
+                inputStream = ByteArrayInputStream(ByteArray(4096) { 0x11 }),
+                expectedPlaintextSize = 4096L,
+                targetFile = cancelTarget,
+                mediaId = "cancel-media-1",
+                vaultSlot = 0,
+                fileMediaKey = key,
+                isCancelled = { true }
+            )
+            fail("Expected CancellationException")
+        } catch (_: java.util.concurrent.CancellationException) {
+            assertFalse("Partial output file must be deleted on cancellation", cancelTarget.exists())
+        }
+    }
+
+    @Test
+    fun testDataSourceRejectsClosedAndInvalidatedSessionReads() {
+        val key = CryptoEngine.randomBytes(CryptoEngine.DEK_BYTES)
+        val original = ByteArray(4096) { (it % 127).toByte() }
+        val targetFile = tempFolder.newFile("session_ds.pvm")
+        StreamingMediaCryptoEngine.encryptStreamToMediaFile(
+            inputStream = ByteArrayInputStream(original),
+            expectedPlaintextSize = original.size.toLong(),
+            targetFile = targetFile,
+            mediaId = "session-ds-1",
+            vaultSlot = 0,
+            fileMediaKey = key
+        )
+
+        var sessionValid = true
+        val dataSource = StreamingMediaCryptoEngine.EncryptedChunkMediaDataSource(
+            mediaFile = targetFile,
+            mediaId = "session-ds-1",
+            vaultSlot = 0,
+            fileMediaKey = key,
+            isSessionValid = { sessionValid }
+        )
+
+        val buf = ByteArray(64)
+        assertEquals(64, dataSource.readAt(0, buf, 0, 64))
+
+        // Session invalidation blocks subsequent reads and closes safely
+        sessionValid = false
+        try {
+            dataSource.readAt(64, buf, 0, 64)
+            fail("Expected IOException once session becomes invalid")
+        } catch (_: java.io.IOException) {
+            // expected
+        }
+
+        // Closed state returns -1 cleanly without touching zeroed keys
+        dataSource.close()
+        assertEquals(-1, dataSource.readAt(0, buf, 0, 64))
+    }
 }

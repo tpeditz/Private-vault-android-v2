@@ -632,17 +632,19 @@ fun AuthenticatorToolView(
                         }
                     }
                     if (!qrText.isNullOrBlank()) {
-                        val parsed = TotpEngine.parseOtpAuthUri(qrText)
-                        if (parsed != null) {
-                            service = parsed.serviceName
-                            account = parsed.accountName
-                            secret = parsed.secret
-                            parsedDigits = parsed.digits
-                            parsedPeriod = parsed.periodSeconds
-                            parsedAlgo = parsed.algorithm
-                            scanError = null
-                        } else {
-                            scanError = "QR code is not a valid TOTP URI."
+                        when (val parsed = TotpEngine.parseOtpAuthUriWithDetails(qrText)) {
+                            is TotpEngine.ParseOtpAuthResult.Success -> {
+                                service = parsed.parsed.serviceName
+                                account = parsed.parsed.accountName
+                                secret = parsed.parsed.secret
+                                parsedDigits = parsed.parsed.digits
+                                parsedPeriod = parsed.parsed.periodSeconds
+                                parsedAlgo = parsed.parsed.algorithm
+                                scanError = null
+                            }
+                            is TotpEngine.ParseOtpAuthResult.Invalid -> {
+                                scanError = parsed.message
+                            }
                         }
                     } else {
                         scanError = "No QR code detected in image."
@@ -697,6 +699,11 @@ fun AuthenticatorToolView(
                             autoCorrectEnabled = false
                         ),
                         modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        text = "$parsedDigits digits • ${parsedPeriod}s • ${parsedAlgo.name}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline
                     )
                 }
             },

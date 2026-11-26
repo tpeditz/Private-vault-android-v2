@@ -360,6 +360,8 @@ private fun VideoPlayerContent(
                                             setOnErrorListener { mp, _, _ ->
                                                 runCatching { mp.reset(); mp.release() }
                                                 mediaPlayer = null
+                                                runCatching { dataSource?.close() }
+                                                dataSource = null
                                                 playerError = "This encrypted video could not be played on this device."
                                                 true
                                             }

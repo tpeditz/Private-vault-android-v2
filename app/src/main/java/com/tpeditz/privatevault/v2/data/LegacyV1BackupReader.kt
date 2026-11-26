@@ -19,6 +19,7 @@ object LegacyV1BackupReader {
     val V1_MAGIC_BYTES = "PVAULTB1".toByteArray(StandardCharsets.US_ASCII)
     const val HEADER_BYTES = 52
     const val MAX_V1_BACKUP_BYTES = 32 * 1024 * 1024 // 32 MiB ceiling of old container
+    const val MAX_V1_RECORDS = 50_000
 
     fun isLegacyV1Backup(headerBytes: ByteArray): Boolean {
         if (headerBytes.size < V1_MAGIC_BYTES.size) return false
@@ -119,15 +120,24 @@ object LegacyV1BackupReader {
             }
 
             val exportedAtEpochMs = root.optLong("exportedAtEpochMs", 0L)
+            require(exportedAtEpochMs >= 0L) { "Invalid legacy backup timestamp." }
             val appVersionName = root.optString("appVersionName", "1.0.x")
 
             val recordsArray = root.optJSONArray("records")
                 ?: throw IllegalArgumentException("Legacy backup payload is missing \"records\" array.")
+            require(recordsArray.length() <= MAX_V1_RECORDS) {
+                "Legacy backup record count exceeds maximum supported."
+            }
 
             val items = ArrayList<VaultItem>(recordsArray.length())
+            val seenIds = HashSet<String>(recordsArray.length())
             for (i in 0 until recordsArray.length()) {
-                val recordObj = recordsArray.optJSONObject(i) ?: continue
-                items.add(VaultRecordCodec.decodeFromJsonObject(recordObj))
+                val recordObj = recordsArray.optJSONObject(i)
+                    ?: throw IllegalArgumentException("Malformed record entry in legacy backup payload.")
+                val decoded = VaultRecordCodec.decodeFromJsonObject(recordObj)
+                require(decoded.id.isNotBlank()) { "Legacy backup record is missing required ID." }
+                require(seenIds.add(decoded.id)) { "Legacy backup contains duplicate record ID ${decoded.id}." }
+                items.add(decoded)
             }
 
             val mediaPayloads = HashMap<String, EmbeddedMediaPayload>()
@@ -218,7 +228,9 @@ object LegacyV1BackupReader {
                 appVersionName = appVersionName,
                 applicationId = "com.tpeditz.privatevault",
                 items = items,
-                mediaPayloads = mediaPayloads
+                mediaPayloads = mediaPayloads,
+                exportScope = BackupExportScope.ALL_DATA,
+                isExportScopeKnown = false
             )
         } finally {
             Arrays.fill(backupKek, 0.toByte())
@@ -235,15 +247,19 @@ object LegacyV1BackupReader {
     fun inspectAndStageLegacyBackup(
         inputStream: java.io.InputStream,
         backupPasswordChars: CharArray,
-        stagingDir: java.io.File
+        stagingDir: java.io.File,
+        isCancelled: () -> Boolean = { false },
+        onProgress: (bytesRead: Long, totalBytes: Long) -> Unit = { _, _ -> }
     ): StagedBackupRestore {
         stagingDir.mkdirs()
         try {
+            if (isCancelled()) throw java.util.concurrent.CancellationException("Restore cancelled by user.")
             val baos = java.io.ByteArrayOutputStream()
             val buf = ByteArray(64 * 1024)
             var totalRead = 0
             var r: Int
             while (inputStream.read(buf).also { r = it } != -1) {
+                if (isCancelled()) throw java.util.concurrent.CancellationException("Restore cancelled by user.")
                 totalRead += r
                 require(totalRead <= MAX_V1_BACKUP_BYTES) {
                     "Legacy backup file exceeds maximum supported V1 container size (32 MiB)."
@@ -256,15 +272,25 @@ object LegacyV1BackupReader {
             val mediaStagingDir = java.io.File(stagingDir, "media").apply { mkdirs() }
             val thumbStagingDir = java.io.File(stagingDir, "thumbs").apply { mkdirs() }
 
+            val totalAssetBytes = payload.mediaPayloads.values.sumOf {
+                it.mediaCiphertextBytes.size.toLong() + it.thumbCiphertextBytes.size.toLong()
+            }
+            var stagedBytes = 0L
             for ((mediaId, blob) in payload.mediaPayloads) {
+                if (isCancelled()) throw java.util.concurrent.CancellationException("Restore cancelled by user.")
                 VaultFileSafety.requireAssetId(mediaId)
                 if (blob.mediaCiphertextBytes.isNotEmpty()) {
                     val mediaFile = VaultFileSafety.requireWithin(mediaStagingDir, java.io.File(mediaStagingDir, "$mediaId.pvmedia"))
                     mediaFile.writeBytes(blob.mediaCiphertextBytes)
+                    stagedBytes += blob.mediaCiphertextBytes.size
                 }
                 if (blob.thumbCiphertextBytes.isNotEmpty()) {
                     val thumbFile = VaultFileSafety.requireWithin(thumbStagingDir, java.io.File(thumbStagingDir, "$mediaId.pvthumb"))
                     thumbFile.writeBytes(blob.thumbCiphertextBytes)
+                    stagedBytes += blob.thumbCiphertextBytes.size
+                }
+                if (totalAssetBytes > 0L) {
+                    onProgress(stagedBytes, totalAssetBytes)
                 }
             }
 

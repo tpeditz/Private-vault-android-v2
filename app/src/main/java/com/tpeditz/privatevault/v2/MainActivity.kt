@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
 import android.os.Bundle
+import android.provider.DocumentsContract
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -286,12 +287,15 @@ class MainActivity : FragmentActivity() {
                             passwordChars = activePwd,
                             outputStream = os,
                             onProgress = { _, _ -> },
+                            onCleanupIncomplete = {
+                                DocumentsContract.deleteDocument(contentResolver, uri)
+                            },
                             onComplete = { success, err ->
                                 java.util.Arrays.fill(activePwd, '\u0000')
                                 scope.launch {
                                     snackbarHostState.showSnackbar(
-                                        if (success) "Backup saved successfully"
-                                        else err ?: "Could not create backup."
+                                        if (success) "Backup saved successfully."
+                                        else err ?: "Backup could not be completed. Your previous backup has been kept."
                                     )
                                 }
                             }
@@ -427,7 +431,7 @@ class MainActivity : FragmentActivity() {
                                     pendingRestorePayload = uiState.pendingRestorePayload,
                                     onCreateVault = { chars, cb -> viewModel.createVault(chars, cb) },
                                     onCreateVaultWithRestore = { chars, cb ->
-                                        viewModel.createVaultAndCommitRestore(chars, RestoreMode.REPLACE_ACTIVE_VAULT, cb)
+                                        viewModel.createVaultAndCommitRestore(chars, onComplete = cb)
                                     },
                                     onRestoreBackupClicked = {
                                         firstLaunchRestorePassword = ""
@@ -484,18 +488,39 @@ class MainActivity : FragmentActivity() {
                                 )
                             } else {
                                 // Vault is Unlocked: Handle Screen Routing
-                                BackHandler(enabled = uiState.currentSecondary !is SecondaryDestination.None) {
+                                BackHandler(
+                                    enabled = uiState.currentSecondary !is SecondaryDestination.None &&
+                                        uiState.currentSecondary !is SecondaryDestination.NoteEditor
+                                ) {
                                     viewModel.navigateBack()
                                 }
 
                                 when (val sec = uiState.currentSecondary) {
                                     is SecondaryDestination.NoteEditor -> {
+                                        val editorDest = sec
                                         NoteEditorScreen(
-                                            noteId = sec.noteId,
+                                            noteId = editorDest.noteId,
                                             uiState = uiState,
-                                            onSaveNote = { viewModel.saveNote(it) },
+                                            onSaveNote = { record, onComplete ->
+                                                viewModel.saveNote(record) { success, errorMsg ->
+                                                    val stillUnlockedHere = viewModel.uiState.value.isUnlocked &&
+                                                        viewModel.uiState.value.currentSecondary == editorDest
+                                                    onComplete(success && stillUnlockedHere, errorMsg)
+                                                    if (success && stillUnlockedHere) {
+                                                        scope.launch {
+                                                            snackbarHostState.showSnackbar("Note saved successfully")
+                                                        }
+                                                    }
+                                                }
+                                            },
                                             onDeleteNote = { viewModel.deleteNote(it) },
-                                            onBack = { viewModel.navigateBack() }
+                                            onBack = {
+                                                if (viewModel.uiState.value.isUnlocked &&
+                                                    viewModel.uiState.value.currentSecondary == editorDest
+                                                ) {
+                                                    viewModel.navigateBack()
+                                                }
+                                            }
                                         )
                                     }
                                     is SecondaryDestination.PasswordEditor -> {
@@ -583,7 +608,14 @@ class MainActivity : FragmentActivity() {
                                             onConfirmRestore = { mode ->
                                                 viewModel.confirmRestore(mode) { success ->
                                                     scope.launch {
-                                                        snackbarHostState.showSnackbar(if (success) "Restore complete" else "Restore failed")
+                                                        val errMsg = viewModel.uiState.value.pendingRestoreError?.message
+                                                        snackbarHostState.showSnackbar(
+                                                            when {
+                                                                success -> "Vault restored successfully."
+                                                                errMsg != null -> errMsg
+                                                                else -> "Restore cancelled."
+                                                            }
+                                                        )
                                                     }
                                                 }
                                             },

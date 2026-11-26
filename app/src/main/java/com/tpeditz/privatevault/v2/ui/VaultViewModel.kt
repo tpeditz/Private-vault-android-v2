@@ -29,6 +29,7 @@ import com.tpeditz.privatevault.v2.data.VaultAlbumRecord
 import com.tpeditz.privatevault.v2.data.VaultFolder
 import com.tpeditz.privatevault.v2.data.VaultItem
 import com.tpeditz.privatevault.v2.data.VaultRepository
+import com.tpeditz.privatevault.v2.data.filterItemsForBackupScope
 import com.tpeditz.privatevault.v2.ota.OtaState
 import com.tpeditz.privatevault.v2.ota.OtaUpdateManager
 import com.tpeditz.privatevault.v2.ota.isPendingInstallation
@@ -88,6 +89,13 @@ class VaultViewModel(
     @Volatile private var cachedAutoLockTimeoutSeconds: Int = 0
     @Volatile private var cachedLockOnScreenOff = true
     private var activeRestoreJob: Job? = null
+    private val backupOpSeq = java.util.concurrent.atomic.AtomicLong(0L)
+    @Volatile private var activeBackupOpId: Long = 0L
+    private val restoreOpSeq = java.util.concurrent.atomic.AtomicLong(0L)
+    @Volatile private var activeRestoreOpId: Long = 0L
+    private val cloudUploadOpSeq = java.util.concurrent.atomic.AtomicLong(0L)
+    @Volatile private var activeCloudUploadOpId: Long = 0L
+    private val activeNoteSaveIds = java.util.Collections.synchronizedSet(HashSet<String>())
     private var foregroundOtaJob: Job? = null
     private var installUpdateJob: Job? = null
     private var lastAutomaticOtaAttemptElapsed: Long? = null
@@ -624,10 +632,38 @@ class VaultViewModel(
     // Notes CRUD
     // ============================================================================================
 
-    fun saveNote(note: NoteRecord) {
+    fun saveNote(
+        note: NoteRecord,
+        onComplete: ((Boolean, String?) -> Unit)? = null
+    ) {
+        val expectedSessionId = sessionManager.getCurrentSessionId()
+        if (expectedSessionId == null || !_uiState.value.isUnlocked) {
+            onComplete?.invoke(false, "Your vault was locked. Unlock it and try again.")
+            return
+        }
+        if (!activeNoteSaveIds.add(note.id)) {
+            onComplete?.invoke(false, "Save already in progress.")
+            return
+        }
         viewModelScope.launch {
-            repository.saveItem(note.copy(updatedAtEpochMs = System.currentTimeMillis()))
-            loadActiveVaultItems()
+            try {
+                repository.saveItem(
+                    item = note.copy(updatedAtEpochMs = System.currentTimeMillis()),
+                    expectedSessionId = expectedSessionId
+                )
+                if (sessionManager.getCurrentSessionId() != expectedSessionId) {
+                    onComplete?.invoke(false, "Your vault was locked before saving finished.")
+                    return@launch
+                }
+                loadActiveVaultItems()
+                onComplete?.invoke(true, null)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onComplete?.invoke(false, VaultErrorMapper.mapVaultActionError(e))
+            } finally {
+                activeNoteSaveIds.remove(note.id)
+            }
         }
     }
 
@@ -1394,7 +1430,7 @@ class VaultViewModel(
             if (email.isBlank()) return@launch
             val recoveryPwd = AutoCloudBackupKeyStore.readRecoveryPasswordOrNull(context) ?: return@launch
             try {
-                val items = repository.getAllItemsForActiveSlot(session.sessionId)
+                val items = repository.getAllItemsForBackupOrThrow(session.sessionId)
                 CloudBackupScheduler.stageEncryptedSnapshot(context, email) { fos ->
                     repository.createAuthoritativeStreamingBackup(
                         items = items,
@@ -1414,6 +1450,9 @@ class VaultViewModel(
                 }
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: com.tpeditz.privatevault.v2.data.CorruptedVaultRecordsException) {
+                SafeVaultLogger.w("VaultViewModel", "Pending auto backup aborted: unreadable records")
+                preferencesRepository.setAutoCloudBackupStatus("Some vault items could not be read — backup not created")
             } catch (e: Exception) {
                 SafeVaultLogger.w("VaultViewModel", "Pending auto backup staging failed: ${e.message}")
             } finally {
@@ -1427,17 +1466,23 @@ class VaultViewModel(
         onConsentRequired: ((PendingIntent) -> Unit)? = null,
         onComplete: (Boolean, String?) -> Unit
     ) {
+        val opId = cloudUploadOpSeq.incrementAndGet()
+        activeCloudUploadOpId = opId
+        fun completeCurrent(success: Boolean, message: String?) {
+            deliverCurrentOperationResult(opId, activeCloudUploadOpId) { onComplete(success, message) }
+        }
         viewModelScope.launch(Dispatchers.IO) {
-            val tempBackupFile = File(context.cacheDir, "cloud_snapshot_${System.currentTimeMillis()}.pvault")
+            val tempBackupFile = File(context.cacheDir, "cloud_snapshot_${java.util.UUID.randomUUID()}.pvault")
             var resolvedChars: CharArray? = null
             var ownsResolvedChars = false
+            var uploadCommitted = false
             try {
                 val backupSessionId = requireRealSession()
                 val activePwd = if (backupPasswordChars != null && backupPasswordChars.isNotEmpty()) {
                     val policy = PasswordPolicy.validateNewPassword(backupPasswordChars, "Cloud backup password")
                     if (!policy.isValid) {
                         return@launch withContext(Dispatchers.Main) {
-                            onComplete(false, policy.errorMessage ?: "Use at least ${PasswordPolicy.MIN_NEW_PASSWORD_LENGTH} characters.")
+                            completeCurrent(false, policy.errorMessage ?: "Use at least ${PasswordPolicy.MIN_NEW_PASSWORD_LENGTH} characters.")
                         }
                     }
                     resolvedChars = backupPasswordChars
@@ -1445,7 +1490,7 @@ class VaultViewModel(
                 } else {
                     val unwrapped = AutoCloudBackupKeyStore.readRecoveryPasswordOrNull(context)
                         ?: return@launch withContext(Dispatchers.Main) {
-                            onComplete(false, "Enter a backup password or configure an Automatic Backup recovery password first.")
+                            completeCurrent(false, "Enter a backup password or configure an Automatic Backup recovery password first.")
                         }
                     ownsResolvedChars = true
                     resolvedChars = unwrapped
@@ -1455,7 +1500,7 @@ class VaultViewModel(
                 val email = preferencesRepository.connectedGoogleAccount.first().trim()
                 if (email.isBlank()) {
                     return@launch withContext(Dispatchers.Main) {
-                        onComplete(false, "Connect a Google account first.")
+                        completeCurrent(false, "Connect a Google account first.")
                     }
                 }
 
@@ -1463,59 +1508,66 @@ class VaultViewModel(
                     is GoogleDriveAuthHelper.DriveAuthState.Authorized -> authState.accessToken
                     is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent -> {
                         withContext(Dispatchers.Main) {
-                            onConsentRequired?.invoke(authState.pendingIntent)
-                            onComplete(false, "Approve Google Drive permission and try again.")
+                            deliverCurrentOperationResult(opId, activeCloudUploadOpId) { onConsentRequired?.invoke(authState.pendingIntent) }
+                            completeCurrent(false, "Approve Google Drive permission and try again.")
                         }
                         return@launch
                     }
                     is GoogleDriveAuthHelper.DriveAuthState.Failed -> {
                         return@launch withContext(Dispatchers.Main) {
-                            onComplete(false, authState.userMessage)
+                            completeCurrent(false, authState.userMessage)
                         }
                     }
                 }
 
-                val allItems = repository.getAllItemsForActiveSlot(backupSessionId)
+                val allItems = repository.getAllItemsForBackupOrThrow(backupSessionId)
                 FileOutputStream(tempBackupFile).use { fos ->
                     repository.createAuthoritativeStreamingBackup(
                         items = allItems,
                         backupPasswordChars = activePwd,
                         outputStream = fos,
+                        isCancelled = { !isActive || activeCloudUploadOpId != opId || realSessionId() != backupSessionId },
                         expectedSessionId = backupSessionId
                     )
                     fos.flush()
                     fos.fd.sync()
                 }
                 requireRealSession(backupSessionId)
+                ensureActive()
+                if (activeCloudUploadOpId != opId) throw CancellationException("Cloud backup superseded.")
                 var res = googleDriveSyncManager.uploadBackupSnapshotFile(token, tempBackupFile)
                 if (res is GoogleDriveSyncManager.SyncResult.Error && res.isAuthError) {
                     val refreshed = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)
                     if (refreshed is GoogleDriveAuthHelper.DriveAuthState.Authorized) {
                         token = refreshed.accessToken
                         requireRealSession(backupSessionId)
+                        ensureActive()
+                        if (activeCloudUploadOpId != opId) throw CancellationException("Cloud backup superseded.")
                         res = googleDriveSyncManager.uploadBackupSnapshotFile(token, tempBackupFile)
                     } else if (refreshed is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent) {
                         withContext(Dispatchers.Main) {
-                            onConsentRequired?.invoke(refreshed.pendingIntent)
-                            onComplete(false, "Approve Google Drive permission and try again.")
+                            deliverCurrentOperationResult(opId, activeCloudUploadOpId) { onConsentRequired?.invoke(refreshed.pendingIntent) }
+                            completeCurrent(false, "Approve Google Drive permission and try again.")
                         }
                         return@launch
                     }
                 }
                 val postSessionActive = realSessionId() == backupSessionId
                 val currentEmail = preferencesRepository.connectedGoogleAccount.first().trim()
+                if (activeCloudUploadOpId != opId) return@launch
                 if (!postSessionActive || !currentEmail.equals(email, ignoreCase = true)) {
                     withContext(Dispatchers.Main) {
-                        onComplete(false, "Vault session or connected Google account changed during cloud backup.")
+                        completeCurrent(false, "Vault session or connected Google account changed during cloud backup.")
                     }
                     return@launch
                 }
                 when (res) {
                     is GoogleDriveSyncManager.SyncResult.Success -> {
-                        preferencesRepository.recordCloudBackup()
-                        preferencesRepository.setAutoCloudBackupStatus("Backed up to Google Drive")
-                        loadActiveVaultItems()
-                        withContext(Dispatchers.Main) { onComplete(true, null) }
+                        uploadCommitted = true
+                        runCatching { preferencesRepository.recordCloudBackup() }
+                        runCatching { preferencesRepository.setAutoCloudBackupStatus("Backed up to Google Drive") }
+                        runCatching { loadActiveVaultItems() }
+                        withContext(Dispatchers.Main) { completeCurrent(true, null) }
                     }
                     is GoogleDriveSyncManager.SyncResult.Error -> {
                         val friendly = if (res.isAuthError) {
@@ -1524,18 +1576,33 @@ class VaultViewModel(
                             res.message
                         }
                         preferencesRepository.setAutoCloudBackupStatus("Last upload failed: $friendly")
-                        withContext(Dispatchers.Main) { onComplete(false, friendly) }
+                        withContext(Dispatchers.Main) { completeCurrent(false, friendly) }
                     }
                 }
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: com.tpeditz.privatevault.v2.data.CorruptedVaultRecordsException) {
+                val msg = VaultErrorMapper.mapBackupExportError(e)
+                if (activeCloudUploadOpId == opId) preferencesRepository.setAutoCloudBackupStatus(msg)
+                withContext(Dispatchers.Main) { completeCurrent(false, msg) }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { onComplete(false, VaultErrorMapper.mapCloudError(e)) }
+                if (uploadCommitted) {
+                    withContext(Dispatchers.Main) { completeCurrent(true, null) }
+                } else {
+                    val msg = if (e is IllegalArgumentException || e is IllegalStateException) {
+                        VaultErrorMapper.mapBackupExportError(e)
+                    } else {
+                        VaultErrorMapper.mapCloudError(e)
+                    }
+                    if (activeCloudUploadOpId == opId) preferencesRepository.setAutoCloudBackupStatus("Last upload failed: $msg")
+                    withContext(Dispatchers.Main) { completeCurrent(false, msg) }
+                }
             } finally {
                 tempBackupFile.delete()
                 if (ownsResolvedChars && resolvedChars != null) {
                     Arrays.fill(resolvedChars, '\u0000')
                 }
+                backupPasswordChars?.let { Arrays.fill(it, '\u0000') }
             }
         }
     }
@@ -1753,12 +1820,16 @@ class VaultViewModel(
     // ============================================================================================
 
     fun cancelBackup() {
+        backupOpSeq.incrementAndGet()
+        activeBackupOpId = 0L
         activeBackupJob?.cancel()
         activeBackupJob = null
         _uiState.update { it.copy(isLoading = false, backupProgressRatio = null, backupStatusMessage = null) }
     }
 
     fun cancelRestore() {
+        restoreOpSeq.incrementAndGet()
+        activeRestoreOpId = 0L
         activeRestoreJob?.cancel()
         activeRestoreJob = null
         clearPendingRestore()
@@ -1774,86 +1845,162 @@ class VaultViewModel(
         passwordChars: CharArray,
         outputStream: OutputStream,
         onProgress: (Long, Long) -> Unit = { _, _ -> },
+        onCleanupIncomplete: () -> Boolean = { true },
         onComplete: (Boolean, String?) -> Unit
     ) {
         val pwdValidation = PasswordPolicy.validateNewPassword(passwordChars, "Backup password")
         if (!pwdValidation.isValid) {
             runCatching { outputStream.close() }
+            cleanupIncompleteDocumentExport(exportCompleted = false, deleteIncompleteOutput = onCleanupIncomplete)
             val msg = pwdValidation.errorMessage ?: "Use at least ${PasswordPolicy.MIN_NEW_PASSWORD_LENGTH} characters for your new backup password."
             _uiState.update { it.copy(isLoading = false, backupProgressRatio = null, backupStatusMessage = null, activeErrorMessage = msg) }
             onComplete(false, msg)
             return
         }
         activeBackupJob?.cancel()
-        _uiState.update { it.copy(isLoading = true, backupProgressRatio = 0f, backupStatusMessage = "Preparing backup...") }
+        val opId = backupOpSeq.incrementAndGet()
+        activeBackupOpId = opId
+        fun completeCurrent(success: Boolean, message: String?) {
+            deliverCurrentOperationResult(opId, activeBackupOpId) { onComplete(success, message) }
+        }
+        _uiState.update { it.copy(isLoading = true, backupProgressRatio = null, backupStatusMessage = "Preparing backup...") }
         activeBackupJob = viewModelScope.launch(Dispatchers.IO) {
+            var exportCompleted = false
             try {
                 val expectedId = sessionManager.getCurrentSessionId() ?: error("Unlock your vault first.")
-                val allItems = repository.getAllItemsForActiveSlot(expectedId)
-                val filteredItems = when (scope) {
-                    BackupExportScope.ALL_DATA -> allItems
-                    BackupExportScope.NOTES_PASSWORDS_LINKS -> allItems.filter {
-                        it is NoteRecord || it is CredentialRecord || it is SecureLinkRecord || it is VaultFolder
-                    }
-                    BackupExportScope.NOTES_ONLY -> allItems.filter { it is NoteRecord || it is VaultFolder }
-                    BackupExportScope.PASSWORDS_ONLY -> allItems.filter { it is CredentialRecord || it is VaultFolder }
-                    BackupExportScope.MEDIA_ONLY -> allItems.filter { it is MediaRecord || it is VaultAlbumRecord }
-                    BackupExportScope.DOCUMENTS_ONLY -> allItems.filter { it is DocumentRecord || it is VaultFolder }
-                }
+                val allItems = repository.getAllItemsForBackupOrThrow(expectedId)
+                val filteredItems = filterItemsForBackupScope(allItems, scope)
 
-                _uiState.update { it.copy(backupStatusMessage = "Encrypting and writing backup...") }
-                repository.createAuthoritativeStreamingBackup(
-                    items = filteredItems,
-                    backupPasswordChars = passwordChars,
-                    outputStream = outputStream,
-                    expectedSessionId = expectedId,
-                    isCancelled = { !isActive },
-                    onProgress = { written, total ->
-                        val ratio = if (total > 0L) (written.toFloat() / total.toFloat()).coerceIn(0f, 1f) else 0f
+                if (activeBackupOpId == opId) {
+                    _uiState.update { it.copy(backupStatusMessage = "Encrypting and writing backup...") }
+                }
+                outputStream.use { os ->
+                    repository.createAuthoritativeStreamingBackup(
+                        items = filteredItems,
+                        backupPasswordChars = passwordChars,
+                        outputStream = os,
+                        expectedSessionId = expectedId,
+                        exportScope = scope,
+                        isCancelled = { !isActive || activeBackupOpId != opId || sessionManager.getCurrentSessionId() != expectedId },
+                        onProgress = { written, total ->
+                            if (activeBackupOpId == opId && total > 0L) {
+                                val ratio = (written.toFloat() / total.toFloat()).coerceIn(0f, 0.99f)
+                                val pct = (ratio * 100).toInt().coerceAtMost(99)
+                                _uiState.update {
+                                    it.copy(
+                                        backupProgressRatio = ratio,
+                                        backupStatusMessage = "Backing up... $pct%"
+                                    )
+                                }
+                                onProgress(written, total)
+                            }
+                        }
+                    )
+                    ensureActive()
+                    if (activeBackupOpId != opId || sessionManager.getCurrentSessionId() != expectedId) {
+                        throw CancellationException("Backup superseded or session changed.")
+                    }
+                    finalizeBackupOutput(os) { fileStream ->
+                        val stat = android.system.Os.fstat(fileStream.fd)
+                        if (android.system.OsConstants.S_ISREG(stat.st_mode)) {
+                            fileStream.fd.sync()
+                        }
+                        // Pipe-backed SAF providers finalize via successful flush and close.
+                    }
+                }
+                exportCompleted = true
+                runCatching { preferencesRepository.recordLocalBackup() }
+                withContext(Dispatchers.Main) {
+                    if (activeBackupOpId == opId) {
                         _uiState.update {
                             it.copy(
-                                backupProgressRatio = ratio,
-                                backupStatusMessage = "Backing up... ${(ratio * 100).toInt()}%"
+                                isLoading = false,
+                                backupProgressRatio = 1f,
+                                backupStatusMessage = "Backup complete",
+                                activeSnackbarMessage = "Backup saved successfully."
                             )
                         }
-                        onProgress(written, total)
                     }
-                )
-                preferencesRepository.recordLocalBackup()
-                withContext(Dispatchers.Main) {
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            backupProgressRatio = 1f,
-                            backupStatusMessage = "Backup complete",
-                            activeSnackbarMessage = "Backup exported successfully"
-                        )
-                    }
-                    onComplete(true, null)
+                    completeCurrent(true, null)
                 }
             } catch (e: CancellationException) {
                 SafeVaultLogger.i("Backup", "Backup cancelled by user")
-                withContext(Dispatchers.Main) {
-                    _uiState.update { it.copy(isLoading = false, backupProgressRatio = null, backupStatusMessage = null) }
-                    onComplete(false, "Backup cancelled")
+                val cleaned = withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                    cleanupIncompleteDocumentExport(exportCompleted, onCleanupIncomplete)
+                }
+                if (exportCompleted) {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                        if (activeBackupOpId == opId) {
+                            _uiState.update {
+                                it.copy(
+                                    isLoading = false,
+                                    backupProgressRatio = 1f,
+                                    backupStatusMessage = "Backup complete",
+                                    activeSnackbarMessage = "Backup saved successfully."
+                                )
+                            }
+                        }
+                        completeCurrent(true, null)
+                    }
+                } else {
+                    val msg = if (cleaned == false) {
+                        "Backup cancelled. An incomplete file may remain at the chosen location."
+                    } else {
+                        "Backup cancelled."
+                    }
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                        if (activeBackupOpId == opId) {
+                            _uiState.update { it.copy(isLoading = false, backupProgressRatio = null, backupStatusMessage = null) }
+                        }
+                        completeCurrent(false, msg)
+                    }
                 }
             } catch (e: Exception) {
                 SafeVaultLogger.e("Backup", "Export failed", e)
-                val friendly = VaultErrorMapper.mapBackupExportError(e)
-                withContext(Dispatchers.Main) {
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            backupProgressRatio = null,
-                            backupStatusMessage = null,
-                            activeErrorMessage = friendly
-                        )
+                if (exportCompleted) {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                        if (activeBackupOpId == opId) {
+                            _uiState.update {
+                                it.copy(
+                                    isLoading = false,
+                                    backupProgressRatio = 1f,
+                                    backupStatusMessage = "Backup complete",
+                                    activeSnackbarMessage = "Backup saved successfully."
+                                )
+                            }
+                        }
+                        completeCurrent(true, null)
                     }
-                    onComplete(false, friendly)
+                } else {
+                    val cleaned = withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                        cleanupIncompleteDocumentExport(exportCompleted = false, deleteIncompleteOutput = onCleanupIncomplete)
+                    }
+                    val baseMsg = VaultErrorMapper.mapBackupExportError(e)
+                    val friendly = if (cleaned == false) {
+                        "$baseMsg An incomplete file may remain at the chosen location."
+                    } else {
+                        baseMsg
+                    }
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                        if (activeBackupOpId == opId) {
+                            _uiState.update {
+                                it.copy(
+                                    isLoading = false,
+                                    backupProgressRatio = null,
+                                    backupStatusMessage = null,
+                                    activeErrorMessage = friendly
+                                )
+                            }
+                        }
+                        completeCurrent(false, friendly)
+                    }
                 }
             } finally {
-                activeBackupJob = null
+                if (activeBackupOpId == opId) {
+                    activeBackupJob = null
+                }
                 runCatching { outputStream.close() }
+                Arrays.fill(passwordChars, '\u0000')
             }
         }
     }
@@ -1864,16 +2011,22 @@ class VaultViewModel(
         onResult: (BackupPayload?, String?) -> Unit
     ) {
         activeRestoreJob?.cancel()
+        val opId = restoreOpSeq.incrementAndGet()
+        activeRestoreOpId = opId
+        fun resultCurrent(payload: BackupPayload?, message: String?) {
+            deliverCurrentOperationResult(opId, activeRestoreOpId) { onResult(payload, message) }
+        }
         _uiState.update {
             it.copy(
                 isLoading = true,
                 backupProgressRatio = null,
                 backupStatusMessage = "Reading and verifying backup...",
-                pendingRestoreError = null
+                pendingRestoreError = null,
+                pendingRestorePayload = null
             )
         }
         val initialSessionId = sessionManager.getCurrentSessionId()
-        val stagingDir = File(context.cacheDir, "restore_staging_${System.currentTimeMillis()}").apply { mkdirs() }
+        val stagingDir = File(context.cacheDir, "restore_staging_${System.currentTimeMillis()}_${java.util.UUID.randomUUID().toString().take(8)}").apply { mkdirs() }
         val bis = BufferedInputStream(inputStream)
         activeRestoreJob = viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -1891,60 +2044,104 @@ class VaultViewModel(
                     headerBytesRead += r
                 }
                 bis.reset()
-                if (headerBytesRead < 4) {
-                    throw IllegalArgumentException("Unrecognized backup file header.")
+                if (headerBytesRead < 8) {
+                    throw IllegalArgumentException("Invalid backup magic header.")
                 }
 
-                val staged = if (EncryptedBackupV2Engine.isV2Backup(headerBuf)) {
-                    EncryptedBackupV2Engine.inspectAndStageBackup(bis, passwordChars, stagingDir)
+                val isCancelledCheck = {
+                    !isActive || activeRestoreOpId != opId || (hadInitializedVault && sessionManager.getCurrentSessionId() != initialSessionId)
+                }
+                val progressCallback: (Long, Long) -> Unit = { readBytes, totalBytes ->
+                    if (activeRestoreOpId == opId && totalBytes > 0L) {
+                        val ratio = (readBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 0.99f)
+                        val pct = (ratio * 100).toInt().coerceAtMost(99)
+                        _uiState.update {
+                            it.copy(
+                                backupProgressRatio = ratio,
+                                backupStatusMessage = "Verifying backup... $pct%"
+                            )
+                        }
+                    }
+                }
+
+                val staged = if (EncryptedBackupV2Engine.isSupportedBackup(headerBuf)) {
+                    EncryptedBackupV2Engine.inspectAndStageBackup(
+                        inputStream = bis,
+                        backupPasswordChars = passwordChars,
+                        stagingDir = stagingDir,
+                        isCancelled = isCancelledCheck,
+                        onProgress = progressCallback
+                    )
                 } else if (LegacyV1BackupReader.isLegacyV1Backup(headerBuf)) {
-                    LegacyV1BackupReader.inspectAndStageLegacyBackup(bis, passwordChars, stagingDir)
+                    LegacyV1BackupReader.inspectAndStageLegacyBackup(
+                        inputStream = bis,
+                        backupPasswordChars = passwordChars,
+                        stagingDir = stagingDir,
+                        isCancelled = isCancelledCheck,
+                        onProgress = progressCallback
+                    )
                 } else {
-                    throw IllegalArgumentException("Unrecognized backup file header.")
+                    throw IllegalArgumentException("Invalid backup magic header.")
                 }
                 ensureActive()
+                if (activeRestoreOpId != opId) {
+                    stagingDir.deleteRecursively()
+                    throw CancellationException("Restore inspection superseded.")
+                }
                 if (hadInitializedVault && sessionManager.getCurrentSessionId() != initialSessionId) {
                     throw IllegalStateException("Session changed before backup staging completed.")
                 }
 
-                currentStagedRestore = staged
                 withContext(Dispatchers.Main) {
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            backupProgressRatio = null,
-                            backupStatusMessage = null,
-                            pendingRestorePayload = staged.payload,
-                            pendingRestoreError = null
-                        )
+                    if (activeRestoreOpId == opId) {
+                        currentStagedRestore?.stagingDir?.takeIf { it.absolutePath != staged.stagingDir.absolutePath }?.deleteRecursively()
+                        currentStagedRestore = staged
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                backupProgressRatio = null,
+                                backupStatusMessage = null,
+                                pendingRestorePayload = staged.payload,
+                                pendingRestoreError = null
+                            )
+                        }
+                    } else {
+                        stagingDir.deleteRecursively()
                     }
-                    onResult(staged.payload, null)
+                    resultCurrent(staged.payload, null)
                 }
             } catch (e: CancellationException) {
                 SafeVaultLogger.i("Restore", "Restore inspection cancelled")
                 stagingDir.deleteRecursively()
-                withContext(Dispatchers.Main) {
-                    _uiState.update { it.copy(isLoading = false, backupProgressRatio = null, backupStatusMessage = null) }
-                    onResult(null, "Restore cancelled")
+                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                    if (activeRestoreOpId == opId) {
+                        _uiState.update { it.copy(isLoading = false, backupProgressRatio = null, backupStatusMessage = null) }
+                    }
+                    resultCurrent(null, "Restore cancelled")
                 }
             } catch (e: Exception) {
                 SafeVaultLogger.w("Restore", "Failed to decrypt backup: ${e.message}")
                 stagingDir.deleteRecursively()
                 val friendly = VaultErrorMapper.mapRestoreError(e)
-                withContext(Dispatchers.Main) {
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            backupProgressRatio = null,
-                            backupStatusMessage = null,
-                            pendingRestoreError = friendly
-                        )
+                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                    if (activeRestoreOpId == opId) {
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                backupProgressRatio = null,
+                                backupStatusMessage = null,
+                                pendingRestoreError = friendly
+                            )
+                        }
                     }
-                    onResult(null, friendly.message)
+                    resultCurrent(null, friendly.message)
                 }
             } finally {
-                activeRestoreJob = null
+                if (activeRestoreOpId == opId) {
+                    activeRestoreJob = null
+                }
                 runCatching { bis.close() }
+                Arrays.fill(passwordChars, '\u0000')
             }
         }
     }
@@ -1957,67 +2154,120 @@ class VaultViewModel(
             onComplete(false)
             return
         }
-        val staged = currentStagedRestore ?: run {
-            val payload = _uiState.value.pendingRestorePayload ?: return
-            StagedBackupRestore(payload, File(context.cacheDir, "empty_staging").apply { mkdirs() })
+        val staged = currentStagedRestore
+        if (staged == null || !staged.stagingDir.isDirectory || _uiState.value.pendingRestorePayload == null) {
+            clearPendingRestore()
+            _uiState.update { it.copy(pendingRestoreError = restoreReselectError()) }
+            onComplete(false)
+            return
+        }
+        if (mode == RestoreMode.REPLACE_ACTIVE_VAULT && staged.payload.isPartialCategoryBackup) {
+            val friendly = VaultErrorMapper.mapRestoreError(
+                IllegalArgumentException(
+                    "Replace Active Vault is not allowed for partial category backups (${staged.payload.scopeDisplayLabel})."
+                )
+            )
+            _uiState.update { it.copy(pendingRestoreError = friendly) }
+            onComplete(false)
+            return
         }
         activeRestoreJob?.cancel()
+        val opId = restoreOpSeq.incrementAndGet()
+        activeRestoreOpId = opId
+        fun completeCurrent(success: Boolean) {
+            deliverCurrentOperationResult(opId, activeRestoreOpId) { onComplete(success) }
+        }
         _uiState.update { it.copy(isLoading = true, backupProgressRatio = null, backupStatusMessage = "Restoring vault items...", pendingRestoreError = null) }
         activeRestoreJob = viewModelScope.launch(Dispatchers.IO) {
+            var committed = false
             try {
                 ensureActive()
-                if (sessionManager.getCurrentSessionId() != expectedSessionId) {
+                if (activeRestoreOpId != opId || sessionManager.getCurrentSessionId() != expectedSessionId) {
                     throw IllegalStateException("Session changed during restore.")
                 }
-                repository.commitRestore(staged, mode, isCancelled = { !isActive || sessionManager.getCurrentSessionId() != expectedSessionId })
-                currentStagedRestore = null
-                loadActiveVaultItems()
+                repository.commitRestore(
+                    staged = staged,
+                    mode = mode,
+                    isCancelled = { !isActive || activeRestoreOpId != opId || sessionManager.getCurrentSessionId() != expectedSessionId },
+                    allowUnknownScopeReplace = true
+                )
+                committed = true
+                if (activeRestoreOpId == opId) {
+                    currentStagedRestore = null
+                }
+                runCatching { loadActiveVaultItems() }
                 withContext(Dispatchers.Main) {
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            backupProgressRatio = null,
-                            backupStatusMessage = null,
-                            pendingRestorePayload = null,
-                            pendingRestoreError = null,
-                            activeSnackbarMessage = "Vault restored successfully"
-                        )
+                    if (activeRestoreOpId == opId) {
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                backupProgressRatio = null,
+                                backupStatusMessage = null,
+                                pendingRestorePayload = null,
+                                pendingRestoreError = null,
+                                activeSnackbarMessage = "Vault restored successfully"
+                            )
+                        }
                     }
-                    onComplete(true)
+                    completeCurrent(true)
                 }
             } catch (e: CancellationException) {
                 SafeVaultLogger.i("Restore", "Restore commit cancelled")
-                withContext(Dispatchers.Main) {
-                    _uiState.update { it.copy(isLoading = false, backupProgressRatio = null, backupStatusMessage = null) }
-                    onComplete(false)
+                if (committed) {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                        completeCurrent(true)
+                    }
+                } else {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                        if (activeRestoreOpId == opId) {
+                            invalidateMissingRestoreStage(staged)
+                            _uiState.update { it.copy(isLoading = false, backupProgressRatio = null, backupStatusMessage = null) }
+                        }
+                        completeCurrent(false)
+                    }
                 }
             } catch (e: Exception) {
                 SafeVaultLogger.e("Restore", "Restore commit failed", e)
-                val friendly = VaultErrorMapper.mapRestoreError(e)
-                withContext(Dispatchers.Main) {
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            backupProgressRatio = null,
-                            backupStatusMessage = null,
-                            pendingRestoreError = friendly
-                        )
+                if (committed) {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                        completeCurrent(true)
                     }
-                    onComplete(false)
+                } else {
+                    val friendly = VaultErrorMapper.mapRestoreError(e)
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                        if (activeRestoreOpId == opId) {
+                            val stageLost = invalidateMissingRestoreStage(staged)
+                            _uiState.update {
+                                it.copy(
+                                    isLoading = false,
+                                    backupProgressRatio = null,
+                                    backupStatusMessage = null,
+                                    pendingRestoreError = if (stageLost) restoreReselectError() else friendly
+                                )
+                            }
+                        }
+                        completeCurrent(false)
+                    }
                 }
             } finally {
-                activeRestoreJob = null
+                if (activeRestoreOpId == opId) {
+                    activeRestoreJob = null
+                }
             }
         }
     }
 
     fun createVaultAndCommitRestore(
         masterPasswordChars: CharArray,
-        mode: RestoreMode = RestoreMode.REPLACE_ACTIVE_VAULT,
+        mode: RestoreMode? = null,
         onComplete: (Boolean, String?) -> Unit
     ) {
-        val staged = currentStagedRestore ?: run {
-            onComplete(false, "No backup loaded for restore.")
+        val staged = currentStagedRestore
+        if (staged == null || !staged.stagingDir.isDirectory || _uiState.value.pendingRestorePayload == null) {
+            clearPendingRestore()
+            _uiState.update { it.copy(pendingRestoreError = restoreReselectError()) }
+            Arrays.fill(masterPasswordChars, '\u0000')
+            onComplete(false, restoreReselectError().message)
             return
         }
         val pwdPolicy = PasswordPolicy.validateNewPassword(masterPasswordChars, "Master password")
@@ -2025,67 +2275,136 @@ class VaultViewModel(
             onComplete(false, pwdPolicy.errorMessage ?: "Use at least ${PasswordPolicy.MIN_NEW_PASSWORD_LENGTH} characters for your new master password.")
             return
         }
+        val effectiveMode = mode ?: if (staged.payload.isVerifiedFullBackup) {
+            RestoreMode.REPLACE_ACTIVE_VAULT
+        } else {
+            RestoreMode.MERGE_KEEP_NEWEST
+        }
         activeRestoreJob?.cancel()
+        val opId = restoreOpSeq.incrementAndGet()
+        activeRestoreOpId = opId
+        fun completeCurrent(success: Boolean, message: String?) {
+            deliverCurrentOperationResult(opId, activeRestoreOpId) { onComplete(success, message) }
+        }
         _uiState.update { it.copy(isLoading = true, backupProgressRatio = null, backupStatusMessage = "Initializing vault and restoring data...", pendingRestoreError = null) }
         activeRestoreJob = viewModelScope.launch(Dispatchers.IO) {
+            var vaultAndRestoreCommitted = false
             try {
                 ensureActive()
-                val res = repository.createInitialVault(masterPasswordChars)
+                val res = repository.initializeVaultAndCommitRestore(
+                    masterPasswordChars = masterPasswordChars,
+                    staged = staged,
+                    mode = effectiveMode,
+                    isCancelled = { !isActive || activeRestoreOpId != opId }
+                )
                 if (res !is AuthResult.Success) {
                     val errMsg = (res as? AuthResult.Error)?.message ?: "Failed to initialize vault."
                     withContext(Dispatchers.Main) {
-                        _uiState.update { it.copy(isLoading = false, backupStatusMessage = null) }
-                        onComplete(false, errMsg)
+                        if (activeRestoreOpId == opId) {
+                            _uiState.update { it.copy(isLoading = false, backupStatusMessage = null) }
+                        }
+                        completeCurrent(false, errMsg)
                     }
                     return@launch
                 }
-                _uiState.update { it.copy(isVaultInitialized = true, isBiometricsConfigured = false) }
-                ensureActive()
-                repository.commitRestore(staged, mode, isCancelled = { !isActive })
-                currentStagedRestore = null
-                loadActiveVaultItems()
+                vaultAndRestoreCommitted = true
+                if (activeRestoreOpId == opId) {
+                    currentStagedRestore = null
+                }
+                runCatching { loadActiveVaultItems() }
                 val isBiometricAvailable = BiometricKeystoreManager.hasKeystoreKey()
                 withContext(Dispatchers.Main) {
-                    _uiState.update {
-                        it.copy(
-                            isVaultInitialized = true,
-                            isUnlocked = true,
-                            activeSlotId = 0,
-                            pendingRestorePayload = null,
-                            pendingRestoreError = null,
-                            isLoading = false,
-                            backupProgressRatio = null,
-                            backupStatusMessage = null,
-                            isBiometricsConfigured = isBiometricAvailable,
-                            activeSnackbarMessage = "Vault initialized and restored successfully"
-                        )
+                    if (activeRestoreOpId == opId) {
+                        _uiState.update {
+                            it.copy(
+                                isVaultInitialized = true,
+                                isUnlocked = true,
+                                activeSlotId = 0,
+                                pendingRestorePayload = null,
+                                pendingRestoreError = null,
+                                isLoading = false,
+                                backupProgressRatio = null,
+                                backupStatusMessage = null,
+                                isBiometricsConfigured = isBiometricAvailable,
+                                activeSnackbarMessage = "Vault initialized and restored successfully"
+                            )
+                        }
                     }
-                    onComplete(true, null)
+                    completeCurrent(true, null)
                 }
             } catch (e: CancellationException) {
                 SafeVaultLogger.i("Restore", "Create vault and restore cancelled")
-                withContext(Dispatchers.Main) {
-                    _uiState.update { it.copy(isLoading = false, backupProgressRatio = null, backupStatusMessage = null) }
-                    onComplete(false, "Restore cancelled")
+                if (vaultAndRestoreCommitted) {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                        completeCurrent(true, null)
+                    }
+                } else {
+                    val stillInitialized = runCatching { repository.isVaultInitialized() }.getOrDefault(false)
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                        if (activeRestoreOpId == opId) {
+                            invalidateMissingRestoreStage(staged)
+                            _uiState.update {
+                                it.copy(
+                                    isVaultInitialized = stillInitialized,
+                                    isLoading = false,
+                                    backupProgressRatio = null,
+                                    backupStatusMessage = null
+                                )
+                            }
+                        }
+                        completeCurrent(false, if (!staged.stagingDir.isDirectory) restoreReselectError().message else "Restore cancelled")
+                    }
                 }
             } catch (e: Exception) {
                 SafeVaultLogger.e("Restore", "Create vault and restore failed", e)
-                val friendly = VaultErrorMapper.mapRestoreError(e)
-                withContext(Dispatchers.Main) {
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            backupProgressRatio = null,
-                            backupStatusMessage = null,
-                            pendingRestoreError = friendly
-                        )
+                if (vaultAndRestoreCommitted) {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                        completeCurrent(true, null)
                     }
-                    onComplete(false, friendly.message)
+                } else {
+                    val friendly = VaultErrorMapper.mapRestoreError(e)
+                    val stillInitialized = runCatching { repository.isVaultInitialized() }.getOrDefault(false)
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                        if (activeRestoreOpId == opId) {
+                            invalidateMissingRestoreStage(staged)
+                            _uiState.update {
+                                it.copy(
+                                    isVaultInitialized = stillInitialized,
+                                    isLoading = false,
+                                    backupProgressRatio = null,
+                                    backupStatusMessage = null,
+                                    pendingRestoreError = if (!staged.stagingDir.isDirectory) restoreReselectError() else friendly
+                                )
+                            }
+                        }
+                        completeCurrent(false, if (!staged.stagingDir.isDirectory) restoreReselectError().message else friendly.message)
+                    }
                 }
             } finally {
-                activeRestoreJob = null
+                Arrays.fill(masterPasswordChars, '\u0000')
+                if (activeRestoreOpId == opId) {
+                    activeRestoreJob = null
+                }
             }
         }
+    }
+
+    private fun restoreReselectError() = VaultErrorMapper.FriendlyRestoreError(
+        kind = VaultErrorMapper.RestoreErrorKind.FILE_UNACCESSIBLE,
+        title = "Choose your backup again",
+        message = "The temporary restore files are no longer available. Select your original backup again to retry.",
+        canChooseAnotherFile = true
+    )
+
+    private fun invalidateMissingRestoreStage(staged: StagedBackupRestore): Boolean {
+        if (staged.stagingDir.isDirectory) return false
+        if (currentStagedRestore === staged) {
+            currentStagedRestore = null
+            _uiState.update {
+                it.copy(pendingRestorePayload = null, pendingRestoreError = restoreReselectError())
+            }
+        }
+        return true
     }
 
     fun clearPendingRestore() {

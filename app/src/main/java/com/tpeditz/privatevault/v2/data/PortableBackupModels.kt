@@ -55,7 +55,9 @@ data class BackupPayload(
     val applicationId: String = "com.tpeditz.privatevault.v2",
     val items: List<VaultItem>,
     val mediaPayloads: Map<String, EmbeddedMediaPayload> = emptyMap(),
-    val documentPayloads: Map<String, EmbeddedDocumentPayload> = emptyMap()
+    val documentPayloads: Map<String, EmbeddedDocumentPayload> = emptyMap(),
+    val exportScope: BackupExportScope = BackupExportScope.ALL_DATA,
+    val isExportScopeKnown: Boolean = false
 ) {
     val legacyMediaBlobs: Map<String, EmbeddedMediaPayload> get() = mediaPayloads
     val notesCount: Int get() = items.count { it is NoteRecord }
@@ -66,6 +68,19 @@ data class BackupPayload(
     val linksCount: Int get() = items.count { it is SecureLinkRecord }
     val authenticatorsCount: Int get() = items.count { it is AuthenticatorRecord }
 
+    val isVerifiedFullBackup: Boolean
+        get() = isExportScopeKnown && exportScope == BackupExportScope.ALL_DATA
+
+    val isPartialCategoryBackup: Boolean
+        get() = isExportScopeKnown && exportScope != BackupExportScope.ALL_DATA
+
+    val scopeDisplayLabel: String
+        get() = when {
+            !isExportScopeKnown -> "Backup scope unknown"
+            exportScope == BackupExportScope.ALL_DATA -> "Full vault backup"
+            else -> exportScope.label
+        }
+
     val isEmptyBackup: Boolean
         get() = items.none {
             it is NoteRecord || it is CredentialRecord || it is MediaRecord ||
@@ -73,7 +88,36 @@ data class BackupPayload(
         }
 }
 
+fun filterItemsForBackupScope(allItems: List<VaultItem>, scope: BackupExportScope): List<VaultItem> {
+    return when (scope) {
+        BackupExportScope.ALL_DATA -> allItems
+        BackupExportScope.NOTES_PASSWORDS_LINKS -> allItems.filter {
+            it is NoteRecord ||
+                it is CredentialRecord ||
+                it is SecureLinkRecord ||
+                (it is VaultFolder && (it.scope == FolderScope.NOTES || it.scope == FolderScope.CREDENTIALS))
+        }
+        BackupExportScope.NOTES_ONLY -> allItems.filter {
+            it is NoteRecord || (it is VaultFolder && it.scope == FolderScope.NOTES)
+        }
+        BackupExportScope.PASSWORDS_ONLY -> allItems.filter {
+            it is CredentialRecord || (it is VaultFolder && it.scope == FolderScope.CREDENTIALS)
+        }
+        BackupExportScope.MEDIA_ONLY -> allItems.filter {
+            it is MediaRecord || it is VaultAlbumRecord
+        }
+        BackupExportScope.DOCUMENTS_ONLY -> allItems.filter {
+            it is DocumentRecord || (it is VaultFolder && it.scope == FolderScope.DOCUMENTS)
+        }
+    }
+}
+
 data class StagedBackupRestore(
     val payload: BackupPayload,
     val stagingDir: java.io.File
 )
+
+class CorruptedVaultRecordsException(
+    val corruptedCount: Int,
+    message: String = "Some vault items could not be read. Your backup was not replaced."
+) : IllegalStateException(message)

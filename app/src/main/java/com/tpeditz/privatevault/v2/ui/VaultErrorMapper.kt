@@ -1,5 +1,6 @@
 package com.tpeditz.privatevault.v2.ui
 
+import com.tpeditz.privatevault.v2.data.CorruptedVaultRecordsException
 import org.json.JSONException
 import java.io.EOFException
 import java.io.FileNotFoundException
@@ -173,17 +174,25 @@ object VaultErrorMapper {
 
     fun mapBackupExportError(throwable: Throwable?): String {
         if (throwable is CancellationException) return "Backup cancelled."
+        if (throwable is CorruptedVaultRecordsException) {
+            return "Some vault items could not be read. Your previous backup has been kept."
+        }
+        if (throwable is GeneralSecurityException) {
+            return "Some vault files could not be verified for this backup. Your previous backup has been kept."
+        }
         val msg = throwable?.message.orEmpty().lowercase()
         return when {
             msg.contains("vault is locked") || msg.contains("session") || msg.contains("wiped") ->
                 "Your vault was locked. Unlock it and try again."
+            msg.contains("some vault items could not be read") ->
+                "Some vault items could not be read. Your previous backup has been kept."
             msg.contains("at least 12 characters") || msg.contains("characters") ->
                 throwable?.message ?: "Please choose a stronger backup password."
             msg.contains("2 gib") || msg.contains("exceeds maximum") || msg.contains("no space") || msg.contains("enospc") ->
-                "Not enough storage space to create this backup."
-            msg.contains("missing encrypted") || msg.contains("not found") ->
-                "Some vault files could not be read for this backup."
-            else -> "Could not create backup. Check available storage and try again."
+                "Not enough storage to complete the backup."
+            msg.contains("missing encrypted") || msg.contains("not found") || msg.contains("integrity") || msg.contains("sha-256") ->
+                "Some vault files could not be verified for this backup. Your previous backup has been kept."
+            else -> "Backup could not be completed. Your previous backup has been kept."
         }
     }
 
