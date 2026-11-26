@@ -1,7 +1,7 @@
 # PRIVATE VAULT V2 (Android)
 
 > **Zero-Knowledge, Offline-First Cryptographic Vault & Password Manager for Android**  
-> **Version:** `2.0.1` (Version Code: `2`)  
+> **Version:** `2.0.4` (Version Code: `5`)  
 > **Application ID:** `com.tpeditz.privatevault.v2`  
 > **Developed by:** **Tp Editz**  
 > **Official Website:** [https://tpeditz.github.io/Private-vault-android-v2/](https://tpeditz.github.io/Private-vault-android-v2/)  
@@ -22,8 +22,8 @@
 - **PVAULTB2 Streaming Backup & Crash-Safe Restore:** Supports up to 2 GiB containers with bounded streaming I/O, per-file SHA-256 + `thumbSha256` verification, file-first durable disk writes (`fd.sync()`), atomic Room transactions, `vaultMutationMutex` serialization, fail-closed recovery journal rollback, and friendly retryable error UX (`VaultErrorMapper`).
 - **New Password Strength Policy (`PasswordPolicy`):** Enforces a 12-character minimum (with multi-word spaces and Unicode support) on newly created vault/master/backup/cloud passwords while keeping full backward compatibility for existing `<12`-character vaults, backups, and automatic cloud schedules.
 - **Legacy V1 Backward Compatibility:** `LegacyV1BackupReader` restores original `PVAULTB1` containers, legacy Unicode passwords, and embedded media payloads.
-- **Strict Android Autofill Service:** Native `AutofillService` with strict exact/parent host matching, HTTPS/HTTP isolation, explicit `android://<packageName>` native app matching (`AutofillHelper`), neutral vault picker fallback when unassociated, and zero service-name or package-token guessing.
-- **Encrypted Cloud Backup (Optional):** Modern Credential Manager + GIS `AuthorizationClient` (`drive.appdata`), UUID-keyed immutable staged snapshots (`CloudBackupScheduler`), Keystore-protected recovery passwords (`AutoCloudBackupKeyStore`), and `multipart/related` Drive sync.
+- **Standalone Password & Authenticator Manager:** Encrypted credential vault with `websiteUrl` associations, masked-by-default password history with deliberate reveal, CSPRNG password/passphrase generator, repeated-word passphrase penalty scoring, offline RFC 4226/6238 TOTP authenticator, bounded CSV import (`login_uri`, duplicate detection), and auto-clearing clipboard protection (Android Autofill intentionally removed in V2.0.4).
+- **Encrypted Cloud Backup (Optional):** Modern Credential Manager + GIS `AuthorizationClient` (`drive.appdata`), UUID-keyed immutable staged snapshots (`CloudBackupScheduler`), Keystore-protected recovery passwords (`AutoCloudBackupKeyStore`), paginated `modifiedTime desc` Drive listing, and multipart / resumable streaming uploads.
 - **Share-to-Vault (`ACTION_SEND`):** Receives shared text/URLs when unlocked to save cleanly as encrypted Notes or Secure Links.
 - **Cryptographic OTA Updates & CI/CD:** Checks `https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/update.json`, enforcing `FLAG_DEBUGGABLE == false`, SHA-256 checksums, version monotonicity, `ApkVerifier` v1/v2/v3 signing certificates, `ON_RESUME` Unknown Sources re-verification, and hardened draft-staged `.github/workflows/`.
 
@@ -61,10 +61,6 @@ Private-vault-android-v2/
 │       │   ├── AndroidManifest.xml
 │       │   ├── java/com/tpeditz/privatevault/v2/
 │       │   │   ├── MainActivity.kt
-│       │   │   ├── autofill/
-│       │   │   │   ├── AutofillAuthActivity.kt
-│       │   │   │   ├── AutofillHelper.kt
-│       │   │   │   └── PrivateVaultAutofillService.kt
 │       │   │   ├── data/
 │       │   │   │   ├── AppPreferencesRepository.kt
 │       │   │   │   ├── EncryptedBackupV2Engine.kt
@@ -103,7 +99,7 @@ Private-vault-android-v2/
 │       │   │       └── theme/
 │       │   └── res/
 │       ├── androidTest/java/com/tpeditz/privatevault/v2/  # Room, DataStore & Compose instrumentation tests
-│       └── test/java/com/tpeditz/privatevault/v2/         # 16 JVM unit & regression test suites (89 tests)
+│       └── test/java/com/tpeditz/privatevault/v2/         # 19 JVM unit & regression test suites (101 tests)
 ├── gradle/
 │   ├── libs.versions.toml
 │   └── wrapper/
@@ -121,7 +117,7 @@ Private-vault-android-v2/
 ## 4. Build & Verification Commands
 
 ```bash
-# Run all 16 unit & repository regression suites (89 tests)
+# Run all 19 unit & repository regression suites (101 tests)
 ./gradlew :app:testDebugUnitTest
 
 # Run Android Lint verification (0 errors)

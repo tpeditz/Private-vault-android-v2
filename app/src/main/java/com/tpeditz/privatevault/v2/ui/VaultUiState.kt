@@ -24,7 +24,6 @@ data class PrivacyHealthMetrics(
     val isBiometricEnabled: Boolean = false,
     val isScreenshotProtected: Boolean = true,
     val autoLockTimeoutSeconds: Int = 60,
-    val isAutofillActive: Boolean = false,
     val isUpdateAvailable: Boolean = false
 )
 
@@ -60,6 +59,7 @@ data class VaultUiState(
 
     // Tools & TOTP
     val totpRemainingSeconds: Int = 30,
+    val totpEpochSeconds: Long = System.currentTimeMillis() / 1000L,
     val clipboardCountdownSeconds: Int? = null,
 
     // Privacy Dashboard Metrics

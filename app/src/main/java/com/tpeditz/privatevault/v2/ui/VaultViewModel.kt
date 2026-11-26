@@ -8,7 +8,6 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import com.tpeditz.privatevault.v2.autofill.AutofillHelper
 import com.tpeditz.privatevault.v2.data.AppPreferencesRepository
 import com.tpeditz.privatevault.v2.data.AuthResult
 import com.tpeditz.privatevault.v2.data.AuthenticatorRecord
@@ -96,6 +95,23 @@ class VaultViewModel(
     private val _showPendingUpdateReminder = MutableStateFlow(true)
     val showPendingUpdateReminder: StateFlow<Boolean> = _showPendingUpdateReminder.asStateFlow()
 
+    // Bounded volatile cache for decrypted media thumbnails (12 MiB max), strictly cleared and wiped on eviction, lock, or session change.
+    private val thumbnailCacheLock = Any()
+    private val decryptedThumbnailCache = object : android.util.LruCache<String, ByteArray>(12 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: ByteArray): Int = value.size.coerceAtLeast(1)
+        override fun entryRemoved(evicted: Boolean, key: String, oldValue: ByteArray, newValue: ByteArray?) {
+            if (oldValue !== newValue) {
+                Arrays.fill(oldValue, 0.toByte())
+            }
+        }
+    }
+
+    fun clearVolatileThumbnailCache() {
+        synchronized(thumbnailCacheLock) {
+            decryptedThumbnailCache.evictAll()
+        }
+    }
+
 
     init {
         // Collect session state
@@ -105,6 +121,7 @@ class VaultViewModel(
                 when (session) {
                     is VaultSessionManager.SessionState.Unlocked -> {
                         if (lastActiveSessionId != session.sessionId) {
+                            clearVolatileThumbnailCache()
                             loadItemsJob?.cancel()
                             _uiState.update { it.copy(notes = emptyList(), credentials = emptyList(), media = emptyList(),
                                 documents = emptyList(), secureLinks = emptyList(), folders = emptyList(), albums = emptyList(),
@@ -133,6 +150,7 @@ class VaultViewModel(
                     }
                     is VaultSessionManager.SessionState.Locked -> {
                         lastActiveSessionId = null
+                        clearVolatileThumbnailCache()
                         loadItemsJob?.cancel()
                         cancelBackup()
                         cancelRestore()
@@ -409,13 +427,80 @@ class VaultViewModel(
         return repository.getBiometricIvForUnlock()
     }
 
-    suspend fun enrollBiometrics(cipher: Cipher): Boolean {
-        val ok = repository.enrollBiometricKey(cipher)
-        if (ok) {
-            preferencesRepository.setBiometricUnlockEnabled(true)
-            _uiState.update { it.copy(isBiometricsConfigured = true) }
+    private suspend fun reconcileBiometricPreferencesAndKeystore(): String? {
+        val dbNonceSha = repository.getBiometricNonceSha256Hex()
+        val activeAlias = preferencesRepository.biometricKeyAlias.first()
+        val pendingAlias = preferencesRepository.biometricPendingAlias.first()
+        val pendingNonceSha = preferencesRepository.biometricPendingNonceSha256.first()
+        val resolution = BiometricKeystoreManager.reconcileAliasState(
+            activeAlias = activeAlias,
+            pendingAlias = pendingAlias,
+            pendingNonceSha256 = pendingNonceSha,
+            dbBiometricNonceSha256 = dbNonceSha,
+            hasKeyInKeystore = { alias -> BiometricKeystoreManager.hasKeystoreKey(alias) }
+        )
+        if (dbNonceSha == null) {
+            preferencesRepository.clearBiometricPreferences()
+            BiometricKeystoreManager.deleteBiometricKey()
+            return null
         }
-        return ok
+        if (resolution.shouldPromotePendingAlias && !resolution.unlockAlias.isNullOrBlank()) {
+            preferencesRepository.commitPendingBiometricAlias(resolution.unlockAlias)
+        } else if (resolution.shouldClearPending) {
+            preferencesRepository.clearPendingBiometricCommit()
+        }
+        resolution.staleAliasToRetire?.let { BiometricKeystoreManager.retireAlias(it) }
+        return resolution.unlockAlias
+    }
+
+    suspend fun getBiometricUnlockInfo(): Pair<ByteArray, String?>? {
+        val resolvedAlias = reconcileBiometricPreferencesAndKeystore()
+        val iv = repository.getBiometricIvForUnlock() ?: return null
+        return iv to resolvedAlias
+    }
+
+    suspend fun getActiveBiometricAlias(): String? {
+        return reconcileBiometricPreferencesAndKeystore()
+            ?: preferencesRepository.biometricKeyAlias.first()
+    }
+
+    suspend fun enrollBiometrics(cipher: Cipher, targetAlias: String? = null): Boolean {
+        var dbCommitted = false
+        return try {
+            val ok = repository.enrollBiometricKey(cipher) { nonceSha256 ->
+                if (!targetAlias.isNullOrBlank()) {
+                    preferencesRepository.stagePendingBiometricCommit(targetAlias, nonceSha256)
+                }
+            }
+            if (ok) {
+                dbCommitted = true
+                withContext(kotlinx.coroutines.NonCancellable) {
+                    if (!targetAlias.isNullOrBlank()) {
+                        preferencesRepository.commitPendingBiometricAlias(targetAlias)
+                        BiometricKeystoreManager.commitStagedAliasAndRetirePrevious(targetAlias)
+                    } else {
+                        preferencesRepository.setBiometricUnlockEnabled(true)
+                    }
+                }
+                _uiState.update {
+                    it.copy(
+                        isBiometricsConfigured = true,
+                        privacyMetrics = it.privacyMetrics.copy(isBiometricEnabled = true)
+                    )
+                }
+            } else if (!targetAlias.isNullOrBlank()) {
+                preferencesRepository.clearPendingBiometricCommit()
+                BiometricKeystoreManager.discardStagedAlias(targetAlias)
+            }
+            ok
+        } catch (t: Throwable) {
+            if (!dbCommitted && !targetAlias.isNullOrBlank()) {
+                runCatching { preferencesRepository.clearPendingBiometricCommit() }
+                BiometricKeystoreManager.discardStagedAlias(targetAlias)
+            }
+            if (t is CancellationException) throw t
+            false
+        }
     }
 
     fun unlockWithBiometric(cipher: Cipher, onResult: (Boolean, String?) -> Unit) {
@@ -492,8 +577,6 @@ class VaultViewModel(
                 BiometricKeystoreManager.hasKeystoreKey()
             val screenSec = preferencesRepository.screenshotProtectionEnabled.first()
             val timeoutSec = preferencesRepository.autoLockTimeoutSeconds.first()
-            val liveAutofill = AutofillHelper.isAutofillServiceEnabled(context)
-            runCatching { preferencesRepository.setAutofillEnabled(liveAutofill) }
 
             val currentOta = otaUpdateManager.otaState.value
             val updateAvailable = currentOta is OtaState.UpdateAvailable ||
@@ -512,7 +595,6 @@ class VaultViewModel(
                 isBiometricEnabled = bio,
                 isScreenshotProtected = screenSec,
                 autoLockTimeoutSeconds = timeoutSec,
-                isAutofillActive = liveAutofill,
                 isUpdateAvailable = updateAvailable
             )
 
@@ -624,11 +706,33 @@ class VaultViewModel(
         clipboardManager.copyPublicText(label, text)
     }
 
-    fun importCsv(inputStream: InputStream, onComplete: (Int, Int) -> Unit) {
-        viewModelScope.launch {
-            val res = repository.importCredentialsFromCsv(inputStream)
-            loadActiveVaultItems()
-            onComplete(res.first, res.second)
+    fun importCsv(inputStream: InputStream, onComplete: (Int, Int, String?) -> Unit) {
+        val expectedSessionId = sessionManager.getCurrentSessionId()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                inputStream.use { stream ->
+                    if (expectedSessionId == null) {
+                        withContext(Dispatchers.Main) {
+                            onComplete(0, 0, "Unlock your vault before importing credentials.")
+                        }
+                        return@launch
+                    }
+                    val res = repository.importCredentialsFromCsv(stream, expectedSessionId = expectedSessionId)
+                    loadActiveVaultItems()
+                    withContext(Dispatchers.Main) { onComplete(res.first, res.second, null) }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val friendly = when {
+                    e.message.orEmpty().contains("session", ignoreCase = true) ||
+                        e.message.orEmpty().contains("locked", ignoreCase = true) ->
+                        "Import stopped because the vault session changed or locked."
+                    e is IllegalArgumentException && !e.message.isNullOrBlank() -> e.message!!
+                    else -> "Could not import CSV file. Check the file format and try again."
+                }
+                withContext(Dispatchers.Main) { onComplete(0, 0, friendly) }
+            }
         }
     }
 
@@ -848,12 +952,65 @@ class VaultViewModel(
         return repository.loadDecryptedPhotoBytes(mediaRecord)
     }
 
+    suspend fun loadDecryptedThumbnailBytes(mediaRecord: MediaRecord): ByteArray? {
+        val initialSession = sessionManager.getActiveSession() ?: return null
+        if (initialSession.isWiped) return null
+        val activeSessionId = initialSession.sessionId
+        val cacheKey = "${activeSessionId}_${mediaRecord.id}"
+        synchronized(thumbnailCacheLock) {
+            val stillValid = sessionManager.getActiveSession()
+            if (stillValid == null || stillValid.sessionId != activeSessionId || stillValid.isWiped) {
+                return null
+            }
+            decryptedThumbnailCache.get(cacheKey)?.let { return it.copyOf() }
+        }
+        val bytes = runCatching { repository.loadDecryptedThumbnailBytes(mediaRecord) }.getOrNull() ?: return null
+        val postLoadSession = sessionManager.getActiveSession()
+        if (postLoadSession == null || postLoadSession.sessionId != activeSessionId || postLoadSession.isWiped) {
+            Arrays.fill(bytes, 0.toByte())
+            return null
+        }
+        if (bytes.size <= 2 * 1024 * 1024) {
+            synchronized(thumbnailCacheLock) {
+                val insideLockSession = sessionManager.getActiveSession()
+                if (insideLockSession != null && insideLockSession.sessionId == activeSessionId && !insideLockSession.isWiped) {
+                    decryptedThumbnailCache.put(cacheKey, bytes)
+                    return bytes.copyOf()
+                }
+            }
+            Arrays.fill(bytes, 0.toByte())
+            return null
+        }
+        return bytes
+    }
+
     suspend fun openEncryptedVideoDataSource(mediaRecord: MediaRecord): StreamingMediaCryptoEngine.EncryptedChunkMediaDataSource {
         return repository.openEncryptedVideoDataSource(mediaRecord)
     }
 
     suspend fun loadDecryptedDocumentBytes(documentRecord: DocumentRecord): ByteArray {
         return repository.loadDecryptedDocumentBytes(documentRecord)
+    }
+
+    suspend fun loadDecryptedDocumentPreviewBytes(
+        documentRecord: DocumentRecord,
+        maxPreviewBytes: Int = 2 * 1024 * 1024
+    ): ByteArray {
+        return repository.loadDecryptedDocumentPreviewBytes(documentRecord, maxPreviewBytes)
+    }
+
+    suspend fun exportDecryptedDocumentToStream(
+        documentRecord: DocumentRecord,
+        outputStream: OutputStream,
+        isCancelled: () -> Boolean = { false }
+    ): Long {
+        val expectedSessionId = sessionManager.getCurrentSessionId()
+        return repository.exportDecryptedDocumentToStream(
+            documentRecord = documentRecord,
+            outputStream = outputStream,
+            expectedSessionId = expectedSessionId,
+            isCancelled = isCancelled
+        )
     }
 
     // ============================================================================================
@@ -930,10 +1087,10 @@ class VaultViewModel(
 
     fun refreshSystemSecurityStatus() {
         viewModelScope.launch {
-            val liveAutofill = AutofillHelper.isAutofillServiceEnabled(context)
-            runCatching { preferencesRepository.setAutofillEnabled(liveAutofill) }
+            val reconciledAlias = reconcileBiometricPreferencesAndKeystore()
             val bioPref = preferencesRepository.biometricUnlockEnabled.first()
-            val actualBio = bioPref && BiometricKeystoreManager.hasKeystoreKey() &&
+            val actualBio = bioPref && !reconciledAlias.isNullOrBlank() &&
+                BiometricKeystoreManager.hasKeystoreKey(reconciledAlias) &&
                 sessionManager.getActiveSlotIdOrNull() != VaultSessionManager.DECOY_SLOT
             val storedEmail = preferencesRepository.connectedGoogleAccount.first().trim()
             val hasRecoveryPwd = AutoCloudBackupKeyStore.hasRecoveryPassword(context)
@@ -953,7 +1110,6 @@ class VaultViewModel(
                     autoCloudBackupEnabled = realSessionId() != null && autoEnabled,
                     lastCloudBackupStatusMessage = if (realSessionId() != null) lastCloudStatus.ifBlank { null } else null,
                     privacyMetrics = it.privacyMetrics.copy(
-                        isAutofillActive = liveAutofill,
                         isBiometricEnabled = actualBio,
                         isUpdateAvailable = updateAvailable
                     )
@@ -966,7 +1122,7 @@ class VaultViewModel(
         if (realSessionId() == null) return
         viewModelScope.launch {
             repository.disableBiometricKey()
-            preferencesRepository.setBiometricUnlockEnabled(false)
+            preferencesRepository.clearBiometricPreferences()
             _uiState.update {
                 it.copy(
                     isBiometricsConfigured = false,
@@ -980,6 +1136,15 @@ class VaultViewModel(
         viewModelScope.launch {
             try {
                 val ok = repository.provisionDecoyVault(primaryPasswordChars, decoyPasswordChars)
+                if (ok) {
+                    preferencesRepository.clearBiometricPreferences()
+                    _uiState.update {
+                        it.copy(
+                            isBiometricsConfigured = false,
+                            privacyMetrics = it.privacyMetrics.copy(isBiometricEnabled = false)
+                        )
+                    }
+                }
                 loadActiveVaultItems()
                 withContext(Dispatchers.Main) { onComplete?.invoke(ok, if (ok) null else "Check your primary password and use at least 12 characters for your decoy password.") }
             } catch (e: Exception) {
@@ -1337,6 +1502,14 @@ class VaultViewModel(
                         return@launch
                     }
                 }
+                val postSessionActive = realSessionId() == backupSessionId
+                val currentEmail = preferencesRepository.connectedGoogleAccount.first().trim()
+                if (!postSessionActive || !currentEmail.equals(email, ignoreCase = true)) {
+                    withContext(Dispatchers.Main) {
+                        onComplete(false, "Vault session or connected Google account changed during cloud backup.")
+                    }
+                    return@launch
+                }
                 when (res) {
                     is GoogleDriveSyncManager.SyncResult.Success -> {
                         preferencesRepository.recordCloudBackup()
@@ -1354,6 +1527,8 @@ class VaultViewModel(
                         withContext(Dispatchers.Main) { onComplete(false, friendly) }
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) { onComplete(false, VaultErrorMapper.mapCloudError(e)) }
             } finally {
@@ -1373,7 +1548,7 @@ class VaultViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             val targetFile = File(context.cacheDir, "cloud_download_${java.util.UUID.randomUUID()}.pvault")
             try {
-                requireRealSession()
+                val downloadSessionId = requireRealSession()
                 val email = preferencesRepository.connectedGoogleAccount.first().trim()
                 if (email.isBlank()) {
                     return@launch withContext(Dispatchers.Main) {
@@ -1396,11 +1571,13 @@ class VaultViewModel(
                     }
                 }
 
+                requireRealSession(downloadSessionId)
                 var res = googleDriveSyncManager.downloadBackupSnapshotToFile(token, fileId, targetFile)
                 if (res is GoogleDriveSyncManager.SyncResult.Error && res.isAuthError) {
                     val refreshed = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)
                     if (refreshed is GoogleDriveAuthHelper.DriveAuthState.Authorized) {
                         token = refreshed.accessToken
+                        requireRealSession(downloadSessionId)
                         res = googleDriveSyncManager.downloadBackupSnapshotToFile(token, fileId, targetFile)
                     } else if (refreshed is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent) {
                         withContext(Dispatchers.Main) {
@@ -1409,6 +1586,15 @@ class VaultViewModel(
                         }
                         return@launch
                     }
+                }
+                requireRealSession(downloadSessionId)
+                val currentEmail = preferencesRepository.connectedGoogleAccount.first().trim()
+                if (!currentEmail.equals(email, ignoreCase = true)) {
+                    runCatching { targetFile.delete() }
+                    withContext(Dispatchers.Main) {
+                        onDownloaded(null, "Connected Google account changed during download.")
+                    }
+                    return@launch
                 }
                 when (res) {
                     is GoogleDriveSyncManager.SyncResult.Success -> {
@@ -1419,6 +1605,9 @@ class VaultViewModel(
                         withContext(Dispatchers.Main) { onDownloaded(null, res.message) }
                     }
                 }
+            } catch (e: CancellationException) {
+                runCatching { targetFile.delete() }
+                throw e
             } catch (e: Exception) {
                 runCatching { targetFile.delete() }
                 withContext(Dispatchers.Main) { onDownloaded(null, VaultErrorMapper.mapCloudError(e)) }
@@ -1432,7 +1621,7 @@ class VaultViewModel(
     ) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                requireRealSession()
+                val querySessionId = requireRealSession()
                 val email = preferencesRepository.connectedGoogleAccount.first().trim()
                 if (email.isBlank()) {
                     withContext(Dispatchers.Main) { onResult(emptyList(), "Connect a Google account first.") }
@@ -1457,6 +1646,7 @@ class VaultViewModel(
                     val refreshed = GoogleDriveAuthHelper.requestOrFetchDriveAccessToken(context, email)
                     if (refreshed is GoogleDriveAuthHelper.DriveAuthState.Authorized) {
                         token = refreshed.accessToken
+                        requireRealSession(querySessionId)
                         res = googleDriveSyncManager.queryCloudBackups(token)
                     } else if (refreshed is GoogleDriveAuthHelper.DriveAuthState.NeedsConsent) {
                         withContext(Dispatchers.Main) {
@@ -1466,6 +1656,7 @@ class VaultViewModel(
                         return@launch
                     }
                 }
+                requireRealSession(querySessionId)
                 when (res) {
                     is GoogleDriveSyncManager.SyncResult.Success -> {
                         withContext(Dispatchers.Main) { onResult(res.data, null) }
@@ -1474,6 +1665,8 @@ class VaultViewModel(
                         withContext(Dispatchers.Main) { onResult(emptyList(), res.message) }
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) { onResult(emptyList(), VaultErrorMapper.mapCloudError(e)) }
             }
@@ -1547,8 +1740,9 @@ class VaultViewModel(
         totpTickerJob?.cancel()
         totpTickerJob = viewModelScope.launch {
             while (isActive) {
-                val rem = TotpEngine.getRemainingSeconds()
-                _uiState.update { it.copy(totpRemainingSeconds = rem) }
+                val epochSec = System.currentTimeMillis() / 1000L
+                val rem = TotpEngine.getRemainingSeconds(epochSeconds = epochSec, periodSeconds = 30)
+                _uiState.update { it.copy(totpRemainingSeconds = rem, totpEpochSeconds = epochSec) }
                 delay(1000L)
             }
         }
@@ -1920,9 +2114,17 @@ class VaultViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val success = repository.changeMasterPassword(currentPasswordChars, newPasswordChars)
+                if (success) {
+                    preferencesRepository.clearBiometricPreferences()
+                }
                 withContext(Dispatchers.Main) {
                     if (success) {
-                        _uiState.update { it.copy(isBiometricsConfigured = false) }
+                        _uiState.update {
+                            it.copy(
+                                isBiometricsConfigured = false,
+                                privacyMetrics = it.privacyMetrics.copy(isBiometricEnabled = false)
+                            )
+                        }
                         onComplete(true, null)
                     } else {
                         onComplete(false, "Current password is incorrect.")
@@ -2036,6 +2238,7 @@ class VaultViewModel(
 
     override fun onCleared() {
         super.onCleared()
+        clearVolatileThumbnailCache()
         cancelBackup()
         cancelRestore()
     }

@@ -121,4 +121,38 @@ class TotpEngineTest {
         assertEquals(30, p.periodSeconds)
         assertEquals(TotpAlgorithm.SHA1, p.algorithm)
     }
+
+    @Test
+    fun testLocaleIndependenceAndBoundsValidation() {
+        val prevLocale = java.util.Locale.getDefault()
+        try {
+            // Arabic-Indic locale must still output pure ASCII digits 0..9
+            java.util.Locale.setDefault(java.util.Locale.forLanguageTag("ar-EG"))
+            val code = TotpEngine.generateTotpCode(
+                secretBase32 = rfcBase32Secret,
+                epochSeconds = 59L,
+                periodSeconds = 30,
+                digits = 8,
+                algorithm = TotpAlgorithm.SHA1
+            )
+            assertEquals("94287082", code)
+            assertTrue(code.all { it in '0'..'9' })
+        } finally {
+            java.util.Locale.setDefault(prevLocale)
+        }
+
+        // Invalid period and digit counts must be rejected cleanly
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            TotpEngine.generateTotpCode(rfcBase32Secret, periodSeconds = 0)
+        }
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            TotpEngine.generateTotpCode(rfcBase32Secret, digits = 4)
+        }
+        org.junit.Assert.assertNull(
+            TotpEngine.parseOtpAuthUri("otpauth://totp/Test?secret=INVALID!@#&digits=6&period=30")
+        )
+        org.junit.Assert.assertNull(
+            TotpEngine.parseOtpAuthUri("otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&algorithm=MD5")
+        )
+    }
 }

@@ -83,7 +83,6 @@ import com.tpeditz.privatevault.v2.ui.PrimaryTab
 import com.tpeditz.privatevault.v2.ui.SecondaryDestination
 import com.tpeditz.privatevault.v2.ui.VaultViewModel
 import com.tpeditz.privatevault.v2.ui.screens.AboutScreen
-import com.tpeditz.privatevault.v2.ui.screens.AutofillSettingsScreen
 import com.tpeditz.privatevault.v2.ui.screens.BackupRestoreScreen
 import com.tpeditz.privatevault.v2.ui.screens.CloudBackupScreen
 import com.tpeditz.privatevault.v2.ui.screens.DocumentViewerScreen
@@ -329,10 +328,15 @@ class MainActivity : FragmentActivity() {
                 if (uri != null) {
                     val ins = runCatching { contentResolver.openInputStream(uri) }.getOrNull()
                     if (ins != null) {
-                        viewModel.importCsv(ins) { imported, skipped ->
+                        viewModel.importCsv(ins) { imported, skipped, err ->
                             scope.launch {
-                                snackbarHostState.showSnackbar("Imported $imported credentials ($skipped skipped)")
+                                val msg = err ?: "Imported $imported credentials ($skipped skipped)"
+                                snackbarHostState.showSnackbar(msg)
                             }
+                        }
+                    } else {
+                        scope.launch {
+                            snackbarHostState.showSnackbar("Unable to open the selected CSV file.")
                         }
                     }
                 }
@@ -441,9 +445,10 @@ class MainActivity : FragmentActivity() {
                                     onUnlockWithPassword = { chars, cb -> viewModel.unlockWithPassword(chars, cb) },
                                     onUnlockWithBiometric = {
                                         scope.launch {
-                                            val iv = viewModel.getBiometricIvForUnlock()
-                                            if (iv != null) {
-                                                val cipher = BiometricKeystoreManager.getDecryptCipherForUnlock(iv)
+                                            val unlockInfo = viewModel.getBiometricUnlockInfo()
+                                            if (unlockInfo != null) {
+                                                val (iv, alias) = unlockInfo
+                                                val cipher = BiometricKeystoreManager.getDecryptCipherForUnlock(iv, alias)
                                                 if (cipher != null) {
                                                     val prompt = BiometricPrompt(
                                                         this@MainActivity,
@@ -519,11 +524,6 @@ class MainActivity : FragmentActivity() {
                                             viewModel = viewModel,
                                             documentsList = uiState.documents,
                                             onDeleteDocument = { viewModel.deleteDocument(it) },
-                                            onBack = { viewModel.navigateBack() }
-                                        )
-                                    }
-                                    is SecondaryDestination.AutofillSettings -> {
-                                        AutofillSettingsScreen(
                                             onBack = { viewModel.navigateBack() }
                                         )
                                     }
@@ -718,32 +718,47 @@ class MainActivity : FragmentActivity() {
                                             onSetAutoLockTimeout = { viewModel.setAutoLockTimeout(it) },
                                             onSetClipboardTtl = { viewModel.setClipboardTtl(it) },
                                             onEnableBiometrics = {
-                                                val cipher = if (viewModel.canEnrollBiometrics()) BiometricKeystoreManager.getEncryptCipherForEnrollment() else null
-                                                if (cipher != null) {
-                                                    val prompt = BiometricPrompt(
-                                                        this@MainActivity,
-                                                        ContextCompat.getMainExecutor(this@MainActivity),
-                                                        object : BiometricPrompt.AuthenticationCallback() {
-                                                            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                                                                val authCipher = result.cryptoObject?.cipher ?: cipher
-                                                                scope.launch {
-                                                                    val ok = runCatching { viewModel.enrollBiometrics(authCipher) }.getOrDefault(false)
-                                                                    snackbarHostState.showSnackbar(if (ok) "Biometric quick-unlock enrolled" else "Enrollment failed")
+                                                scope.launch {
+                                                    val staged = if (viewModel.canEnrollBiometrics()) {
+                                                        BiometricKeystoreManager.getEncryptCipherForStagedEnrollment(
+                                                            viewModel.getActiveBiometricAlias()
+                                                        )
+                                                    } else null
+                                                    if (staged != null) {
+                                                        val prompt = BiometricPrompt(
+                                                            this@MainActivity,
+                                                            ContextCompat.getMainExecutor(this@MainActivity),
+                                                            object : BiometricPrompt.AuthenticationCallback() {
+                                                                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                                                                    val authCipher = result.cryptoObject?.cipher ?: staged.cipher
+                                                                    scope.launch {
+                                                                        val ok = viewModel.enrollBiometrics(authCipher, staged.targetAlias)
+                                                                        snackbarHostState.showSnackbar(if (ok) "Biometric quick-unlock enrolled" else "Enrollment failed")
+                                                                    }
+                                                                }
+                                                                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                                                                    BiometricKeystoreManager.discardStagedAlias(staged.targetAlias)
+                                                                    val cancelled = errorCode == BiometricPrompt.ERROR_USER_CANCELED ||
+                                                                        errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON ||
+                                                                        errorCode == BiometricPrompt.ERROR_CANCELED
+                                                                    val msg = if (cancelled) {
+                                                                        "Biometric setup cancelled. Previous settings unchanged."
+                                                                    } else {
+                                                                        "Biometric error: $errString"
+                                                                    }
+                                                                    scope.launch { snackbarHostState.showSnackbar(msg) }
                                                                 }
                                                             }
-                                                            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                                                                scope.launch { snackbarHostState.showSnackbar("Biometric error: $errString") }
-                                                            }
-                                                        }
-                                                    )
-                                                    val promptInfo = BiometricPrompt.PromptInfo.Builder()
-                                                        .setTitle("Enroll Biometric Quick-Unlock")
-                                                        .setSubtitle("Confirm your biometric identity to protect your vault")
-                                                        .setNegativeButtonText("Cancel")
-                                                        .build()
-                                                    prompt.authenticate(promptInfo, BiometricPrompt.CryptoObject(cipher))
-                                                } else {
-                                                    scope.launch { snackbarHostState.showSnackbar("Biometric enrollment cipher unavailable") }
+                                                        )
+                                                        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+                                                            .setTitle("Enroll Biometric Quick-Unlock")
+                                                            .setSubtitle("Confirm your biometric identity to protect your vault")
+                                                            .setNegativeButtonText("Cancel")
+                                                            .build()
+                                                        prompt.authenticate(promptInfo, BiometricPrompt.CryptoObject(staged.cipher))
+                                                    } else {
+                                                        snackbarHostState.showSnackbar("Biometric enrollment cipher unavailable")
+                                                    }
                                                 }
                                             },
                                             onDisableBiometrics = { viewModel.disableBiometrics() },
@@ -841,7 +856,8 @@ class MainActivity : FragmentActivity() {
                                                 onDeleteDocument = { viewModel.deleteDocument(it) },
                                                 onDeleteLink = { viewModel.deleteLink(it) },
                                                 onCreateAlbum = { viewModel.createAlbum(it) },
-                                                onDeleteAlbum = { viewModel.deleteAlbum(it) }
+                                                onDeleteAlbum = { viewModel.deleteAlbum(it) },
+                                                onLoadThumbnail = { media -> viewModel.loadDecryptedThumbnailBytes(media) }
                                             )
                                             PrimaryTab.SETTINGS -> SettingsScreen(
                                                 uiState = uiState,
@@ -852,7 +868,6 @@ class MainActivity : FragmentActivity() {
                                             )
                                         }
                                     }
-                                    else -> {}
                                 }
                             }
                         }

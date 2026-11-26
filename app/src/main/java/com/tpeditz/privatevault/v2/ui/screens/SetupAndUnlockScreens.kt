@@ -9,11 +9,16 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Lock
@@ -39,7 +44,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
@@ -63,6 +72,28 @@ fun SetupVaultScreen(
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
     val strength = remember(password) { OfflinePasswordStrengthEstimator.evaluate(password) }
+    val focusManager = LocalFocusManager.current
+    val submitSetup: () -> Unit = {
+        val policy = PasswordPolicy.validateNewPassword(password, confirmPassword, "Master password")
+        if (!policy.isValid) {
+            errorMessage = policy.errorMessage
+        } else {
+            val chars = password.toCharArray()
+            if (pendingRestorePayload != null) {
+                onCreateVaultWithRestore(chars) { success, err ->
+                    if (!success) {
+                        errorMessage = err ?: "Could not initialize vault and restore backup."
+                    }
+                }
+            } else {
+                onCreateVault(chars) { success, err ->
+                    if (!success) {
+                        errorMessage = err ?: "Could not initialize vault."
+                    }
+                }
+            }
+        }
+    }
 
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -71,7 +102,9 @@ fun SetupVaultScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(24.dp),
+                .verticalScroll(rememberScrollState())
+                .imePadding()
+                .padding(horizontal = 24.dp, vertical = 20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
@@ -137,12 +170,23 @@ fun SetupVaultScreen(
                     password = it
                     errorMessage = null
                 },
-                label = { Text("Master Password") },
+                label = { Text("Master Password (12+ chars)") },
                 singleLine = true,
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Password,
+                    autoCorrectEnabled = false,
+                    imeAction = ImeAction.Next
+                ),
+                keyboardActions = KeyboardActions(
+                    onNext = { focusManager.moveFocus(FocusDirection.Down) }
+                ),
                 visualTransformation = if (isPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
                 trailingIcon = {
                     IconButton(onClick = { isPasswordVisible = !isPasswordVisible }) {
-                        Icon(if (isPasswordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility, contentDescription = null)
+                        Icon(
+                            imageVector = if (isPasswordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                            contentDescription = if (isPasswordVisible) "Hide password" else "Show password"
+                        )
                     }
                 },
                 modifier = Modifier.fillMaxWidth()
@@ -189,6 +233,17 @@ fun SetupVaultScreen(
                 },
                 label = { Text("Confirm Master Password") },
                 singleLine = true,
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Password,
+                    autoCorrectEnabled = false,
+                    imeAction = ImeAction.Done
+                ),
+                keyboardActions = KeyboardActions(
+                    onDone = {
+                        focusManager.clearFocus()
+                        if (!isLoading) submitSetup()
+                    }
+                ),
                 visualTransformation = if (isPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
                 modifier = Modifier.fillMaxWidth()
             )
@@ -205,34 +260,14 @@ fun SetupVaultScreen(
             Spacer(modifier = Modifier.height(24.dp))
 
             Button(
-                onClick = {
-                    val policy = PasswordPolicy.validateNewPassword(password, confirmPassword, "Master password")
-                    if (!policy.isValid) {
-                        errorMessage = policy.errorMessage
-                    } else {
-                        val chars = password.toCharArray()
-                        if (pendingRestorePayload != null) {
-                            onCreateVaultWithRestore(chars) { success, err ->
-                                if (!success) {
-                                    errorMessage = err ?: "Could not initialize vault and restore backup."
-                                }
-                            }
-                        } else {
-                            onCreateVault(chars) { success, err ->
-                                if (!success) {
-                                    errorMessage = err ?: "Could not initialize vault."
-                                }
-                            }
-                        }
-                    }
-                },
+                onClick = submitSetup,
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !isLoading
             ) {
                 if (isLoading) {
                     CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                 } else {
-                    Text(if (pendingRestorePayload != null) "Restore & Unlock Vault" else "Create Vault")
+                    Text(if (pendingRestorePayload != null) "Restore & Unlock Vault" else "Create Encrypted Vault")
                 }
             }
 
@@ -268,6 +303,18 @@ fun UnlockVaultScreen(
     var isPasswordVisible by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
+    val focusManager = LocalFocusManager.current
+    val submitUnlock: () -> Unit = {
+        if (password.isNotEmpty()) {
+            val chars = password.toCharArray()
+            onUnlockWithPassword(chars) { success, err ->
+                if (!success) {
+                    errorMessage = err ?: "Incorrect password"
+                }
+            }
+        }
+    }
+
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background
@@ -275,7 +322,9 @@ fun UnlockVaultScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(24.dp),
+                .verticalScroll(rememberScrollState())
+                .imePadding()
+                .padding(horizontal = 24.dp, vertical = 20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
@@ -317,10 +366,24 @@ fun UnlockVaultScreen(
                 },
                 label = { Text("Vault Password") },
                 singleLine = true,
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Password,
+                    autoCorrectEnabled = false,
+                    imeAction = ImeAction.Done
+                ),
+                keyboardActions = KeyboardActions(
+                    onDone = {
+                        focusManager.clearFocus()
+                        if (!isLoading) submitUnlock()
+                    }
+                ),
                 visualTransformation = if (isPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
                 trailingIcon = {
                     IconButton(onClick = { isPasswordVisible = !isPasswordVisible }) {
-                        Icon(if (isPasswordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility, contentDescription = null)
+                        Icon(
+                            imageVector = if (isPasswordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                            contentDescription = if (isPasswordVisible) "Hide password" else "Show password"
+                        )
                     }
                 },
                 modifier = Modifier.fillMaxWidth()
@@ -338,16 +401,7 @@ fun UnlockVaultScreen(
             Spacer(modifier = Modifier.height(20.dp))
 
             Button(
-                onClick = {
-                    if (password.isNotEmpty()) {
-                        val chars = password.toCharArray()
-                        onUnlockWithPassword(chars) { success, err ->
-                            if (!success) {
-                                errorMessage = err ?: "Incorrect password"
-                            }
-                        }
-                    }
-                },
+                onClick = submitUnlock,
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !isLoading
             ) {

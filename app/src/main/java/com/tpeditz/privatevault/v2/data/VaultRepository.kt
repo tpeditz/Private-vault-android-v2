@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import com.tpeditz.privatevault.v2.security.BiometricKeystoreManager
 import com.tpeditz.privatevault.v2.security.CryptoEngine
@@ -13,6 +14,8 @@ import com.tpeditz.privatevault.v2.security.SafeVaultLogger
 import com.tpeditz.privatevault.v2.security.StreamingMediaCryptoEngine
 import com.tpeditz.privatevault.v2.security.VaultSessionManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -30,6 +33,7 @@ import java.io.OutputStream
 import java.io.Reader
 import java.nio.charset.StandardCharsets
 import java.util.Arrays
+import java.util.Locale
 import java.util.concurrent.CancellationException
 import org.bouncycastle.util.encoders.Base64
 import java.util.UUID
@@ -468,6 +472,11 @@ class VaultRepository(
         realEnv?.biometricNonce
     }
 
+    suspend fun getBiometricNonceSha256Hex(): String? = withContext(Dispatchers.IO) {
+        val nonce = dao.getEnvelopeForSlot(VaultSessionManager.REAL_SLOT)?.biometricNonce ?: return@withContext null
+        BiometricKeystoreManager.nonceSha256Hex(nonce)
+    }
+
     /**
      * Unlocks Slot 0 using Android Keystore wrapped biometric key.
      */
@@ -502,37 +511,49 @@ class VaultRepository(
     }
 
     /**
-     * Enrolls biometrics for Slot 0.
+     * Enrolls biometrics for Slot 0, invoking [beforeDbWrite] with the SHA-256 hex digest of the
+     * newly generated GCM IV strictly before committing the wrapped DEK to SQLite.
      */
-    suspend fun enrollBiometricKey(cipher: Cipher): Boolean = withContext(Dispatchers.IO) {
-        val session = sessionManager.requireUnlockedSession()
-        require(session.slotId == VaultSessionManager.REAL_SLOT && !session.isDecoyConfiguredInRealVault) {
-            "Biometrics are unavailable for this vault configuration."
-        }
+    suspend fun enrollBiometricKey(
+        cipher: Cipher,
+        beforeDbWrite: suspend (nonceSha256Hex: String) -> Unit = {}
+    ): Boolean = withContext(Dispatchers.IO) {
+        vaultMutationMutex.withLock {
+            val session = sessionManager.requireUnlockedSession()
+            require(session.slotId == VaultSessionManager.REAL_SLOT && !session.isDecoyConfiguredInRealVault) {
+                "Biometrics are unavailable for this vault configuration."
+            }
 
-        val realEnv = dao.getEnvelopeForSlot(VaultSessionManager.REAL_SLOT) ?: return@withContext false
-        val dek = session.borrowDekCopy()
-        try {
-            val wrapped = BiometricKeystoreManager.wrapDekWithCipher(cipher, dek)
-            val updated = realEnv.copy(
-                biometricNonce = wrapped.iv,
-                biometricWrappedDek = wrapped.ciphertext
-            )
-            dao.upsertEnvelope(updated)
-            true
-        } finally {
-            Arrays.fill(dek, 0.toByte())
+            val realEnv = dao.getEnvelopeForSlot(VaultSessionManager.REAL_SLOT) ?: return@withLock false
+            val dek = session.borrowDekCopy()
+            try {
+                val wrapped = BiometricKeystoreManager.wrapDekWithCipher(cipher, dek)
+                val nonceSha256 = BiometricKeystoreManager.nonceSha256Hex(wrapped.iv)
+                beforeDbWrite(nonceSha256)
+                val updated = realEnv.copy(
+                    biometricNonce = wrapped.iv,
+                    biometricWrappedDek = wrapped.ciphertext
+                )
+                dao.upsertEnvelope(updated)
+                true
+            } finally {
+                Arrays.fill(dek, 0.toByte())
+            }
         }
     }
 
     suspend fun disableBiometricKey(): Unit = withContext(Dispatchers.IO) {
-        BiometricKeystoreManager.deleteBiometricKey()
-        val realEnv = dao.getEnvelopeForSlot(VaultSessionManager.REAL_SLOT) ?: return@withContext
-        val updated = realEnv.copy(
-            biometricNonce = null,
-            biometricWrappedDek = null
-        )
-        dao.upsertEnvelope(updated)
+        vaultMutationMutex.withLock {
+            val realEnv = dao.getEnvelopeForSlot(VaultSessionManager.REAL_SLOT)
+            if (realEnv != null) {
+                val updated = realEnv.copy(
+                    biometricNonce = null,
+                    biometricWrappedDek = null
+                )
+                dao.upsertEnvelope(updated)
+            }
+            BiometricKeystoreManager.deleteBiometricKey()
+        }
     }
 
     /**
@@ -595,7 +616,6 @@ class VaultRepository(
                 biometricNonce = null,
                 biometricWrappedDek = null
             )
-            BiometricKeystoreManager.deleteBiometricKey()
 
             // Provision Slot 1 (Decoy)
             val decoyParams = CryptoEngine.KdfParams()
@@ -672,6 +692,7 @@ class VaultRepository(
                 decoySlotId = VaultSessionManager.DECOY_SLOT,
                 seedRecords = seedRecords
             )
+            BiometricKeystoreManager.deleteBiometricKey()
             sessionManager.refreshRealDecoyPolicy(activeSession.sessionId, true)
             true
             }
@@ -755,12 +776,36 @@ class VaultRepository(
                 wrappedPayloadCiphertext = wrappedDecoy
             )
 
+            val decoyMediaFiles = dao.getAllMediaFileEntitiesForSlot(VaultSessionManager.DECOY_SLOT)
+            val decoyDocFiles = dao.getAllDocumentFileEntitiesForSlot(VaultSessionManager.DECOY_SLOT)
+            val candidateObsoleteDecoyFiles = buildList<File> {
+                decoyMediaFiles.forEach { entity ->
+                    runCatching { VaultFileSafety.requireWithin(filesDir, File(filesDir, entity.relativeMediaPath)) }.getOrNull()?.let { add(it) }
+                    runCatching { VaultFileSafety.requireWithin(filesDir, File(filesDir, entity.relativeThumbPath)) }.getOrNull()?.let { add(it) }
+                }
+                decoyDocFiles.forEach { entity ->
+                    runCatching { VaultFileSafety.requireWithin(filesDir, File(filesDir, entity.relativeFilePath)) }.getOrNull()?.let { add(it) }
+                }
+            }
+
             dao.disableDecoyAtomically(
                 updatedRealEnvelope = updatedRealEnv,
                 dummyDecoyEnvelope = updatedDecoyEnv,
                 decoySlotId = VaultSessionManager.DECOY_SLOT
             )
             sessionManager.refreshRealDecoyPolicy(activeSession.sessionId, false)
+
+            // Clean orphaned Slot 1 ciphertext files only after the atomic DB commit succeeds,
+            // strictly protecting any path referenced by Slot 0.
+            runCatching {
+                val authoritativePaths = getAuthoritativeReferencedCanonicalPaths()
+                for (obsolete in candidateObsoleteDecoyFiles) {
+                    val canon = runCatching { obsolete.canonicalPath }.getOrNull()
+                    if (obsolete.exists() && canon != null && !authoritativePaths.contains(canon)) {
+                        obsolete.delete()
+                    }
+                }
+            }
             true
             }
         }
@@ -828,8 +873,8 @@ class VaultRepository(
                 biometricNonce = null,
                 biometricWrappedDek = null
             )
-            BiometricKeystoreManager.deleteBiometricKey()
             dao.upsertEnvelope(updatedRealEnv)
+            BiometricKeystoreManager.deleteBiometricKey()
             true
             }
         }
@@ -1320,6 +1365,7 @@ class VaultRepository(
 
     suspend fun loadDecryptedPhotoBytes(mediaRecord: MediaRecord): ByteArray = withContext(Dispatchers.IO) {
         val session = sessionManager.requireUnlockedSession()
+        val initialSessionId = session.sessionId
         val mediaEntity = dao.getMediaFileEntity(session.slotId, mediaRecord.id)
         val mediaFile = if (mediaEntity != null) {
             File(filesDir, mediaEntity.relativeMediaPath)
@@ -1331,12 +1377,19 @@ class VaultRepository(
         require(mediaFile.exists()) { "Encrypted media file not found on disk." }
         val fileMediaKey = Base64.decode(mediaRecord.fileMediaKeyBase64)
         try {
-            StreamingMediaCryptoEngine.decryptEntireMediaFile(
+            currentCoroutineContext().ensureActive()
+            val plain = StreamingMediaCryptoEngine.decryptEntireMediaFile(
                 encryptedFile = mediaFile,
                 mediaId = mediaRecord.id,
                 vaultSlot = session.slotId,
                 fileMediaKey = fileMediaKey
             )
+            val active = sessionManager.getActiveSession()
+            if (active == null || active.sessionId != initialSessionId || active.isWiped) {
+                Arrays.fill(plain, 0.toByte())
+                throw IllegalStateException("Vault session changed or locked.")
+            }
+            plain
         } finally {
             Arrays.fill(fileMediaKey, 0.toByte())
         }
@@ -1368,6 +1421,7 @@ class VaultRepository(
 
     suspend fun loadDecryptedThumbnailBytes(mediaRecord: MediaRecord): ByteArray = withContext(Dispatchers.IO) {
         val session = sessionManager.requireUnlockedSession()
+        val initialSessionId = session.sessionId
         val mediaEntity = dao.getMediaFileEntity(session.slotId, mediaRecord.id)
         val thumbFile = if (mediaEntity != null) {
             File(filesDir, mediaEntity.relativeThumbPath)
@@ -1377,9 +1431,10 @@ class VaultRepository(
         require(thumbFile.exists()) { "Encrypted thumbnail file not found on disk." }
         val thumbKey = Base64.decode(mediaRecord.thumbnailKeyBase64)
         try {
+            currentCoroutineContext().ensureActive()
             val raw = thumbFile.readBytes()
             val magic = "PVM1".toByteArray(StandardCharsets.US_ASCII)
-            if (raw.size >= 32 && raw.copyOfRange(0, 4).contentEquals(magic)) {
+            val plain = if (raw.size >= 32 && raw.copyOfRange(0, 4).contentEquals(magic)) {
                 StreamingMediaCryptoEngine.decryptEntireMediaFile(
                     encryptedFile = thumbFile,
                     mediaId = mediaRecord.id,
@@ -1394,6 +1449,12 @@ class VaultRepository(
                     thumbKey = thumbKey
                 )
             }
+            val active = sessionManager.getActiveSession()
+            if (active == null || active.sessionId != initialSessionId || active.isWiped) {
+                Arrays.fill(plain, 0.toByte())
+                throw IllegalStateException("Vault session changed or locked.")
+            }
+            plain
         } finally {
             Arrays.fill(thumbKey, 0.toByte())
         }
@@ -1401,6 +1462,7 @@ class VaultRepository(
 
     suspend fun loadDecryptedDocumentBytes(documentRecord: DocumentRecord): ByteArray = withContext(Dispatchers.IO) {
         val session = sessionManager.requireUnlockedSession()
+        val initialSessionId = session.sessionId
         val docEntity = dao.getDocumentFileEntity(session.slotId, documentRecord.id)
         val docFile = if (docEntity != null) {
             File(filesDir, docEntity.relativeFilePath)
@@ -1410,12 +1472,104 @@ class VaultRepository(
         require(docFile.exists()) { "Encrypted document file not found on disk." }
         val fileKey = Base64.decode(documentRecord.fileKeyBase64)
         try {
-            StreamingMediaCryptoEngine.decryptEntireMediaFile(
+            currentCoroutineContext().ensureActive()
+            val plain = StreamingMediaCryptoEngine.decryptEntireMediaFile(
                 encryptedFile = docFile,
                 mediaId = documentRecord.id,
                 vaultSlot = session.slotId,
                 fileMediaKey = fileKey
             )
+            val active = sessionManager.getActiveSession()
+            if (active == null || active.sessionId != initialSessionId || active.isWiped) {
+                Arrays.fill(plain, 0.toByte())
+                throw IllegalStateException("Vault session changed or locked.")
+            }
+            plain
+        } finally {
+            Arrays.fill(fileKey, 0.toByte())
+        }
+    }
+
+    /**
+     * Streams at most `maxPreviewBytes` of an encrypted document for inline viewer previews
+     * without loading huge files into memory.
+     */
+    suspend fun loadDecryptedDocumentPreviewBytes(
+        documentRecord: DocumentRecord,
+        maxPreviewBytes: Int = 2 * 1024 * 1024
+    ): ByteArray = withContext(Dispatchers.IO) {
+        val session = sessionManager.requireUnlockedSession()
+        val initialSessionId = session.sessionId
+        val docEntity = dao.getDocumentFileEntity(session.slotId, documentRecord.id)
+        val docFile = if (docEntity != null) {
+            File(filesDir, docEntity.relativeFilePath)
+        } else {
+            File(filesDir, "documents/${documentRecord.id}.pvdoc")
+        }
+        require(docFile.exists()) { "Encrypted document file not found on disk." }
+        val fileKey = Base64.decode(documentRecord.fileKeyBase64)
+        val out = java.io.ByteArrayOutputStream()
+        try {
+            currentCoroutineContext().ensureActive()
+            StreamingMediaCryptoEngine.decryptMediaFileToStream(
+                encryptedFile = docFile,
+                outputStream = out,
+                mediaId = documentRecord.id,
+                vaultSlot = session.slotId,
+                fileMediaKey = fileKey,
+                maxPlaintextBytes = maxPreviewBytes.toLong()
+            )
+            val bytes = out.toByteArray()
+            val active = sessionManager.getActiveSession()
+            if (active == null || active.sessionId != initialSessionId || active.isWiped) {
+                Arrays.fill(bytes, 0.toByte())
+                throw IllegalStateException("Vault session changed or locked.")
+            }
+            bytes
+        } finally {
+            Arrays.fill(fileKey, 0.toByte())
+        }
+    }
+
+    /**
+     * Streams all decrypted chunks directly into a user-selected `OutputStream`, keeping only
+     * a single 256 KiB chunk in RAM at any moment.
+     */
+    suspend fun exportDecryptedDocumentToStream(
+        documentRecord: DocumentRecord,
+        outputStream: OutputStream,
+        expectedSessionId: Long? = null,
+        isCancelled: () -> Boolean = { false }
+    ): Long = withContext(Dispatchers.IO) {
+        val session = sessionManager.requireUnlockedSession()
+        require(expectedSessionId == null || session.sessionId == expectedSessionId) { "Vault session changed." }
+        val callerContext = currentCoroutineContext()
+        val docEntity = dao.getDocumentFileEntity(session.slotId, documentRecord.id)
+        val docFile = if (docEntity != null) {
+            File(filesDir, docEntity.relativeFilePath)
+        } else {
+            File(filesDir, "documents/${documentRecord.id}.pvdoc")
+        }
+        require(docFile.exists()) { "Encrypted document file not found on disk." }
+        val fileKey = Base64.decode(documentRecord.fileKeyBase64)
+        try {
+            val written = StreamingMediaCryptoEngine.decryptMediaFileToStream(
+                encryptedFile = docFile,
+                outputStream = outputStream,
+                mediaId = documentRecord.id,
+                vaultSlot = session.slotId,
+                fileMediaKey = fileKey,
+                isCancelled = {
+                    val active = sessionManager.getActiveSession()
+                    val coroutineActive = callerContext[kotlinx.coroutines.Job]?.isCancelled != true
+                    isCancelled() || !coroutineActive || active == null || active.sessionId != session.sessionId || active.isWiped
+                }
+            )
+            val postActive = sessionManager.getActiveSession()
+            require(postActive != null && postActive.sessionId == session.sessionId && !postActive.isWiped) {
+                "Vault session changed."
+            }
+            written
         } finally {
             Arrays.fill(fileKey, 0.toByte())
         }
@@ -1472,16 +1626,37 @@ class VaultRepository(
 
     /**
      * Imports credentials from a user-supplied CSV file via Storage Access Framework, adhering strictly
-     * to RFC 4180 parsing with multiline quoted strings and without destructive formula stripping.
+     * to RFC 4180 parsing with exact credential preservation, resource-cap rejection instead of silent
+     * truncation, session consistency, and atomic batch persistence.
      */
-    suspend fun importCredentialsFromCsv(inputStream: InputStream): Pair<Int, Int> = withContext(Dispatchers.IO) {
+    suspend fun importCredentialsFromCsv(
+        inputStream: InputStream,
+        expectedSessionId: Long? = null
+    ): Pair<Int, Int> = withContext(Dispatchers.IO) {
         vaultMutationMutex.withLock {
-        val session = sessionManager.requireUnlockedSession()
-        var importedCount = 0
-        var skippedCount = 0
+            val session = sessionManager.requireUnlockedSession()
+            val initialSessionId = session.sessionId
+            require(expectedSessionId == null || initialSessionId == expectedSessionId) { "Vault session changed." }
+            require(!session.isWiped) { "Vault session is invalid or wiped." }
+            val targetSlot = session.slotId
 
-        BufferedReader(InputStreamReader(inputStream, StandardCharsets.UTF_8)).use { reader ->
-            val rows = parseRfc4180Csv(reader)
+            fun requireCsvSessionValid() {
+                val active = sessionManager.getActiveSession()
+                require(active != null && active.sessionId == initialSessionId && active.slotId == targetSlot && !active.isWiped) {
+                    "Vault session changed or locked during CSV import."
+                }
+            }
+
+            var importedCount = 0
+            var skippedCount = 0
+            val callerContext = currentCoroutineContext()
+
+            val rows = BufferedReader(InputStreamReader(inputStream, StandardCharsets.UTF_8)).use { reader ->
+                parseRfc4180Csv(reader) {
+                    callerContext.ensureActive()
+                    requireCsvSessionValid()
+                }
+            }
             if (rows.isEmpty()) return@withLock Pair(0, 0)
 
             val headers = rows.first()
@@ -1493,63 +1668,162 @@ class VaultRepository(
             var folderIdx = -1
 
             headers.forEachIndexed { index, rawHeader ->
-                val h = rawHeader.trim().removePrefix("\uFEFF").lowercase()
+                val h = rawHeader.trim().removePrefix("\uFEFF").lowercase(Locale.US)
                 when {
-                    h.contains("username") || h.contains("login") || h.contains("email") || h.contains("user") -> if (userIdx == -1) userIdx = index
-                    h.contains("title") || h.contains("service") || h == "name" -> if (titleIdx == -1) titleIdx = index
-                    h.contains("password") || h.contains("pass") -> if (pwdIdx == -1) pwdIdx = index
-                    h.contains("url") || h.contains("website") || h.contains("uri") -> if (urlIdx == -1) urlIdx = index
-                    h.contains("note") || h.contains("comment") -> if (notesIdx == -1) notesIdx = index
-                    h.contains("folder") || h.contains("category") -> if (folderIdx == -1) folderIdx = index
+                    h.contains("url") || h.contains("website") || h.contains("uri") || h == "origin" ->
+                        if (urlIdx == -1) urlIdx = index
+                    h.contains("password") || h == "pass" || h.endsWith("_pass") ->
+                        if (pwdIdx == -1) pwdIdx = index
+                    h.contains("username") || h.contains("email") || h.contains("user") || h == "login" || h.startsWith("login_user") ->
+                        if (userIdx == -1) userIdx = index
+                    h.contains("title") || h.contains("service") || h == "name" || h == "site_name" ->
+                        if (titleIdx == -1) titleIdx = index
+                    h.contains("note") || h.contains("comment") || h == "extra" ->
+                        if (notesIdx == -1) notesIdx = index
+                    h.contains("folder") || h.contains("category") || h == "grouping" ->
+                        if (folderIdx == -1) folderIdx = index
                 }
             }
 
             if (pwdIdx == -1 && userIdx == -1) {
-                // Invalid or unsupported CSV header
-                return@withLock Pair(0, 0)
+                throw IllegalArgumentException("Unsupported CSV header: expected username or password columns.")
             }
 
-            for (rowIndex in 1 until rows.size) {
-                val row = rows[rowIndex]
-                if (row.isEmpty() || row.all { it.isBlank() }) continue
-
-                val title = if (titleIdx in row.indices) row[titleIdx].trim() else "Imported Credential"
-                val username = if (userIdx in row.indices) row[userIdx].trim() else ""
-                val password = if (pwdIdx in row.indices) row[pwdIdx] else ""
-                val url = if (urlIdx in row.indices) row[urlIdx].trim() else ""
-                val notes = if (notesIdx in row.indices) row[notesIdx] else ""
-                val folderName = if (folderIdx in row.indices) row[folderIdx].trim().ifBlank { VaultFolder.DEFAULT_FOLDER_NAME } else VaultFolder.DEFAULT_FOLDER_NAME
-
-                if (password.isBlank() && username.isBlank()) {
-                    skippedCount++
-                    continue
+            requireCsvSessionValid()
+            val existingFingerprints = getAllItemsForActiveSlot(initialSessionId)
+                .filterIsInstance<CredentialRecord>()
+                .filter { !it.isTrashed }
+                .mapTo(HashSet()) { c ->
+                    "${c.serviceName.lowercase(Locale.US)}|${c.username}|${c.websiteUrl}|${c.password}"
                 }
 
-                val cred = CredentialRecord(
-                    serviceName = title.ifBlank { "Credential" },
-                    username = username,
-                    password = password,
-                    websiteUrl = url,
-                    notes = notes,
-                    folderName = folderName
-                )
-                saveItemLocked(cred)
-                importedCount++
+            val entitiesToInsert = ArrayList<EncryptedRecordEntity>(rows.size.coerceAtMost(256))
+            val dek = session.borrowDekCopy()
+            try {
+                for (rowIndex in 1 until rows.size) {
+                    callerContext.ensureActive()
+                    requireCsvSessionValid()
+
+                    val row = rows[rowIndex]
+                    if (row.isEmpty() || row.all { it.isEmpty() }) continue
+
+                    // Preserve exact credential values (quotes, spaces, multiline values, Unicode) with zero silent truncation.
+                    val rawTitle = if (titleIdx in row.indices) row[titleIdx] else ""
+                    val username = if (userIdx in row.indices) row[userIdx] else ""
+                    val password = if (pwdIdx in row.indices) row[pwdIdx] else ""
+                    val url = if (urlIdx in row.indices) row[urlIdx] else ""
+                    val notes = if (notesIdx in row.indices) row[notesIdx] else ""
+                    val folderName = if (folderIdx in row.indices) {
+                        row[folderIdx].trim().ifBlank { VaultFolder.DEFAULT_FOLDER_NAME }
+                    } else {
+                        VaultFolder.DEFAULT_FOLDER_NAME
+                    }
+
+                    if (password.isEmpty() && username.isEmpty() && url.isBlank() && rawTitle.isBlank()) {
+                        continue
+                    }
+                    if (password.isBlank() && username.isBlank()) {
+                        skippedCount++
+                        continue
+                    }
+
+                    val resolvedTitle = if (rawTitle.isBlank()) {
+                        url.trim().removePrefix("https://").removePrefix("http://").substringBefore("/").ifBlank { "Credential" }
+                    } else {
+                        rawTitle
+                    }
+                    val fingerprint = "${resolvedTitle.lowercase(Locale.US)}|$username|$url|$password"
+                    if (!existingFingerprints.add(fingerprint)) {
+                        skippedCount++
+                        continue
+                    }
+
+                    val cred = CredentialRecord(
+                        serviceName = resolvedTitle,
+                        username = username,
+                        password = password,
+                        websiteUrl = url,
+                        notes = notes,
+                        folderName = folderName
+                    )
+                    val encoded = VaultRecordCodec.encode(cred)
+                    val nonce = CryptoEngine.generateNonce()
+                    val aad = CryptoEngine.buildRecordAad(targetSlot, cred.id)
+                    val ciphertext = try {
+                        CryptoEngine.encryptAesGcm(
+                            keyBytes = dek,
+                            nonce = nonce,
+                            plaintext = encoded,
+                            aad = aad
+                        )
+                    } finally {
+                        Arrays.fill(encoded, 0.toByte())
+                    }
+                    entitiesToInsert.add(
+                        EncryptedRecordEntity(
+                            recordId = cred.id,
+                            vaultSlot = targetSlot,
+                            schemaVersion = CryptoEngine.RECORD_SCHEMA_VERSION,
+                            nonce = nonce,
+                            ciphertext = ciphertext
+                        )
+                    )
+                    importedCount++
+                }
+
+                callerContext.ensureActive()
+                requireCsvSessionValid()
+                if (entitiesToInsert.isNotEmpty()) {
+                    runInTransaction {
+                        callerContext.ensureActive()
+                        requireCsvSessionValid()
+                        dao.upsertRecords(entitiesToInsert)
+                    }
+                }
+            } finally {
+                Arrays.fill(dek, 0.toByte())
             }
-        }
-        Pair(importedCount, skippedCount)
+            Pair(importedCount, skippedCount)
         }
     }
 
-    private fun parseRfc4180Csv(reader: Reader): List<List<String>> {
+    private fun parseRfc4180Csv(
+        reader: Reader,
+        checkActive: () -> Unit = {}
+    ): List<List<String>> {
+        val maxCsvChars = 5 * 1024 * 1024
+        val maxCsvRows = 10_000
+        val maxFieldChars = 16_384
+        var totalCharsRead = 0
         val records = mutableListOf<List<String>>()
         val currentRecord = mutableListOf<String>()
         val currentField = StringBuilder()
         var inQuotes = false
 
+        fun appendChar(ch: Char) {
+            if (currentField.length >= maxFieldChars) {
+                throw IllegalArgumentException("CSV field exceeds maximum supported length ($maxFieldChars characters).")
+            }
+            currentField.append(ch)
+        }
+
+        fun commitRow() {
+            if (records.size >= maxCsvRows) {
+                throw IllegalArgumentException("CSV file exceeds maximum supported row limit ($maxCsvRows rows).")
+            }
+            records.add(currentRecord.toList())
+            currentRecord.clear()
+            checkActive()
+        }
+
         while (true) {
             val ch = reader.read()
             if (ch == -1) break
+            totalCharsRead++
+            require(totalCharsRead <= maxCsvChars) { "CSV file exceeds maximum supported import size." }
+            if ((totalCharsRead and 4095) == 0) {
+                checkActive()
+            }
             val c = ch.toChar()
 
             if (inQuotes) {
@@ -1557,18 +1831,24 @@ class VaultRepository(
                     reader.mark(1)
                     val nextCh = reader.read()
                     if (nextCh == '\"'.code) {
-                        currentField.append('\"')
+                        totalCharsRead++
+                        require(totalCharsRead <= maxCsvChars) { "CSV file exceeds maximum supported import size." }
+                        appendChar('\"')
                     } else {
                         inQuotes = false
                         if (nextCh != -1) reader.reset()
                     }
                 } else {
-                    currentField.append(c)
+                    appendChar(c)
                 }
             } else {
                 when (c) {
                     '\"' -> {
-                        inQuotes = true
+                        if (currentField.isEmpty()) {
+                            inQuotes = true
+                        } else {
+                            appendChar(c)
+                        }
                     }
                     ',' -> {
                         currentRecord.add(currentField.toString())
@@ -1579,32 +1859,36 @@ class VaultRepository(
                         val nextCh = reader.read()
                         if (nextCh != '\n'.code && nextCh != -1) {
                             reader.reset()
+                        } else if (nextCh == '\n'.code) {
+                            totalCharsRead++
+                            require(totalCharsRead <= maxCsvChars) { "CSV file exceeds maximum supported import size." }
                         }
                         currentRecord.add(currentField.toString())
                         currentField.clear()
                         if (currentRecord.isNotEmpty()) {
-                            records.add(currentRecord.toList())
-                            currentRecord.clear()
+                            commitRow()
                         }
                     }
                     '\n' -> {
                         currentRecord.add(currentField.toString())
                         currentField.clear()
                         if (currentRecord.isNotEmpty()) {
-                            records.add(currentRecord.toList())
-                            currentRecord.clear()
+                            commitRow()
                         }
                     }
                     else -> {
-                        currentField.append(c)
+                        appendChar(c)
                     }
                 }
             }
         }
 
+        if (inQuotes) {
+            throw IllegalArgumentException("Malformed CSV file: unclosed quoted field.")
+        }
         if (currentField.isNotEmpty() || currentRecord.isNotEmpty()) {
             currentRecord.add(currentField.toString())
-            records.add(currentRecord.toList())
+            commitRow()
         }
         return records
     }
@@ -1718,12 +2002,45 @@ class VaultRepository(
             fos.flush()
             fos.fd.sync()
         }
-        // Same-directory rename on Android replaces the prior journal atomically.
-        // Never fall back to a partial overwrite or remove the old journal first.
-        if (!tempFile.renameTo(journalFile)) {
+        // Same-directory atomic replace (POSIX Os.rename on Android, NIO REPLACE_EXISTING on JVM).
+        // Never fall back to a partial overwrite or remove the old journal before replacement completes.
+        atomicReplaceFile(tempFile, journalFile)
+        check(journalFile.exists()) { "Restore journal was not persisted safely." }
+    }
+
+    private fun atomicReplaceFile(sourceTemp: File, destination: File) {
+        if (sourceTemp.renameTo(destination)) return
+        val osRenamed = try {
+            android.system.Os.rename(sourceTemp.absolutePath, destination.absolutePath)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+        if (osRenamed) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            java.nio.file.Files.move(
+                sourceTemp.toPath(),
+                destination.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING
+            )
+            return
+        }
+        val nioMoved = runCatching {
+            val filesCls = Class.forName("java.nio.file.Files")
+            val pathCls = Class.forName("java.nio.file.Path")
+            val copyOptCls = Class.forName("java.nio.file.CopyOption")
+            val stdOptCls = Class.forName("java.nio.file.StandardCopyOption")
+            val replaceExisting = java.lang.Enum.valueOf(stdOptCls.asSubclass(Enum::class.java), "REPLACE_EXISTING")
+            val options = java.lang.reflect.Array.newInstance(copyOptCls, 1)
+            java.lang.reflect.Array.set(options, 0, replaceExisting)
+            val toPath = File::class.java.getMethod("toPath")
+            val moveMethod = filesCls.getMethod("move", pathCls, pathCls, options.javaClass)
+            moveMethod.invoke(null, toPath.invoke(sourceTemp), toPath.invoke(destination), options)
+            true
+        }.getOrDefault(false)
+        if (!nioMoved) {
             throw java.io.IOException("Could not atomically replace restore journal.")
         }
-        check(journalFile.exists()) { "Restore journal was not persisted safely." }
     }
 
     /**
@@ -2377,6 +2694,7 @@ class VaultRepository(
                 biometricWrappedDek = null
             )
             dao.upsertEnvelope(updatedEnvelope)
+            BiometricKeystoreManager.deleteBiometricKey()
             true
         } finally {
             unwrappedPayload.wipe()

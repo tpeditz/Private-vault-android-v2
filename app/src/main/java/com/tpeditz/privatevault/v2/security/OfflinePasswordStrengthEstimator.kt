@@ -137,9 +137,16 @@ object OfflinePasswordStrengthEstimator {
         }
         if (isRepeated) rawScore -= 15
 
-        // Check for passphrases (words separated by spaces/hyphens)
+        // Check for passphrases (distinct non-repeating words separated by spaces/hyphens)
         val words = password.split(Regex("[\\s\\-_]+")).filter { it.isNotBlank() }
-        if (words.size >= 4 && len >= 16) {
+        val normalizedWords = words.map { it.lowercase() }
+        val distinctWordCount = normalizedWords.distinct().size
+        val hasRepeatingWords = words.size >= 2 && distinctWordCount <= words.size / 2
+        if (hasRepeatingWords) {
+            rawScore -= 25
+            warnings.add("Repeated words weaken passphrases significantly")
+        }
+        if (words.size >= 4 && distinctWordCount >= 4 && len >= 16 && !isCommon && !isWalk) {
             rawScore = rawScore.coerceAtLeast(80)
         }
 

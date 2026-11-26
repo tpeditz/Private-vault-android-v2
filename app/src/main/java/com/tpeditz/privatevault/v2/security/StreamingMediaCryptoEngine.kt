@@ -313,6 +313,31 @@ object StreamingMediaCryptoEngine {
         fileMediaKey: ByteArray
     ): ByteArray {
         val out = ByteArrayOutputStream()
+        decryptMediaFileToStream(
+            encryptedFile = encryptedFile,
+            outputStream = out,
+            mediaId = mediaId,
+            vaultSlot = vaultSlot,
+            fileMediaKey = fileMediaKey
+        )
+        return out.toByteArray()
+    }
+
+    /**
+     * Streams decrypted chunks sequentially to `outputStream` (max 256 KiB chunk buffer in memory at once)
+     * and zeroes each temporary plaintext buffer immediately after writing.
+     */
+    @Throws(IOException::class, AEADBadTagException::class)
+    fun decryptMediaFileToStream(
+        encryptedFile: File,
+        outputStream: java.io.OutputStream,
+        mediaId: String,
+        vaultSlot: Int,
+        fileMediaKey: ByteArray,
+        maxPlaintextBytes: Long = Long.MAX_VALUE,
+        isCancelled: () -> Boolean = { false }
+    ): Long {
+        var totalWritten = 0L
         RandomAccessFile(encryptedFile, "r").use { raf ->
             val headerBytes = ByteArray(HEADER_BYTES)
             raf.readFully(headerBytes)
@@ -323,6 +348,9 @@ object StreamingMediaCryptoEngine {
             val nonce = ByteArray(CryptoEngine.NONCE_BYTES)
 
             for (i in 0 until header.totalChunks) {
+                if (isCancelled()) {
+                    throw java.util.concurrent.CancellationException("Decryption cancelled.")
+                }
                 raf.readFully(frameHeaderBuf)
                 val bb = ByteBuffer.wrap(frameHeaderBuf)
                 val chunkPlainLen = bb.int
@@ -352,13 +380,18 @@ object StreamingMediaCryptoEngine {
                     aad = aad
                 )
                 try {
-                    out.write(plain)
+                    val remainingCap = maxPlaintextBytes - totalWritten
+                    if (remainingCap <= 0L) break
+                    val writeLen = minOf(plain.size.toLong(), remainingCap).toInt()
+                    outputStream.write(plain, 0, writeLen)
+                    totalWritten += writeLen
+                    if (totalWritten >= maxPlaintextBytes) break
                 } finally {
                     Arrays.fill(plain, 0.toByte())
                 }
             }
         }
-        return out.toByteArray()
+        return totalWritten
     }
 
     fun encryptThumbnail(

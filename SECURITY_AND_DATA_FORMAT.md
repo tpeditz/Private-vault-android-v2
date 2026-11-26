@@ -1,6 +1,6 @@
 # PRIVATE VAULT V2 - CRYPTOGRAPHIC SPECIFICATION & DATA FORMAT
 
-> **Product:** Private Vault V2 (`2.0.1`, Version Code `2`)  
+> **Product:** Private Vault V2 (`2.0.4`, Version Code `5`)  
 > **Application ID:** `com.tpeditz.privatevault.v2`  
 > **Developer:** Developed by Tp Editz (@Tp_Editz / @tp_ediitz)  
 > **Repository:** `tpeditz/Private-vault-android-v2`

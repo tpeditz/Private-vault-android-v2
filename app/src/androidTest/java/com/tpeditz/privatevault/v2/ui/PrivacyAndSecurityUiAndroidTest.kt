@@ -1,19 +1,31 @@
 package com.tpeditz.privatevault.v2.ui
 
+import android.content.Intent
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.edit
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import com.tpeditz.privatevault.v2.data.AppPreferencesRepository
 import com.tpeditz.privatevault.v2.data.CloudBackupFrequency
+import com.tpeditz.privatevault.v2.data.CredentialRecord
+import com.tpeditz.privatevault.v2.data.PasswordHistoryEntry
+import com.tpeditz.privatevault.v2.data.dataStore
 import com.tpeditz.privatevault.v2.ui.screens.AboutScreen
 import com.tpeditz.privatevault.v2.ui.screens.CloudBackupScreen
+import com.tpeditz.privatevault.v2.ui.screens.PasswordEditorScreen
 import com.tpeditz.privatevault.v2.ui.screens.PrivacyDashboardScreen
 import com.tpeditz.privatevault.v2.ui.screens.SecuritySettingsScreen
 import com.tpeditz.privatevault.v2.ui.theme.PrivateVaultTheme
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -148,8 +160,7 @@ class PrivacyAndSecurityUiAndroidTest {
                             totalItemsCount = 3,
                             averagePasswordScore = 85,
                             isScreenshotProtected = true,
-                            isBiometricEnabled = true,
-                            isAutofillActive = false
+                            isBiometricEnabled = true
                         )
                     ),
                     onNavigateToTab = {},
@@ -162,10 +173,66 @@ class PrivacyAndSecurityUiAndroidTest {
         composeRule.onNodeWithText("Privacy Health").assertIsDisplayed()
         composeRule.onNodeWithText("Screenshot & App Switcher Protection").assertIsDisplayed()
         composeRule.onNodeWithText("FLAG_SECURE", substring = true).assertDoesNotExist()
+        composeRule.onNodeWithText("Autofill", substring = true, ignoreCase = true).assertDoesNotExist()
 
-        composeRule.onNodeWithText("Android Autofill Service").performClick()
+        composeRule.onNodeWithText("Biometric Unlock").performClick()
         composeRule.runOnIdle {
-            assertEquals(SecondaryDestination.AutofillSettings, navigatedDestination)
+            assertEquals(SecondaryDestination.SecuritySettings, navigatedDestination)
         }
+    }
+
+    @Test
+    fun testNoAutofillServiceRegisteredAndLegacyPreferenceUpgradeSafe() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val autofillIntent = Intent("android.service.autofill.AutofillService").setPackage(context.packageName)
+        @Suppress("DEPRECATION")
+        val services = context.packageManager.queryIntentServices(autofillIntent, 0)
+        assertTrue("Expected zero Autofill services in upgraded APK", services.isEmpty())
+
+        // Simulate legacy V2.0.3 DataStore containing old autofill_enabled = true key
+        context.dataStore.edit { prefs ->
+            prefs[booleanPreferencesKey("autofill_enabled")] = true
+        }
+        val repo = AppPreferencesRepository(context)
+        repo.setAutoLockTimeoutSeconds(300)
+        assertEquals(300, repo.autoLockTimeoutSeconds.first())
+        assertTrue(repo.screenshotProtectionEnabled.first())
+        repo.setAutoLockTimeoutSeconds(60)
+    }
+
+    @Test
+    fun testPasswordHistoryMasksPasswordsByDefaultWithRevealToggle() {
+        val cred = CredentialRecord(
+            id = "cred-hist-1",
+            serviceName = "Example Portal",
+            username = "user@example.test",
+            password = "CurrentStrong#Password99",
+            passwordHistory = listOf(
+                PasswordHistoryEntry(id = "hist-1", password = "Previous!Secret#88", changedAtEpochMs = 1_700_000_000_000L)
+            )
+        )
+        composeRule.setContent {
+            PrivateVaultTheme {
+                PasswordEditorScreen(
+                    credentialId = cred.id,
+                    uiState = VaultUiState(credentials = listOf(cred)),
+                    onSaveCredential = {},
+                    onDeleteCredential = {},
+                    onRestorePassword = { _, _ -> },
+                    onCopyPassword = { _, _ -> },
+                    onBack = {}
+                )
+            }
+        }
+
+        composeRule.onNodeWithText("Website or App URL (optional)").assertIsDisplayed()
+        composeRule.onNodeWithText("Website URL (for Autofill)").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription("Password History").performClick()
+
+        // History password must stay masked until explicitly revealed
+        composeRule.onNodeWithText("••••••••••••").assertIsDisplayed()
+        composeRule.onNodeWithText("Previous!Secret#88").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription("Show password").performClick()
+        composeRule.onNodeWithText("Previous!Secret#88").assertIsDisplayed()
     }
 }

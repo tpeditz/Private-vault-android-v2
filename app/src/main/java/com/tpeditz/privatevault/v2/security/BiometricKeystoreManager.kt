@@ -8,6 +8,7 @@ import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import androidx.biometric.BiometricManager
 import java.security.KeyStore
+import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -26,28 +27,106 @@ import javax.crypto.spec.GCMParameterSpec
 object BiometricKeystoreManager {
 
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
-    private const val KEY_ALIAS_REAL_VAULT_BIO = "com.tpeditz.privatevault.v2.real_bio_kek"
+    internal const val KEY_ALIAS_REAL_VAULT_BIO = "com.tpeditz.privatevault.v2.real_bio_kek"
+    internal const val KEY_ALIAS_REAL_VAULT_BIO_ALT = "com.tpeditz.privatevault.v2.real_bio_kek_alt"
     private const val TRANSFORMATION = "AES/GCM/NoPadding"
     private const val GCM_TAG_BITS = 128
+
+    private val allBioAliases = listOf(KEY_ALIAS_REAL_VAULT_BIO, KEY_ALIAS_REAL_VAULT_BIO_ALT)
+
+    data class StagedEnrollmentCipher(
+        val cipher: Cipher,
+        val targetAlias: String
+    )
 
     data class WrappedBiometricDek(
         val iv: ByteArray,
         val ciphertext: ByteArray
     )
 
-    fun hasKeystoreKey(): Boolean {
+    data class BiometricAliasResolution(
+        val unlockAlias: String?,
+        val shouldPromotePendingAlias: Boolean,
+        val staleAliasToRetire: String?,
+        val shouldClearPending: Boolean
+    )
+
+    fun nonceSha256Hex(nonceBytes: ByteArray): String {
+        return MessageDigest.getInstance("SHA-256").digest(nonceBytes)
+            .joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * Reconciles staged biometric alias metadata against what actually committed into the SQLite
+     * envelope (`dbBiometricNonceSha256`). Guarantees interrupted replacements recover deterministically
+     * without retiring a working key before both DB and preferences agree.
+     */
+    internal fun reconcileAliasState(
+        activeAlias: String?,
+        pendingAlias: String?,
+        pendingNonceSha256: String?,
+        dbBiometricNonceSha256: String?,
+        hasKeyInKeystore: (String) -> Boolean
+    ): BiometricAliasResolution {
+        if (dbBiometricNonceSha256.isNullOrBlank()) {
+            return BiometricAliasResolution(
+                unlockAlias = null,
+                shouldPromotePendingAlias = false,
+                staleAliasToRetire = null,
+                shouldClearPending = !pendingAlias.isNullOrBlank() || !pendingNonceSha256.isNullOrBlank()
+            )
+        }
+
+        val resolvedActive = activeAlias?.takeIf { it in allBioAliases && hasKeyInKeystore(it) }
+        val resolvedPending = pendingAlias?.takeIf { it in allBioAliases && hasKeyInKeystore(it) }
+
+        if (resolvedPending != null && !pendingNonceSha256.isNullOrBlank()) {
+            return if (pendingNonceSha256 == dbBiometricNonceSha256) {
+                // DB commit succeeded before interruption; promote pending alias and retire the old one.
+                BiometricAliasResolution(
+                    unlockAlias = resolvedPending,
+                    shouldPromotePendingAlias = true,
+                    staleAliasToRetire = allBioAliases.firstOrNull { it != resolvedPending && hasKeyInKeystore(it) },
+                    shouldClearPending = true
+                )
+            } else {
+                // Interruption occurred before DB commit; preserve active working alias and discard uncommitted stage.
+                val fallback = resolvedActive ?: allBioAliases.firstOrNull { it != resolvedPending && hasKeyInKeystore(it) }
+                BiometricAliasResolution(
+                    unlockAlias = fallback,
+                    shouldPromotePendingAlias = false,
+                    staleAliasToRetire = resolvedPending.takeIf { it != fallback },
+                    shouldClearPending = true
+                )
+            }
+        }
+
+        val fallback = resolvedActive ?: allBioAliases.firstOrNull { hasKeyInKeystore(it) }
+        return BiometricAliasResolution(
+            unlockAlias = fallback,
+            shouldPromotePendingAlias = false,
+            staleAliasToRetire = null,
+            shouldClearPending = !pendingAlias.isNullOrBlank() || !pendingNonceSha256.isNullOrBlank()
+        )
+    }
+
+    fun hasKeystoreKey(preferredAlias: String? = null): Boolean {
         return try {
             val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            keyStore.containsAlias(KEY_ALIAS_REAL_VAULT_BIO)
+            if (!preferredAlias.isNullOrBlank() && keyStore.containsAlias(preferredAlias)) {
+                return true
+            }
+            allBioAliases.any { keyStore.containsAlias(it) }
         } catch (_: Exception) {
             false
         }
     }
 
-    fun isHardwareBackedKey(): Boolean {
+    fun isHardwareBackedKey(preferredAlias: String? = null): Boolean {
         return try {
             val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            val secretKey = keyStore.getKey(KEY_ALIAS_REAL_VAULT_BIO, null) as? SecretKey
+            val alias = resolveExistingAlias(keyStore, preferredAlias) ?: return false
+            val secretKey = keyStore.getKey(alias, null) as? SecretKey
                 ?: return false
             val factory = SecretKeyFactory.getInstance(secretKey.algorithm, ANDROID_KEYSTORE)
             val keyInfo = factory.getKeySpec(secretKey, KeyInfo::class.java) as? KeyInfo
@@ -65,12 +144,32 @@ object BiometricKeystoreManager {
         }
     }
 
-    fun getEncryptCipherForEnrollment(): Cipher? {
+    private fun resolveExistingAlias(keyStore: KeyStore, preferredAlias: String?): String? {
+        if (!preferredAlias.isNullOrBlank() && keyStore.containsAlias(preferredAlias)) {
+            return preferredAlias
+        }
+        return allBioAliases.firstOrNull { keyStore.containsAlias(it) }
+    }
+
+    fun selectStagingAlias(currentActiveAlias: String?): String {
+        val active = currentActiveAlias?.takeIf { it in allBioAliases } ?: runCatching {
+            val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            allBioAliases.firstOrNull { ks.containsAlias(it) }
+        }.getOrNull()
+        return if (active == KEY_ALIAS_REAL_VAULT_BIO) KEY_ALIAS_REAL_VAULT_BIO_ALT else KEY_ALIAS_REAL_VAULT_BIO
+    }
+
+    /**
+     * Prepares a replacement keystore cipher under an alternate alias so cancelling enrollment
+     * never destroys a previously working biometric configuration.
+     */
+    fun getEncryptCipherForStagedEnrollment(currentActiveAlias: String? = null): StagedEnrollmentCipher? {
         return try {
-            deleteBiometricKey()
+            val targetAlias = selectStagingAlias(currentActiveAlias)
+            deleteAlias(targetAlias)
             val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
             val builder = KeyGenParameterSpec.Builder(
-                KEY_ALIAS_REAL_VAULT_BIO,
+                targetAlias,
                 KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
             )
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
@@ -90,22 +189,45 @@ object BiometricKeystoreManager {
 
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.ENCRYPT_MODE, secretKey)
-            cipher
+            StagedEnrollmentCipher(cipher = cipher, targetAlias = targetAlias)
         } catch (_: Exception) {
             null
         }
     }
 
-    fun getDecryptCipherForUnlock(iv: ByteArray): Cipher? {
+    fun getEncryptCipherForEnrollment(): Cipher? {
+        return getEncryptCipherForStagedEnrollment(null)?.cipher
+    }
+
+    fun commitStagedAliasAndRetirePrevious(committedAlias: String) {
+        allBioAliases.filter { it != committedAlias }.forEach { deleteAlias(it) }
+    }
+
+    fun discardStagedAlias(stagedAlias: String?) {
+        if (!stagedAlias.isNullOrBlank()) {
+            deleteAlias(stagedAlias)
+        }
+    }
+
+    fun retireAlias(alias: String?) {
+        if (!alias.isNullOrBlank()) {
+            deleteAlias(alias)
+        }
+    }
+
+    fun getDecryptCipherForUnlock(iv: ByteArray, preferredAlias: String? = null): Cipher? {
+        var resolvedAlias: String? = null
         return try {
             val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            val secretKey = keyStore.getKey(KEY_ALIAS_REAL_VAULT_BIO, null) as? SecretKey
+            val alias = resolveExistingAlias(keyStore, preferredAlias) ?: return null
+            resolvedAlias = alias
+            val secretKey = keyStore.getKey(alias, null) as? SecretKey
                 ?: return null
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(GCM_TAG_BITS, iv))
             cipher
         } catch (_: KeyPermanentlyInvalidatedException) {
-            deleteBiometricKey()
+            resolvedAlias?.let { deleteAlias(it) }
             null
         } catch (_: Exception) {
             null
@@ -121,14 +243,18 @@ object BiometricKeystoreManager {
         return cipher.doFinal(ciphertext)
     }
 
-    fun deleteBiometricKey() {
+    private fun deleteAlias(alias: String) {
         try {
             val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            if (keyStore.containsAlias(KEY_ALIAS_REAL_VAULT_BIO)) {
-                keyStore.deleteEntry(KEY_ALIAS_REAL_VAULT_BIO)
+            if (keyStore.containsAlias(alias)) {
+                keyStore.deleteEntry(alias)
             }
         } catch (_: Exception) {
         }
+    }
+
+    fun deleteBiometricKey() {
+        allBioAliases.forEach { deleteAlias(it) }
     }
 
     fun canAuthenticate(context: Context): Boolean {

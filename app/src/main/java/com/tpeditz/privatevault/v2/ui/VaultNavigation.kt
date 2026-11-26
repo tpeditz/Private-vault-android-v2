@@ -21,7 +21,6 @@ sealed interface SecondaryDestination {
     data object BackupAndRestore : SecondaryDestination
     data object CloudBackup : SecondaryDestination
     data object SecuritySettings : SecondaryDestination
-    data object AutofillSettings : SecondaryDestination
     data object OtaUpdates : SecondaryDestination
     data object About : SecondaryDestination
 }

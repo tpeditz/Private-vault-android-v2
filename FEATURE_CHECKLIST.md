@@ -1,6 +1,6 @@
 # PRIVATE VAULT V2 - FEATURE CHECKLIST & PARITY MATRIX
 
-> **Product:** Private Vault V2 (`2.0.1`, Version Code `2`)  
+> **Product:** Private Vault V2 (`2.0.4`, Version Code `5`)  
 > **Application ID:** `com.tpeditz.privatevault.v2`  
 > **Developer:** Developed by Tp Editz (@Tp_Editz / @tp_ediitz)  
 > **Website:** [https://tpeditz.github.io/Private-vault-android-v2/](https://tpeditz.github.io/Private-vault-android-v2/)  
@@ -36,9 +36,7 @@
 | | Vault Password Reuse Detection (O(N)) | `[x] Implemented` | Verified in `OfflinePasswordStrengthEstimatorTest` |
 | | Authenticator (RFC 6238 TOTP / RFC 4226 HOTP) | `[x] Implemented` | Verified with published RFC test vectors in `TotpEngineTest` |
 | | Live 30-Second TOTP Rollover Countdown | `[x] Implemented` | Verified in `TotpEngineTest` & UI ticker flow |
-| **Autofill Service** | Android `AutofillService` Implementation | `[x] Implemented` | `PrivateVaultAutofillService` + API 24-safe `AutofillHelper` registered in `AndroidManifest.xml` |
-| | Strict Host, `http`/`https` Isolation & Explicit `android://<pkg>` Matching | `[x] Implemented` | Verified in `AutofillMatcherTest` (no `serviceName` or package-token guessing) |
-| | In-Line Authentication Sheet (`AutofillAuthActivity`) & Neutral Search Picker | `[x] Implemented` | Explicit match or user-confirmed search picker on deliberate tap |
+| **Autofill Service** | Android `AutofillService` Integration | `[-] Removed in 2.0.4` | Owner-approved removal of `AutofillService`, `AutofillAuthActivity`, manifest declarations, settings, and Autofill-only tests while keeping all saved credentials and `websiteUrl` intact (`AutofillRemovalAndPasswordManagerRegressionTest`). |
 | **Backups & Sync** | `PVAULTB2` Streaming Container (Up to 2 GiB) & Friendly Error Recovery | `[x] Implemented` | `EncryptedBackupV2Engine`, `VaultRepositorySafetyHardeningTest`, `VaultErrorMapperTest` |
 | | `LegacyV1BackupReader` (32 MiB Backward Support) | `[x] Implemented` | Verified in `LegacyV1BackupReaderTest` with authentic V1 ciphertext fixtures |
 | | New 12+ Char `PasswordPolicy` with Legacy Short Password Compatibility | `[x] Implemented` | Verified in `PasswordPolicyTest` (blocks new `<12` creation, unlocks/restores legacy) |
@@ -57,7 +55,7 @@
 | | System `PackageInstaller` Session Handoff & `ON_RESUME` Recheck | `[x] Implemented` | Auto-transitions from Unknown Sources prompt cleanly on resume + Cancel/Retry |
 | | Hardened GitHub Actions CI & Draft-Staged Signed Release Workflows | `[x] Implemented` | `.github/workflows/ci.yml`, `publish-production-apk.yml`, and `RELEASE_SETUP.md` |
 | **UI & Experience** | Material 3 Theming (Light, Dark, OLED Black) | `[x] Implemented` | Complete Compose theme in `ui/theme/` |
-| | Home Privacy Dashboard & Live System Metrics | `[x] Implemented` | Bound directly to canonical DataStore + live Autofill/Biometric status |
+| | Home Privacy Dashboard & Live System Metrics | `[x] Implemented` | Bound directly to canonical DataStore + live Biometric, Cloud Backup & OTA status (Autofill removed in 2.0.4) |
 | | Developer Attribution & Consumer About Screen (+ Website/Privacy/Terms) | `[x] Implemented` | Clean consumer UI in `AboutScreen` (no signing/internal leaks) |
 | | Plain-English Screen Protection & DataStore-Bound Security Controls | `[x] Implemented` | Reactive DataStore controls (`Screen Off`, `Auto-Lock`, `Clipboard TTL`, `Biometric Unlock`) |
 

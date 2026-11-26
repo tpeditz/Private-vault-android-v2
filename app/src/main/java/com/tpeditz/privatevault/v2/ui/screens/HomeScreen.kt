@@ -22,6 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Key
@@ -29,24 +30,11 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SaveAlt
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Timer
-import androidx.compose.material.icons.filled.Clear
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.material3.Button
-import androidx.compose.material.icons.filled.Clear
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -57,11 +45,18 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -127,6 +122,15 @@ fun HomeScreen(
         )
 
         var searchQuery by remember { mutableStateOf("") }
+        var debouncedQuery by remember { mutableStateOf("") }
+        LaunchedEffect(searchQuery) {
+            if (searchQuery.isBlank()) {
+                debouncedQuery = ""
+            } else {
+                delay(150L)
+                debouncedQuery = searchQuery.trim()
+            }
+        }
 
         OutlinedTextField(
             value = searchQuery,
@@ -147,13 +151,25 @@ fun HomeScreen(
             shape = RoundedCornerShape(16.dp)
         )
 
-        if (searchQuery.isNotBlank()) {
-            val q = searchQuery.trim()
-            val matchedNotes = uiState.notes.filter { !it.isTrashed && (it.title.contains(q, true) || it.body.contains(q, true)) }
-            val matchedPasswords = uiState.credentials.filter { !it.isTrashed && (it.serviceName.contains(q, true) || it.username.contains(q, true)) }
-            val matchedMedia = uiState.media.filter { !it.isTrashed && (it.title.contains(q, true) || it.originalFileName.contains(q, true)) }
-            val matchedDocs = uiState.documents.filter { !it.isTrashed && (it.title.contains(q, true) || it.originalFileName.contains(q, true)) }
-            val matchedLinks = uiState.secureLinks.filter { !it.isTrashed && (it.title.contains(q, true) || it.url.contains(q, true)) }
+        if (debouncedQuery.isNotBlank()) {
+            val q = debouncedQuery
+            val matchedNotes = remember(q, uiState.notes) {
+                uiState.notes.filter { !it.isTrashed && (it.title.contains(q, true) || it.body.contains(q, true)) }
+            }
+            val matchedPasswords = remember(q, uiState.credentials) {
+                uiState.credentials.filter {
+                    !it.isTrashed && (it.serviceName.contains(q, true) || it.username.contains(q, true) || it.websiteUrl.contains(q, true))
+                }
+            }
+            val matchedMedia = remember(q, uiState.media) {
+                uiState.media.filter { !it.isTrashed && (it.title.contains(q, true) || it.originalFileName.contains(q, true)) }
+            }
+            val matchedDocs = remember(q, uiState.documents) {
+                uiState.documents.filter { !it.isTrashed && (it.title.contains(q, true) || it.originalFileName.contains(q, true)) }
+            }
+            val matchedLinks = remember(q, uiState.secureLinks) {
+                uiState.secureLinks.filter { !it.isTrashed && (it.title.contains(q, true) || it.url.contains(q, true)) }
+            }
 
             val totalMatches = matchedNotes.size + matchedPasswords.size + matchedMedia.size + matchedDocs.size + matchedLinks.size
 
@@ -168,7 +184,7 @@ fun HomeScreen(
 
                 if (matchedNotes.isNotEmpty()) {
                     item { Text("Notes (${matchedNotes.size})", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary) }
-                    items(matchedNotes) { note ->
+                    items(matchedNotes, key = { "note_${it.id}" }) { note ->
                         OutlinedCard(
                             modifier = Modifier.fillMaxWidth().clickable { onNavigateToSecondary(SecondaryDestination.NoteEditor(note.id)) },
                             shape = RoundedCornerShape(12.dp)
@@ -189,7 +205,7 @@ fun HomeScreen(
 
                 if (matchedPasswords.isNotEmpty()) {
                     item { Text("Passwords (${matchedPasswords.size})", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary) }
-                    items(matchedPasswords) { cred ->
+                    items(matchedPasswords, key = { "cred_${it.id}" }) { cred ->
                         OutlinedCard(
                             modifier = Modifier.fillMaxWidth().clickable { onNavigateToSecondary(SecondaryDestination.PasswordEditor(cred.id)) },
                             shape = RoundedCornerShape(12.dp)
@@ -208,7 +224,7 @@ fun HomeScreen(
 
                 if (matchedMedia.isNotEmpty()) {
                     item { Text("Media (${matchedMedia.size})", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary) }
-                    items(matchedMedia) { med ->
+                    items(matchedMedia, key = { "media_${it.id}" }) { med ->
                         OutlinedCard(
                             modifier = Modifier.fillMaxWidth().clickable { onNavigateToSecondary(SecondaryDestination.MediaViewer(med.id)) },
                             shape = RoundedCornerShape(12.dp)
@@ -224,7 +240,7 @@ fun HomeScreen(
 
                 if (matchedDocs.isNotEmpty()) {
                     item { Text("Documents (${matchedDocs.size})", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary) }
-                    items(matchedDocs) { doc ->
+                    items(matchedDocs, key = { "doc_${it.id}" }) { doc ->
                         OutlinedCard(
                             modifier = Modifier.fillMaxWidth().clickable { onNavigateToSecondary(SecondaryDestination.DocumentViewer(doc.id)) },
                             shape = RoundedCornerShape(12.dp)
@@ -240,7 +256,7 @@ fun HomeScreen(
 
                 if (matchedLinks.isNotEmpty()) {
                     item { Text("Secure Links (${matchedLinks.size})", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary) }
-                    items(matchedLinks) { link ->
+                    items(matchedLinks, key = { "link_${it.id}" }) { link ->
                         OutlinedCard(
                             modifier = Modifier.fillMaxWidth().clickable { onNavigateToSecondary(SecondaryDestination.LinkEditor(link.id)) },
                             shape = RoundedCornerShape(12.dp)
@@ -376,6 +392,33 @@ fun HomeScreen(
 
             // Quick Actions Section
             item {
+                if (uiState.privacyMetrics.totalItemsCount == 0) {
+                    OutlinedCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.outlinedCardColors(
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.35f)
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "Getting Started",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = "Everything inside Private Vault stays encrypted on your device. Tap a quick action below to save your first note, password, photo, document, or encrypted backup.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(14.dp))
+                }
                 Text(
                     text = "Quick Actions",
                     style = MaterialTheme.typography.titleMedium,
@@ -529,7 +572,7 @@ fun HomeScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                 }
 
-                items(favoriteItems) { item ->
+                items(favoriteItems, key = { it.id }) { item ->
                     OutlinedCard(
                         modifier = Modifier
                             .fillMaxWidth()

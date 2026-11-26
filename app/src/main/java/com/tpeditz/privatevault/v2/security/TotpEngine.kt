@@ -23,6 +23,11 @@ object TotpEngine {
         val algorithm: TotpAlgorithm = TotpAlgorithm.SHA1
     )
 
+    const val MIN_TOTP_DIGITS = 6
+    const val MAX_TOTP_DIGITS = 8
+    const val MIN_TOTP_PERIOD_SECONDS = 5
+    const val MAX_TOTP_PERIOD_SECONDS = 300
+
     /**
      * Generates a TOTP code for the given secret at `epochSeconds`.
      */
@@ -33,8 +38,15 @@ object TotpEngine {
         digits: Int = 6,
         algorithm: TotpAlgorithm = TotpAlgorithm.SHA1
     ): String {
-        val cleanSecret = secretBase32.replace(" ", "").replace("-", "").uppercase()
+        require(digits in MIN_TOTP_DIGITS..MAX_TOTP_DIGITS) {
+            "TOTP code length must be between $MIN_TOTP_DIGITS and $MAX_TOTP_DIGITS digits."
+        }
+        require(periodSeconds in MIN_TOTP_PERIOD_SECONDS..MAX_TOTP_PERIOD_SECONDS) {
+            "TOTP period must be between $MIN_TOTP_PERIOD_SECONDS and $MAX_TOTP_PERIOD_SECONDS seconds."
+        }
+        val cleanSecret = secretBase32.replace(" ", "").replace("-", "").uppercase(java.util.Locale.US)
         val keyBytes = decodeBase32(cleanSecret)
+        require(keyBytes.isNotEmpty()) { "TOTP secret cannot be empty." }
         val timeStep = epochSeconds / periodSeconds.toLong()
         return generateHotp(keyBytes, timeStep, digits, algorithm)
     }
@@ -46,8 +58,9 @@ object TotpEngine {
         epochSeconds: Long = System.currentTimeMillis() / 1000L,
         periodSeconds: Int = 30
     ): Int {
-        val rem = periodSeconds - (epochSeconds % periodSeconds).toInt()
-        return if (rem == 0) periodSeconds else rem
+        val safePeriod = periodSeconds.coerceIn(MIN_TOTP_PERIOD_SECONDS, MAX_TOTP_PERIOD_SECONDS)
+        val rem = safePeriod - (epochSeconds % safePeriod).toInt()
+        return if (rem <= 0) safePeriod else rem
     }
 
     fun generateHotp(
@@ -56,6 +69,10 @@ object TotpEngine {
         digits: Int = 6,
         algorithm: TotpAlgorithm = TotpAlgorithm.SHA1
     ): String {
+        require(keyBytes.isNotEmpty()) { "HOTP secret key cannot be empty." }
+        require(digits in MIN_TOTP_DIGITS..MAX_TOTP_DIGITS) {
+            "HOTP digits must be between $MIN_TOTP_DIGITS and $MAX_TOTP_DIGITS."
+        }
         val macAlgorithm = when (algorithm) {
             TotpAlgorithm.SHA1 -> "HmacSHA1"
             TotpAlgorithm.SHA256 -> "HmacSHA256"
@@ -75,7 +92,7 @@ object TotpEngine {
 
         val modulus = 10.0.pow(digits.toDouble()).toInt()
         val otp = binary % modulus
-        return "%0${digits}d".format(otp)
+        return "%0${digits}d".format(java.util.Locale.US, otp)
     }
 
     /**
@@ -105,18 +122,23 @@ object TotpEngine {
                     accountName = decodedPath.trim()
                 }
             }
-            val secret = queryParams["secret"] ?: return null
+            val secret = queryParams["secret"]?.replace(" ", "")?.replace("-", "")?.trim() ?: return null
+            val decodedSecret = runCatching { decodeBase32(secret) }.getOrNull()
+            if (decodedSecret == null || decodedSecret.isEmpty()) return null
             val issuerParam = queryParams["issuer"]
             val issuer = (issuerParam ?: issuerFromPath).ifBlank { "Service" }
 
             val digits = queryParams["digits"]?.toIntOrNull() ?: 6
             val period = queryParams["period"]?.toIntOrNull() ?: 30
-            val algorithmStr = queryParams["algorithm"]?.uppercase() ?: "SHA1"
+            if (digits !in MIN_TOTP_DIGITS..MAX_TOTP_DIGITS) return null
+            if (period !in MIN_TOTP_PERIOD_SECONDS..MAX_TOTP_PERIOD_SECONDS) return null
 
+            val algorithmStr = queryParams["algorithm"]?.uppercase(java.util.Locale.US) ?: "SHA1"
             val algorithm = when (algorithmStr) {
+                "SHA1" -> TotpAlgorithm.SHA1
                 "SHA256" -> TotpAlgorithm.SHA256
                 "SHA512" -> TotpAlgorithm.SHA512
-                else -> TotpAlgorithm.SHA1
+                else -> return null
             }
 
             ParsedOtpAuthUri(

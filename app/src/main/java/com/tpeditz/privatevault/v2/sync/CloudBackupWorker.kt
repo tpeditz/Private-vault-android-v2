@@ -122,8 +122,12 @@ class CloudBackupWorker(
             return when (syncResult) {
                 is GoogleDriveSyncManager.SyncResult.Success -> {
                     CloudBackupScheduler.completeUploadedSnapshot(applicationContext, activeSnapshotId)
-                    prefs.recordCloudBackup(System.currentTimeMillis())
-                    prefs.setAutoCloudBackupStatus("Automatic backup completed")
+                    val stillEnabled = prefs.autoCloudBackupEnabled.first()
+                    val currentEmail = prefs.connectedGoogleAccount.first().trim()
+                    if (stillEnabled && currentEmail.equals(expectedEmail.trim(), ignoreCase = true)) {
+                        prefs.recordCloudBackup(System.currentTimeMillis())
+                        prefs.setAutoCloudBackupStatus("Automatic backup completed")
+                    }
                     SafeVaultLogger.i("CloudBackupWorker", "Scheduled cloud backup uploaded cleanly.")
                     Result.success()
                 }

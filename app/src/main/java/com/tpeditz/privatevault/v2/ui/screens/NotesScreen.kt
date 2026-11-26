@@ -22,7 +22,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Clear
@@ -94,27 +94,29 @@ fun NotesScreen(
     var selectedFilter by remember { mutableStateOf("All") }
     var selectedFolderId by remember { mutableStateOf<String?>(null) }
 
-    val filteredNotes = uiState.notes.filter { note ->
-        // Folder filter
-        if (selectedFolderId != null && note.folderId != selectedFolderId) return@filter false
+    val filteredNotes = remember(uiState.notes, selectedFolderId, selectedFilter, uiState.searchQuery) {
+        uiState.notes.filter { note ->
+            // Folder filter
+            if (selectedFolderId != null && note.folderId != selectedFolderId) return@filter false
 
-        // Category/Trash filter
-        when (selectedFilter) {
-            "Favorites" -> note.isFavorite && !note.isTrashed
-            "Archived" -> note.isArchived && !note.isTrashed
-            "Trash" -> note.isTrashed
-            else -> !note.isTrashed && !note.isArchived
-        }
-    }.filter { note ->
-        if (uiState.searchQuery.isBlank()) true else {
-            note.title.contains(uiState.searchQuery, ignoreCase = true) ||
-                note.body.contains(uiState.searchQuery, ignoreCase = true) ||
-                note.tags.any { it.contains(uiState.searchQuery, ignoreCase = true) }
-        }
-    }.sortedWith(
-        compareByDescending<NoteRecord> { it.isPinned }
-            .thenByDescending { it.updatedAtEpochMs }
-    )
+            // Category/Trash filter
+            when (selectedFilter) {
+                "Favorites" -> note.isFavorite && !note.isTrashed
+                "Archived" -> note.isArchived && !note.isTrashed
+                "Trash" -> note.isTrashed
+                else -> !note.isTrashed && !note.isArchived
+            }
+        }.filter { note ->
+            if (uiState.searchQuery.isBlank()) true else {
+                note.title.contains(uiState.searchQuery, ignoreCase = true) ||
+                    note.body.contains(uiState.searchQuery, ignoreCase = true) ||
+                    note.tags.any { it.contains(uiState.searchQuery, ignoreCase = true) }
+            }
+        }.sortedWith(
+            compareByDescending<NoteRecord> { it.isPinned }
+                .thenByDescending { it.updatedAtEpochMs }
+        )
+    }
 
     Scaffold(
         topBar = {
@@ -213,7 +215,7 @@ fun NotesScreen(
                         )
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = if (uiState.searchQuery.isNotBlank()) "No notes match your search" else "No notes here yet",
+                            text = if (uiState.searchQuery.isNotBlank()) "No notes match your search" else "No notes here yet. Tap + to create one.",
                             style = MaterialTheme.typography.bodyLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -431,7 +433,7 @@ fun NoteEditorScreen(
                         }
                         onBack()
                     }) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 actions = {
