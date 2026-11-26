@@ -73,4 +73,14 @@ class OfflinePasswordStrengthEstimatorTest {
         assertFalse(reportUnique.isReusedInVault)
         assertTrue(reportReused.warnings.any { it.contains("reused", ignoreCase = true) })
     }
+
+    @Test
+    fun testRepeatedWordPassphraseIsPenalizedWhileDistinctPassphraseScoresStrong() {
+        val repeated = OfflinePasswordStrengthEstimator.estimateStrength("word word word word")
+        assertTrue("Repeated word passphrase must not be rated Strong (>= 80), got ${repeated.score}", repeated.score < 80)
+        assertTrue(repeated.warnings.any { it.contains("Repeated", ignoreCase = true) })
+
+        val distinct = OfflinePasswordStrengthEstimator.estimateStrength("correct-horse-battery-staple")
+        assertTrue("Distinct multi-word passphrase should be Strong (>= 80), got ${distinct.score}", distinct.score >= 80)
+    }
 }

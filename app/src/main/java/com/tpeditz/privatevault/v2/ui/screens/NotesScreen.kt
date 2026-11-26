@@ -1,5 +1,6 @@
 package com.tpeditz.privatevault.v2.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -22,7 +23,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Clear
@@ -35,6 +36,8 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.RestoreFromTrash
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
@@ -55,7 +58,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -69,7 +71,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.delay
 import com.tpeditz.privatevault.v2.data.ChecklistEntry
 import com.tpeditz.privatevault.v2.data.NoteBodyFormat
 import com.tpeditz.privatevault.v2.data.NoteRecord
@@ -94,27 +95,29 @@ fun NotesScreen(
     var selectedFilter by remember { mutableStateOf("All") }
     var selectedFolderId by remember { mutableStateOf<String?>(null) }
 
-    val filteredNotes = uiState.notes.filter { note ->
-        // Folder filter
-        if (selectedFolderId != null && note.folderId != selectedFolderId) return@filter false
+    val filteredNotes = remember(uiState.notes, selectedFolderId, selectedFilter, uiState.searchQuery) {
+        uiState.notes.filter { note ->
+            // Folder filter
+            if (selectedFolderId != null && note.folderId != selectedFolderId) return@filter false
 
-        // Category/Trash filter
-        when (selectedFilter) {
-            "Favorites" -> note.isFavorite && !note.isTrashed
-            "Archived" -> note.isArchived && !note.isTrashed
-            "Trash" -> note.isTrashed
-            else -> !note.isTrashed && !note.isArchived
-        }
-    }.filter { note ->
-        if (uiState.searchQuery.isBlank()) true else {
-            note.title.contains(uiState.searchQuery, ignoreCase = true) ||
-                note.body.contains(uiState.searchQuery, ignoreCase = true) ||
-                note.tags.any { it.contains(uiState.searchQuery, ignoreCase = true) }
-        }
-    }.sortedWith(
-        compareByDescending<NoteRecord> { it.isPinned }
-            .thenByDescending { it.updatedAtEpochMs }
-    )
+            // Category/Trash filter
+            when (selectedFilter) {
+                "Favorites" -> note.isFavorite && !note.isTrashed
+                "Archived" -> note.isArchived && !note.isTrashed
+                "Trash" -> note.isTrashed
+                else -> !note.isTrashed && !note.isArchived
+            }
+        }.filter { note ->
+            if (uiState.searchQuery.isBlank()) true else {
+                note.title.contains(uiState.searchQuery, ignoreCase = true) ||
+                    note.body.contains(uiState.searchQuery, ignoreCase = true) ||
+                    note.tags.any { it.contains(uiState.searchQuery, ignoreCase = true) }
+            }
+        }.sortedWith(
+            compareByDescending<NoteRecord> { it.isPinned }
+                .thenByDescending { it.updatedAtEpochMs }
+        )
+    }
 
     Scaffold(
         topBar = {
@@ -213,7 +216,7 @@ fun NotesScreen(
                         )
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = if (uiState.searchQuery.isNotBlank()) "No notes match your search" else "No notes here yet",
+                            text = if (uiState.searchQuery.isNotBlank()) "No notes match your search" else "No notes here yet. Tap + to create one.",
                             style = MaterialTheme.typography.bodyLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -367,36 +370,80 @@ fun NoteCardItem(
 fun NoteEditorScreen(
     noteId: String?,
     uiState: VaultUiState,
-    onSaveNote: (NoteRecord) -> Unit,
+    onSaveNote: (NoteRecord, (Boolean, String?) -> Unit) -> Unit,
     onDeleteNote: (String) -> Unit,
     onBack: () -> Unit
 ) {
     val existingNote = remember(noteId) { uiState.notes.find { it.id == noteId } }
-    val stableNoteId = remember { existingNote?.id ?: java.util.UUID.randomUUID().toString() }
+    val stableNoteId = remember(noteId) { existingNote?.id ?: java.util.UUID.randomUUID().toString() }
+    val initialCreatedAtEpochMs = remember(noteId) { existingNote?.createdAtEpochMs ?: System.currentTimeMillis() }
+    val initialTitle = remember(noteId) { existingNote?.title.orEmpty() }
+    val initialBody = remember(noteId) { existingNote?.body.orEmpty() }
+    val initialFormat = remember(noteId) { existingNote?.format ?: NoteBodyFormat.PLAIN_TEXT }
+    val initialPinned = remember(noteId) { existingNote?.isPinned ?: false }
+    val initialFavorite = remember(noteId) { existingNote?.isFavorite ?: false }
+    val initialChecklist = remember(noteId) { existingNote?.checklistItems.orEmpty() }
 
-    var title by remember { mutableStateOf(existingNote?.title.orEmpty()) }
-    var body by remember { mutableStateOf(existingNote?.body.orEmpty()) }
-    var format by remember { mutableStateOf(existingNote?.format ?: NoteBodyFormat.PLAIN_TEXT) }
-    var isPinned by remember { mutableStateOf(existingNote?.isPinned ?: false) }
-    var isFavorite by remember { mutableStateOf(existingNote?.isFavorite ?: false) }
-    var autosaveStatus by remember { mutableStateOf("All changes saved") }
+    var title by remember(noteId) { mutableStateOf(initialTitle) }
+    var body by remember(noteId) { mutableStateOf(initialBody) }
+    var format by remember(noteId) { mutableStateOf(initialFormat) }
+    var isPinned by remember(noteId) { mutableStateOf(initialPinned) }
+    var isFavorite by remember(noteId) { mutableStateOf(initialFavorite) }
 
-    val checklistEntries = remember {
+    val checklistEntries = remember(noteId) {
         mutableStateListOf<ChecklistEntry>().apply {
-            if (existingNote != null) addAll(existingNote.checklistItems)
+            addAll(initialChecklist)
         }
     }
 
-    var newChecklistText by remember { mutableStateOf("") }
+    var newChecklistText by remember(noteId) { mutableStateOf("") }
+    var isSaving by remember(noteId) { mutableStateOf(false) }
+    var saveError by remember(noteId) { mutableStateOf<String?>(null) }
+    var showUnsavedDialog by remember(noteId) { mutableStateOf(false) }
+    val isEditorActive = remember(noteId) { mutableStateOf(true) }
+    androidx.compose.runtime.DisposableEffect(noteId) {
+        isEditorActive.value = true
+        onDispose { isEditorActive.value = false }
+    }
 
-    // Debounced automatic background save
-    LaunchedEffect(title, body, format, checklistEntries.toList(), isPinned, isFavorite) {
-        if (title.isBlank() && body.isBlank() && checklistEntries.isEmpty()) {
-            return@LaunchedEffect
+    val hasUnsavedChanges =
+        title != initialTitle ||
+            body != initialBody ||
+            format != initialFormat ||
+            checklistEntries.toList() != initialChecklist ||
+            isPinned != initialPinned ||
+            isFavorite != initialFavorite ||
+            newChecklistText.isNotBlank()
+
+    fun attemptBackNavigation() {
+        if (isSaving) return
+        if (hasUnsavedChanges) {
+            showUnsavedDialog = true
+        } else {
+            onBack()
         }
-        autosaveStatus = "Saving..."
-        delay(1000L)
-        val record = (existingNote ?: NoteRecord(id = stableNoteId, title = title, body = body)).copy(
+    }
+
+    fun performExplicitSave() {
+        if (isSaving) return
+        val hasPendingChecklistInput = format == NoteBodyFormat.CHECKLIST && newChecklistText.isNotBlank()
+        if (title.isBlank() && body.isBlank() && checklistEntries.isEmpty() && !hasPendingChecklistInput) {
+            saveError = "Enter a note title, body, or checklist item before saving."
+            return
+        }
+        if (hasPendingChecklistInput) {
+            checklistEntries.add(ChecklistEntry(text = newChecklistText.trim()))
+            newChecklistText = ""
+        }
+        isSaving = true
+        saveError = null
+        val base = existingNote ?: NoteRecord(
+            id = stableNoteId,
+            title = title,
+            body = body,
+            createdAtEpochMs = initialCreatedAtEpochMs
+        )
+        val record = base.copy(
             id = stableNoteId,
             title = title.ifBlank { "Untitled Note" },
             body = body,
@@ -404,10 +451,22 @@ fun NoteEditorScreen(
             checklistItems = checklistEntries.toList(),
             isPinned = isPinned,
             isFavorite = isFavorite,
+            createdAtEpochMs = initialCreatedAtEpochMs,
             updatedAtEpochMs = System.currentTimeMillis()
         )
-        onSaveNote(record)
-        autosaveStatus = "All changes saved"
+        onSaveNote(record) { success, errorMessage ->
+            if (!isEditorActive.value) return@onSaveNote
+            isSaving = false
+            if (success) {
+                onBack()
+            } else {
+                saveError = errorMessage ?: "Could not save note."
+            }
+        }
+    }
+
+    BackHandler(enabled = !isSaving) {
+        attemptBackNavigation()
     }
 
     Scaffold(
@@ -415,34 +474,31 @@ fun NoteEditorScreen(
             TopAppBar(
                 title = { Text(if (noteId == null) "New Note" else "Edit Note") },
                 navigationIcon = {
-                    IconButton(onClick = {
-                        if (title.isNotBlank() || body.isNotBlank() || checklistEntries.isNotEmpty()) {
-                            val record = (existingNote ?: NoteRecord(id = stableNoteId, title = title, body = body)).copy(
-                                id = stableNoteId,
-                                title = title.ifBlank { "Untitled Note" },
-                                body = body,
-                                format = format,
-                                checklistItems = checklistEntries.toList(),
-                                isPinned = isPinned,
-                                isFavorite = isFavorite,
-                                updatedAtEpochMs = System.currentTimeMillis()
-                            )
-                            onSaveNote(record)
-                        }
-                        onBack()
-                    }) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                    IconButton(onClick = { attemptBackNavigation() }, enabled = !isSaving) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 actions = {
-                    IconButton(onClick = { isPinned = !isPinned }) {
+                    IconButton(
+                        onClick = {
+                            isPinned = !isPinned
+                            saveError = null
+                        },
+                        enabled = !isSaving
+                    ) {
                         Icon(
                             Icons.Default.PushPin,
                             contentDescription = "Pin",
                             tint = if (isPinned) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
                         )
                     }
-                    IconButton(onClick = { isFavorite = !isFavorite }) {
+                    IconButton(
+                        onClick = {
+                            isFavorite = !isFavorite
+                            saveError = null
+                        },
+                        enabled = !isSaving
+                    ) {
                         Icon(
                             if (isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
                             contentDescription = "Favorite",
@@ -450,10 +506,13 @@ fun NoteEditorScreen(
                         )
                     }
                     if (existingNote != null) {
-                        IconButton(onClick = {
-                            onDeleteNote(existingNote.id)
-                            onBack()
-                        }) {
+                        IconButton(
+                            onClick = {
+                                onDeleteNote(existingNote.id)
+                                onBack()
+                            },
+                            enabled = !isSaving
+                        ) {
                             Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error)
                         }
                     }
@@ -476,17 +535,17 @@ fun NoteEditorScreen(
             ) {
                 Tab(
                     selected = format == NoteBodyFormat.PLAIN_TEXT,
-                    onClick = { format = NoteBodyFormat.PLAIN_TEXT },
+                    onClick = { if (!isSaving) { format = NoteBodyFormat.PLAIN_TEXT; saveError = null } },
                     text = { Text("Plain Text") }
                 )
                 Tab(
                     selected = format == NoteBodyFormat.CHECKLIST,
-                    onClick = { format = NoteBodyFormat.CHECKLIST },
+                    onClick = { if (!isSaving) { format = NoteBodyFormat.CHECKLIST; saveError = null } },
                     text = { Text("Checklist") }
                 )
                 Tab(
                     selected = format == NoteBodyFormat.MARKDOWN,
-                    onClick = { format = NoteBodyFormat.MARKDOWN },
+                    onClick = { if (!isSaving) { format = NoteBodyFormat.MARKDOWN; saveError = null } },
                     text = { Text("Markdown") }
                 )
             }
@@ -497,9 +556,10 @@ fun NoteEditorScreen(
                 value = title,
                 onValueChange = {
                     title = it
-                    autosaveStatus = "Unsaved changes"
+                    saveError = null
                 },
                 label = { Text("Title") },
+                enabled = !isSaving,
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
@@ -514,8 +574,12 @@ fun NoteEditorScreen(
                     ) {
                         OutlinedTextField(
                             value = newChecklistText,
-                            onValueChange = { newChecklistText = it },
+                            onValueChange = {
+                                newChecklistText = it
+                                saveError = null
+                            },
                             placeholder = { Text("Add checklist item...") },
+                            enabled = !isSaving,
                             singleLine = true,
                             modifier = Modifier.weight(1f)
                         )
@@ -525,9 +589,10 @@ fun NoteEditorScreen(
                                 if (newChecklistText.isNotBlank()) {
                                     checklistEntries.add(ChecklistEntry(text = newChecklistText.trim()))
                                     newChecklistText = ""
-                                    autosaveStatus = "Unsaved changes"
+                                    saveError = null
                                 }
-                            }
+                            },
+                            enabled = !isSaving
                         ) {
                             Icon(Icons.Default.Add, contentDescription = "Add Item")
                         }
@@ -540,7 +605,7 @@ fun NoteEditorScreen(
                             .weight(1f)
                             .fillMaxWidth()
                     ) {
-                        items(checklistEntries) { entry ->
+                        items(checklistEntries, key = { it.id }) { entry ->
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier
@@ -549,11 +614,12 @@ fun NoteEditorScreen(
                             ) {
                                 Checkbox(
                                     checked = entry.isChecked,
+                                    enabled = !isSaving,
                                     onCheckedChange = { checked ->
                                         val idx = checklistEntries.indexOf(entry)
                                         if (idx >= 0) {
                                             checklistEntries[idx] = entry.copy(isChecked = checked)
-                                            autosaveStatus = "Unsaved changes"
+                                            saveError = null
                                         }
                                     }
                                 )
@@ -567,8 +633,9 @@ fun NoteEditorScreen(
                                 IconButton(
                                     onClick = {
                                         checklistEntries.remove(entry)
-                                        autosaveStatus = "Unsaved changes"
-                                    }
+                                        saveError = null
+                                    },
+                                    enabled = !isSaving
                                 ) {
                                     Icon(Icons.Default.Clear, contentDescription = "Remove")
                                 }
@@ -581,14 +648,24 @@ fun NoteEditorScreen(
                         value = body,
                         onValueChange = {
                             body = it
-                            autosaveStatus = "Unsaved changes"
+                            saveError = null
                         },
                         label = { Text(if (format == NoteBodyFormat.MARKDOWN) "Markdown Body" else "Note Body") },
+                        enabled = !isSaving,
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxWidth()
                     )
                 }
+            }
+
+            if (saveError != null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = saveError!!,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
             }
 
             Spacer(modifier = Modifier.height(10.dp))
@@ -597,28 +674,62 @@ fun NoteEditorScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                val statusLabel = when {
+                    isSaving -> "Saving..."
+                    hasUnsavedChanges -> "Unsaved changes"
+                    existingNote == null -> "Not yet saved"
+                    else -> "No unsaved changes"
+                }
                 Text(
-                    text = autosaveStatus,
+                    text = statusLabel,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.outline
                 )
-                TextButton(
-                    onClick = {
-                        val record = (existingNote ?: NoteRecord(title = title, body = body)).copy(
-                            title = title,
-                            body = body,
-                            format = format,
-                            checklistItems = checklistEntries.toList(),
-                            isPinned = isPinned,
-                            isFavorite = isFavorite
-                        )
-                        onSaveNote(record)
-                        autosaveStatus = "Saved"
-                    }
+                Button(
+                    onClick = { performExplicitSave() },
+                    enabled = !isSaving
                 ) {
-                    Text("Save Draft")
+                    Text(if (isSaving) "Saving..." else "Save Note")
                 }
             }
         }
+    }
+
+    if (showUnsavedDialog) {
+        AlertDialog(
+            onDismissRequest = { if (!isSaving) showUnsavedDialog = false },
+            title = { Text("Save changes?") },
+            text = { Text("You have unsaved changes in this note.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showUnsavedDialog = false
+                        performExplicitSave()
+                    },
+                    enabled = !isSaving
+                ) {
+                    Text("Save")
+                }
+            },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(
+                        onClick = {
+                            showUnsavedDialog = false
+                            onBack()
+                        },
+                        enabled = !isSaving
+                    ) {
+                        Text("Discard")
+                    }
+                    TextButton(
+                        onClick = { showUnsavedDialog = false },
+                        enabled = !isSaving
+                    ) {
+                        Text("Keep editing")
+                    }
+                }
+            }
+        )
     }
 }

@@ -1,6 +1,6 @@
 # PRIVATE VAULT V2 - CRYPTOGRAPHIC SPECIFICATION & DATA FORMAT
 
-> **Product:** Private Vault V2 (`2.0.1`, Version Code `2`)  
+> **Product:** Private Vault V2 (`2.0.4`, Version Code `5`)  
 > **Application ID:** `com.tpeditz.privatevault.v2`  
 > **Developer:** Developed by Tp Editz (@Tp_Editz / @tp_ediitz)  
 > **Repository:** `tpeditz/Private-vault-android-v2`
@@ -102,34 +102,52 @@ Each chunk $i$ ($0 \le i < N$) is written sequentially:
 
 ---
 
-## 4. Modern Streaming Backup Container (`PVAULTB2`)
+## 4. Streaming Backup Containers (`PVAULTB3` & `PVAULTB2`)
 
-Private Vault V2 introduces `PVAULTB2`, a streaming backup container engineered to support up to **2 GiB** files with memory consumption strictly bounded to $< 1\text{ MiB}$ peak RAM.
+Private Vault V2 supports backups up to **2 GiB** (`2,147,483,648` bytes), `50,000` records, and `32 MiB` manifest ciphertext. File payload I/O streams through bounded **$64\text{ KiB}$** (`PVAULTB2`) / **$256\text{ KiB}$** (`PVAULTB3`) buffers so multi-hundred-megabyte media files never need to be loaded into heap all at once. Total process memory during backup/restore still includes the Argon2id KDF working set ($16\text{–}32\text{ MiB}$ during key derivation), the encrypted/decoded manifest JSON (up to $32\text{ MiB}$), and decoded runtime record objects (PV-16).
 
-### Binary Header Layout (56 Bytes)
+### 4.1 Privacy-Enhanced Streaming Format (`PVAULTB3`, Default for New Exports)
+`PVAULTB3` eliminates unencrypted manifest lengths, item-count/size side-channels, and internal `PVM1` file headers from the container envelope while retaining full streaming bounds and backward compatibility (`PVAULTB1`/`PVAULTB2` backups remain readable without rewriting old user files).
+
+#### Public Binary Header Layout (40 Bytes)
 ```text
 +-----------------------+-------------------------------------------------------+
 | Byte Range            | Content                                               |
 +-----------------------+-------------------------------------------------------+
-| [0..7] (8 bytes)      | Magic: ASCII "PVAULTB2"                               |
-| [8..11] (4 bytes)     | backupSchemaVersion (Int, 2)                          |
+| [0..7] (8 bytes)      | Magic: ASCII "PVAULTB3"                               |
+| [8..11] (4 bytes)     | backupSchemaVersion (Int, 3)                          |
 | [12..15] (4 bytes)    | kdfMemoryKb (Int)                                     |
 | [16..19] (4 bytes)    | kdfIterations (Int)                                   |
 | [20..23] (4 bytes)    | kdfParallelism (Int)                                  |
 | [24..39] (16 bytes)   | backupKdfSalt (16 bytes)                              |
-| [40..51] (12 bytes)   | backupManifestNonce (12 bytes)                        |
-| [52..55] (4 bytes)    | manifestCiphertextLength M (Int)                      |
 +-----------------------+-------------------------------------------------------+
 ```
 
-### Encrypted Stream Layout
-1. **Metadata Manifest JSON ($M$ bytes):** Encrypted with AES-256-GCM using `backupKek` and AAD `PV2_BACKUP_V2:MANIFEST`. Contains full structured records for Notes, Credentials (with history), Folders, Albums, Links, and Authenticators, along with SHA-256 digests (`ciphertextSha256` and `thumbSha256`) for all media, thumbnail, and document payloads.
-2. **Binary Media & Document Payloads (Remainder):** Written sequentially as authenticated `PVM1` / `PVT1` binary streams directly following the manifest using bounded $64\text{ KiB}$ I/O buffers. During restore staging and `VaultRepository.commitRestore()`, every payload is verified by SHA-256, `PVM1`/`PVT1` header/frame AEAD decryption, and uniquely written (`fd.sync()`) before the atomic Room transaction executes.
+#### Authenticated Chunked Inner Stream (`[40..EOF]`)
+Everything after byte `40` is packaged into one continuous virtual byte stream `[4B manifestLen][manifestJson][asset0][asset1]...` and encrypted sequentially in uniform up-to-$256\text{ KiB}$ AES-256-GCM frames:
+```text
++-------------------------------+-----------------------------------------------+
+| Field                         | Length & Format                               |
++-------------------------------+-----------------------------------------------+
+| Plaintext Length L            | 4 bytes (Int, 1 <= L <= 262,144)              |
+| IsFinal Flag                  | 1 byte (0x01 only on final frame, else 0x00)  |
+| Frame Nonce                   | 12 bytes (CSPRNG 96-bit IV)                   |
+| Ciphertext + GCM Tag          | L + 16 bytes (AES-256-GCM)                    |
++-------------------------------+-----------------------------------------------+
+```
+- **Frame AAD:** `"PV3-CHK|ver=3|idx=<chunkIndex>|last=<0|1>|len=<plainLen>|m=<kdfMemoryKb>|t=<kdfIterations>|p=<kdfParallelism>"` — binds every chunk to its sequence position, finality, exact plaintext length, and header KDF profile, preventing chunk reordering, insertion, replay, or truncation.
+- **What `PVAULTB3` hides:** Encrypted manifest length, record counts, individual asset counts/sizes, payload boundaries, and internal `PVM1` media/document headers.
+- **Publicly observable metadata:** Container magic `"PVAULTB3"`, schema version `3`, public KDF header parameters (`kdfMemoryKb`, `kdfIterations`, `kdfParallelism`, 16-byte salt), and approximate total container size rounded up by per-frame framing overhead (`33` bytes per frame).
+
+### 4.2 Legacy Streaming Format (`PVAULTB2`, Readable & Compatible)
+For backups produced prior to V2.0.4 `PVAULTB3`:
+- **Header (56 Bytes):** Magic `"PVAULTB2"`, `backupSchemaVersion = 2`, KDF parameters, 16-byte salt, 12-byte manifest nonce, and 4-byte `manifestCiphertextLength`.
+- **Stream:** AES-256-GCM manifest (`PV2_BACKUP_V2:MANIFEST`) followed sequentially by authenticated `PVM1` / `PVT1` payloads validated against manifest sizes and SHA-256 digests during staging before the atomic Room transaction executes.
 
 ---
 
 ## 5. Cloud Recovery Password & Automatic Backup Boundary (`AutoCloudBackupKeyStore`)
-- Manual and scheduled Google Drive backups encrypt the exact same zero-knowledge `PVAULTB2` container before any bytes leave the device (`multipart/related` upload to `appDataFolder`).
+- Manual and scheduled Google Drive backups encrypt the exact same zero-knowledge `PVAULTB3` container before any bytes leave the device (`multipart/related` upload to `appDataFolder`), while preserving restore support for existing `PVAULTB2` and `PVAULTB1` cloud backups.
 - Scheduled WorkManager backups (`CloudBackupWorker`) NEVER invent ephemeral/unrecoverable passwords and NEVER decrypt vault contents while locked. They require a user-chosen Cloud Recovery Password wrapped in `AndroidKeyStore` (`AES/GCM/NoPadding`) and stage encrypted `.pvault` snapshots only during an active unlocked Slot 0 session.
 
 ---

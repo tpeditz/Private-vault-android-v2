@@ -1,5 +1,7 @@
 package com.tpeditz.privatevault.v2.ui.screens
 
+import android.net.Uri
+import android.provider.DocumentsContract
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -18,7 +20,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.FileDownload
@@ -55,7 +57,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.tpeditz.privatevault.v2.data.DocumentRecord
 import com.tpeditz.privatevault.v2.ui.VaultViewModel
+import com.tpeditz.privatevault.v2.ui.cleanupIncompleteDocumentExport
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.nio.charset.StandardCharsets
@@ -96,50 +104,14 @@ fun DocumentViewerScreen(
     val snackbarHostState = remember { SnackbarHostState() }
 
     var showDeleteConfirm by remember { mutableStateOf(false) }
-    var decryptedBytes by remember(document.id) { mutableStateOf<ByteArray?>(null) }
+    var textPreview by remember(document.id) { mutableStateOf<String?>(null) }
+    var hasPreviewContent by remember(document.id) { mutableStateOf(false) }
+    var isExporting by remember(document.id) { mutableStateOf(false) }
+    var exportJob by remember(document.id) { mutableStateOf<Job?>(null) }
     var loadError by remember(document.id) { mutableStateOf<String?>(null) }
     var isLoading by remember(document.id) { mutableStateOf(true) }
 
-    LaunchedEffect(document.id) {
-        isLoading = true
-        try {
-            decryptedBytes = viewModel.loadDecryptedDocumentBytes(document)
-        } catch (e: Exception) {
-            loadError = "Unable to open this encrypted document. Try unlocking your vault again."
-        } finally {
-            isLoading = false
-        }
-    }
-
-    DisposableEffect(document.id) {
-        onDispose {
-            decryptedBytes?.let { Arrays.fill(it, 0.toByte()) }
-            decryptedBytes = null
-        }
-    }
-
-    val exportLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument(document.mimeType)
-    ) { uri ->
-        if (uri != null && decryptedBytes != null) {
-            scope.launch(Dispatchers.IO) {
-                try {
-                    context.contentResolver.openOutputStream(uri)?.use { os ->
-                        os.write(decryptedBytes!!)
-                    }
-                    withContext(Dispatchers.Main) {
-                        snackbarHostState.showSnackbar("Document saved to chosen location (unencrypted copy)")
-                    }
-                } catch (e: Exception) {
-                    withContext(Dispatchers.Main) {
-                        snackbarHostState.showSnackbar(com.tpeditz.privatevault.v2.ui.VaultErrorMapper.mapFileExportError(e))
-                    }
-                }
-            }
-        }
-    }
-
-    val isTextDocument = remember(document.mimeType) {
+    val isTextDocument = remember(document.mimeType, document.originalFileName) {
         document.mimeType.startsWith("text/") ||
             document.mimeType.contains("json") ||
             document.mimeType.contains("xml") ||
@@ -150,12 +122,110 @@ fun DocumentViewerScreen(
             document.originalFileName.endsWith(".json", true)
     }
 
-    val textPreview = remember(decryptedBytes, isTextDocument) {
-        if (isTextDocument && decryptedBytes != null) {
-            runCatching {
-                String(decryptedBytes!!, StandardCharsets.UTF_8).take(20000)
-            }.getOrNull()
-        } else null
+    LaunchedEffect(document.id, isTextDocument) {
+        isLoading = true
+        loadError = null
+        textPreview = null
+        hasPreviewContent = false
+        var rawPreview: ByteArray? = null
+        try {
+            val bytes = viewModel.loadDecryptedDocumentPreviewBytes(document, maxPreviewBytes = 512 * 1024)
+            rawPreview = bytes
+            ensureActive()
+            hasPreviewContent = true
+            if (isTextDocument) {
+                textPreview = String(bytes, StandardCharsets.UTF_8).take(20000)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            loadError = "Unable to open this encrypted document. Try unlocking your vault again."
+        } finally {
+            rawPreview?.let { Arrays.fill(it, 0.toByte()) }
+            rawPreview = null
+            isLoading = false
+        }
+    }
+
+    DisposableEffect(document.id) {
+        onDispose {
+            exportJob?.cancel()
+            exportJob = null
+            textPreview = null
+        }
+    }
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument(document.mimeType)
+    ) { uri ->
+        if (uri != null) {
+            exportJob?.cancel()
+            isExporting = true
+            exportJob = scope.launch(Dispatchers.IO) {
+                var exportCompleted = false
+                try {
+                    val outStream = context.contentResolver.openOutputStream(uri)
+                        ?: throw java.io.IOException("Unable to open destination file.")
+                    outStream.use { os ->
+                        val written = viewModel.exportDecryptedDocumentToStream(
+                            documentRecord = document,
+                            outputStream = os,
+                            isCancelled = { !isActive }
+                        )
+                        ensureActive()
+                        if (written != document.originalSizeBytes) {
+                            throw java.io.IOException("Exported file size did not match encrypted document length.")
+                        }
+                        os.flush()
+                    }
+                    exportCompleted = true
+                    withContext(Dispatchers.Main) {
+                        snackbarHostState.showSnackbar("Document saved to chosen location (unencrypted copy)")
+                    }
+                } catch (e: CancellationException) {
+                    val deleted = withContext(NonCancellable + Dispatchers.IO) {
+                        cleanupIncompleteDocumentExport(exportCompleted) {
+                            DocumentsContract.deleteDocument(context.contentResolver, uri)
+                        }
+                    }
+                    // Notification cancellation is not an export failure. Keep a file
+                    // whose verified output stream has already closed successfully.
+                    if (deleted != null && scope.isActive) {
+                        withContext(NonCancellable + Dispatchers.Main) {
+                            val cancelMsg = if (deleted) {
+                                "Export cancelled. Incomplete file removed."
+                            } else {
+                                "Export cancelled. An incomplete file may remain at the chosen location."
+                            }
+                            runCatching { snackbarHostState.showSnackbar(cancelMsg) }
+                        }
+                    }
+                    throw e
+                } catch (e: Exception) {
+                    val deleted = withContext(NonCancellable + Dispatchers.IO) {
+                        cleanupIncompleteDocumentExport(exportCompleted) {
+                            DocumentsContract.deleteDocument(context.contentResolver, uri)
+                        }
+                    }
+                    if (deleted != null) {
+                        val baseMsg = com.tpeditz.privatevault.v2.ui.VaultErrorMapper.mapFileExportError(e)
+                        val msg = if (!deleted) {
+                            "$baseMsg An incomplete file may remain at the chosen location."
+                        } else {
+                            baseMsg
+                        }
+                        withContext(NonCancellable + Dispatchers.Main) {
+                            runCatching { snackbarHostState.showSnackbar(msg) }
+                        }
+                    }
+                } finally {
+                    withContext(NonCancellable + Dispatchers.Main) {
+                        isExporting = false
+                        exportJob = null
+                    }
+                }
+            }
+        }
     }
 
     if (showDeleteConfirm) {
@@ -196,7 +266,7 @@ fun DocumentViewerScreen(
                 },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 actions = {
@@ -260,18 +330,26 @@ fun DocumentViewerScreen(
                 }
             }
 
-            // Export Button
+            // Export & Cancel Controls
             Button(
                 onClick = {
                     viewModel.grantFilePickerImmunity()
                     exportLauncher.launch(document.originalFileName.ifBlank { "${document.title}.bin" })
                 },
-                enabled = decryptedBytes != null,
+                enabled = !isLoading && !isExporting && loadError == null,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Icon(Icons.Default.FileDownload, contentDescription = null)
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Export Decrypted Document")
+                Text(if (isExporting) "Exporting..." else "Export Decrypted Document")
+            }
+            if (isExporting) {
+                TextButton(
+                    onClick = { exportJob?.cancel() },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Cancel Export", color = MaterialTheme.colorScheme.error)
+                }
             }
             Text(
                 text = "Note: Exported copies are unencrypted and saved outside Private Vault's protected storage.",
@@ -286,30 +364,32 @@ fun DocumentViewerScreen(
                 fontWeight = FontWeight.Bold
             )
 
+            val activePreview = textPreview
+            val activeErr = loadError
             if (isLoading) {
                 Box(modifier = Modifier.fillMaxWidth().height(150.dp), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
-            } else if (loadError != null) {
+            } else if (activeErr != null) {
                 OutlinedCard(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(14.dp)
                 ) {
                     Text(
-                        text = loadError!!,
+                        text = activeErr,
                         color = MaterialTheme.colorScheme.error,
                         modifier = Modifier.padding(16.dp),
                         style = MaterialTheme.typography.bodyMedium
                     )
                 }
-            } else if (textPreview != null) {
+            } else if (activePreview != null) {
                 OutlinedCard(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(14.dp)
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Text(
-                            text = textPreview,
+                            text = activePreview,
                             fontFamily = FontFamily.Monospace,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurface

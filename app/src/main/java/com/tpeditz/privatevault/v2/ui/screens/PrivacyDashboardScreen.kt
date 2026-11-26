@@ -18,7 +18,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Fingerprint
@@ -72,7 +72,7 @@ fun PrivacyDashboardScreen(
                 title = { Text("Privacy Dashboard", fontWeight = FontWeight.Bold) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -275,12 +275,6 @@ fun PrivacyDashboardScreen(
                             subtitle = if (uiState.isBiometricsConfigured) "Hardware Keystore protected" else "Disabled",
                             isGood = uiState.isBiometricsConfigured,
                             onClick = { onNavigateToSecondary(SecondaryDestination.SecuritySettings) }
-                        )
-                        StatusRow(
-                            title = "Android Autofill Service",
-                            subtitle = if (uiState.privacyMetrics.isAutofillActive) "Active provider" else "Inactive — tap to configure",
-                            isGood = uiState.privacyMetrics.isAutofillActive,
-                            onClick = { onNavigateToSecondary(SecondaryDestination.AutofillSettings) }
                         )
                         StatusRow(
                             title = "Automatic Cloud Backup",

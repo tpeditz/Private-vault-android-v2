@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
 import android.os.Bundle
+import android.provider.DocumentsContract
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -83,7 +84,6 @@ import com.tpeditz.privatevault.v2.ui.PrimaryTab
 import com.tpeditz.privatevault.v2.ui.SecondaryDestination
 import com.tpeditz.privatevault.v2.ui.VaultViewModel
 import com.tpeditz.privatevault.v2.ui.screens.AboutScreen
-import com.tpeditz.privatevault.v2.ui.screens.AutofillSettingsScreen
 import com.tpeditz.privatevault.v2.ui.screens.BackupRestoreScreen
 import com.tpeditz.privatevault.v2.ui.screens.CloudBackupScreen
 import com.tpeditz.privatevault.v2.ui.screens.DocumentViewerScreen
@@ -287,12 +287,15 @@ class MainActivity : FragmentActivity() {
                             passwordChars = activePwd,
                             outputStream = os,
                             onProgress = { _, _ -> },
+                            onCleanupIncomplete = {
+                                DocumentsContract.deleteDocument(contentResolver, uri)
+                            },
                             onComplete = { success, err ->
                                 java.util.Arrays.fill(activePwd, '\u0000')
                                 scope.launch {
                                     snackbarHostState.showSnackbar(
-                                        if (success) "Backup saved successfully"
-                                        else err ?: "Could not create backup."
+                                        if (success) "Backup saved successfully."
+                                        else err ?: "Backup could not be completed. Your previous backup has been kept."
                                     )
                                 }
                             }
@@ -329,10 +332,15 @@ class MainActivity : FragmentActivity() {
                 if (uri != null) {
                     val ins = runCatching { contentResolver.openInputStream(uri) }.getOrNull()
                     if (ins != null) {
-                        viewModel.importCsv(ins) { imported, skipped ->
+                        viewModel.importCsv(ins) { imported, skipped, err ->
                             scope.launch {
-                                snackbarHostState.showSnackbar("Imported $imported credentials ($skipped skipped)")
+                                val msg = err ?: "Imported $imported credentials ($skipped skipped)"
+                                snackbarHostState.showSnackbar(msg)
                             }
+                        }
+                    } else {
+                        scope.launch {
+                            snackbarHostState.showSnackbar("Unable to open the selected CSV file.")
                         }
                     }
                 }
@@ -423,7 +431,7 @@ class MainActivity : FragmentActivity() {
                                     pendingRestorePayload = uiState.pendingRestorePayload,
                                     onCreateVault = { chars, cb -> viewModel.createVault(chars, cb) },
                                     onCreateVaultWithRestore = { chars, cb ->
-                                        viewModel.createVaultAndCommitRestore(chars, RestoreMode.REPLACE_ACTIVE_VAULT, cb)
+                                        viewModel.createVaultAndCommitRestore(chars, onComplete = cb)
                                     },
                                     onRestoreBackupClicked = {
                                         firstLaunchRestorePassword = ""
@@ -441,9 +449,10 @@ class MainActivity : FragmentActivity() {
                                     onUnlockWithPassword = { chars, cb -> viewModel.unlockWithPassword(chars, cb) },
                                     onUnlockWithBiometric = {
                                         scope.launch {
-                                            val iv = viewModel.getBiometricIvForUnlock()
-                                            if (iv != null) {
-                                                val cipher = BiometricKeystoreManager.getDecryptCipherForUnlock(iv)
+                                            val unlockInfo = viewModel.getBiometricUnlockInfo()
+                                            if (unlockInfo != null) {
+                                                val (iv, alias) = unlockInfo
+                                                val cipher = BiometricKeystoreManager.getDecryptCipherForUnlock(iv, alias)
                                                 if (cipher != null) {
                                                     val prompt = BiometricPrompt(
                                                         this@MainActivity,
@@ -479,18 +488,39 @@ class MainActivity : FragmentActivity() {
                                 )
                             } else {
                                 // Vault is Unlocked: Handle Screen Routing
-                                BackHandler(enabled = uiState.currentSecondary !is SecondaryDestination.None) {
+                                BackHandler(
+                                    enabled = uiState.currentSecondary !is SecondaryDestination.None &&
+                                        uiState.currentSecondary !is SecondaryDestination.NoteEditor
+                                ) {
                                     viewModel.navigateBack()
                                 }
 
                                 when (val sec = uiState.currentSecondary) {
                                     is SecondaryDestination.NoteEditor -> {
+                                        val editorDest = sec
                                         NoteEditorScreen(
-                                            noteId = sec.noteId,
+                                            noteId = editorDest.noteId,
                                             uiState = uiState,
-                                            onSaveNote = { viewModel.saveNote(it) },
+                                            onSaveNote = { record, onComplete ->
+                                                viewModel.saveNote(record) { success, errorMsg ->
+                                                    val stillUnlockedHere = viewModel.uiState.value.isUnlocked &&
+                                                        viewModel.uiState.value.currentSecondary == editorDest
+                                                    onComplete(success && stillUnlockedHere, errorMsg)
+                                                    if (success && stillUnlockedHere) {
+                                                        scope.launch {
+                                                            snackbarHostState.showSnackbar("Note saved successfully")
+                                                        }
+                                                    }
+                                                }
+                                            },
                                             onDeleteNote = { viewModel.deleteNote(it) },
-                                            onBack = { viewModel.navigateBack() }
+                                            onBack = {
+                                                if (viewModel.uiState.value.isUnlocked &&
+                                                    viewModel.uiState.value.currentSecondary == editorDest
+                                                ) {
+                                                    viewModel.navigateBack()
+                                                }
+                                            }
                                         )
                                     }
                                     is SecondaryDestination.PasswordEditor -> {
@@ -519,11 +549,6 @@ class MainActivity : FragmentActivity() {
                                             viewModel = viewModel,
                                             documentsList = uiState.documents,
                                             onDeleteDocument = { viewModel.deleteDocument(it) },
-                                            onBack = { viewModel.navigateBack() }
-                                        )
-                                    }
-                                    is SecondaryDestination.AutofillSettings -> {
-                                        AutofillSettingsScreen(
                                             onBack = { viewModel.navigateBack() }
                                         )
                                     }
@@ -583,7 +608,14 @@ class MainActivity : FragmentActivity() {
                                             onConfirmRestore = { mode ->
                                                 viewModel.confirmRestore(mode) { success ->
                                                     scope.launch {
-                                                        snackbarHostState.showSnackbar(if (success) "Restore complete" else "Restore failed")
+                                                        val errMsg = viewModel.uiState.value.pendingRestoreError?.message
+                                                        snackbarHostState.showSnackbar(
+                                                            when {
+                                                                success -> "Vault restored successfully."
+                                                                errMsg != null -> errMsg
+                                                                else -> "Restore cancelled."
+                                                            }
+                                                        )
                                                     }
                                                 }
                                             },
@@ -718,32 +750,47 @@ class MainActivity : FragmentActivity() {
                                             onSetAutoLockTimeout = { viewModel.setAutoLockTimeout(it) },
                                             onSetClipboardTtl = { viewModel.setClipboardTtl(it) },
                                             onEnableBiometrics = {
-                                                val cipher = if (viewModel.canEnrollBiometrics()) BiometricKeystoreManager.getEncryptCipherForEnrollment() else null
-                                                if (cipher != null) {
-                                                    val prompt = BiometricPrompt(
-                                                        this@MainActivity,
-                                                        ContextCompat.getMainExecutor(this@MainActivity),
-                                                        object : BiometricPrompt.AuthenticationCallback() {
-                                                            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                                                                val authCipher = result.cryptoObject?.cipher ?: cipher
-                                                                scope.launch {
-                                                                    val ok = runCatching { viewModel.enrollBiometrics(authCipher) }.getOrDefault(false)
-                                                                    snackbarHostState.showSnackbar(if (ok) "Biometric quick-unlock enrolled" else "Enrollment failed")
+                                                scope.launch {
+                                                    val staged = if (viewModel.canEnrollBiometrics()) {
+                                                        BiometricKeystoreManager.getEncryptCipherForStagedEnrollment(
+                                                            viewModel.getActiveBiometricAlias()
+                                                        )
+                                                    } else null
+                                                    if (staged != null) {
+                                                        val prompt = BiometricPrompt(
+                                                            this@MainActivity,
+                                                            ContextCompat.getMainExecutor(this@MainActivity),
+                                                            object : BiometricPrompt.AuthenticationCallback() {
+                                                                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                                                                    val authCipher = result.cryptoObject?.cipher ?: staged.cipher
+                                                                    scope.launch {
+                                                                        val ok = viewModel.enrollBiometrics(authCipher, staged.targetAlias)
+                                                                        snackbarHostState.showSnackbar(if (ok) "Biometric quick-unlock enrolled" else "Enrollment failed")
+                                                                    }
+                                                                }
+                                                                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                                                                    BiometricKeystoreManager.discardStagedAlias(staged.targetAlias)
+                                                                    val cancelled = errorCode == BiometricPrompt.ERROR_USER_CANCELED ||
+                                                                        errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON ||
+                                                                        errorCode == BiometricPrompt.ERROR_CANCELED
+                                                                    val msg = if (cancelled) {
+                                                                        "Biometric setup cancelled. Previous settings unchanged."
+                                                                    } else {
+                                                                        "Biometric error: $errString"
+                                                                    }
+                                                                    scope.launch { snackbarHostState.showSnackbar(msg) }
                                                                 }
                                                             }
-                                                            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                                                                scope.launch { snackbarHostState.showSnackbar("Biometric error: $errString") }
-                                                            }
-                                                        }
-                                                    )
-                                                    val promptInfo = BiometricPrompt.PromptInfo.Builder()
-                                                        .setTitle("Enroll Biometric Quick-Unlock")
-                                                        .setSubtitle("Confirm your biometric identity to protect your vault")
-                                                        .setNegativeButtonText("Cancel")
-                                                        .build()
-                                                    prompt.authenticate(promptInfo, BiometricPrompt.CryptoObject(cipher))
-                                                } else {
-                                                    scope.launch { snackbarHostState.showSnackbar("Biometric enrollment cipher unavailable") }
+                                                        )
+                                                        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+                                                            .setTitle("Enroll Biometric Quick-Unlock")
+                                                            .setSubtitle("Confirm your biometric identity to protect your vault")
+                                                            .setNegativeButtonText("Cancel")
+                                                            .build()
+                                                        prompt.authenticate(promptInfo, BiometricPrompt.CryptoObject(staged.cipher))
+                                                    } else {
+                                                        snackbarHostState.showSnackbar("Biometric enrollment cipher unavailable")
+                                                    }
                                                 }
                                             },
                                             onDisableBiometrics = { viewModel.disableBiometrics() },
@@ -841,7 +888,8 @@ class MainActivity : FragmentActivity() {
                                                 onDeleteDocument = { viewModel.deleteDocument(it) },
                                                 onDeleteLink = { viewModel.deleteLink(it) },
                                                 onCreateAlbum = { viewModel.createAlbum(it) },
-                                                onDeleteAlbum = { viewModel.deleteAlbum(it) }
+                                                onDeleteAlbum = { viewModel.deleteAlbum(it) },
+                                                onLoadThumbnail = { media -> viewModel.loadDecryptedThumbnailBytes(media) }
                                             )
                                             PrimaryTab.SETTINGS -> SettingsScreen(
                                                 uiState = uiState,
@@ -852,7 +900,6 @@ class MainActivity : FragmentActivity() {
                                             )
                                         }
                                     }
-                                    else -> {}
                                 }
                             }
                         }

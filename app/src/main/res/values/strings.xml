@@ -22,8 +22,4 @@
     <string name="action_restore_backup">Restore Backup</string>
     <string name="action_settings">Settings</string>
 
-    <!-- Autofill -->
-    <string name="autofill_service_name">Private Vault Autofill</string>
-    <string name="autofill_unlock_prompt">Unlock Private Vault to Autofill</string>
-    <string name="autofill_save_prompt">Save to Private Vault?</string>
 </resources>

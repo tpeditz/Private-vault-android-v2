@@ -136,19 +136,6 @@ fun SettingsScreen(
                             subtitle = "Biometrics, Auto-Lock, Decoy Vault",
                             onClick = { onNavigateToSecondary(SecondaryDestination.SecuritySettings) }
                         )
-                        HorizontalDivider()
-                        SettingsRow(
-                            icon = Icons.Default.Password,
-                            title = "Autofill Service",
-                            subtitle = if (uiState.privacyMetrics.isAutofillActive) {
-                                "Active provider"
-                            } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-                                "Requires Android 8.0 or higher"
-                            } else {
-                                "Tap to set up in Android settings"
-                            },
-                            onClick = { onNavigateToSecondary(SecondaryDestination.AutofillSettings) }
-                        )
                     }
                 }
             }

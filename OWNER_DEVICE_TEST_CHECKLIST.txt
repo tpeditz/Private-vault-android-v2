@@ -1,0 +1,72 @@
+Private Vault V2.0.4 - Owner Phone Verification Checklist
+===========================================================
+
+SAFETY WARNING BEFORE TESTING ON A DEVICE
+-----------------------------------------
+- Keep a separate verified copy of your existing vault backups in a safe
+  location BEFORE installing or testing any release candidate.
+- Do NOT uninstall your existing working vault if it holds the only copy of
+  important data, and do NOT overwrite your only good `.pvault` or Google Drive
+  backup during testing.
+- Run every test below using harmless sample/synthetic records (e.g., dummy
+  notes, sample PDFs, sample photos) and isolated test filenames.
+
+No physical Android phone or emulator was connected via ADB during this build
+(`adb devices -l` returned empty), so please run these checks on your device
+with the Debug APK (`app-debug.apk`) or a workflow/keystore-signed Release APK:
+
+1. Isolated First-Launch & Partial/Full Restore Safety (R2, R4)
+   - On a clean test profile or secondary device (without touching your primary
+     device's only vault):
+   - Export a sample full backup ("All Vault Data") -> check `.pvault` file exists.
+   - Start first-launch setup -> tap "Restore from Backup" -> select sample backup:
+     * Verify preview shows "Scope: Full vault backup" and itemized counts.
+     * Cancel mid-restore or test wrong password: verify app stays cleanly on
+       Setup without claiming recovery success, and retry succeeds cleanly.
+   - Inside an unlocked test vault containing existing notes + passwords + docs:
+     * Export a "Documents Only" backup containing at least two custom document
+       folders (`Taxes`, `IDs`) and sample PDFs inside them.
+     * Restore that `Documents Only` `.pvault` file into the test vault:
+       - Verify Preview shows "Backup Scope: Documents Only".
+       - Verify "Replace Active" button is DISABLED and only Merge is allowed.
+       - Confirm Merge -> verify both Documents AND document folders (`Taxes`,
+         `IDs`) appear while existing Notes, Passwords, and Links remain intact.
+   - Test an older `.pvault` backup lacking an explicit scope marker (`PVAULTB1`
+     or earlier `PVAULTB2`):
+     * Verify Preview shows "Backup Scope: Backup scope unknown" and offers
+       "Merge (Recommended)". Verify the old backup file itself stays unmodified.
+
+2. Asset Integrity, Cancellation & Cleanup (R1, R5)
+   - Export a test vault containing photos, a video, a PDF, notes, and TOTP.
+   - Confirm progress reaches 100% and shows "Backup saved successfully." only
+     AFTER choosing the destination and finishing the write.
+   - Start another SAF export into a test folder, then tap Cancel mid-way:
+     * Verify cancelled snackbar appears and your previously saved backup in
+       another location is completely untouched.
+
+3. Notes Editor Checklist & Lifecycle Checks (R6)
+   - Create a New Note -> switch to Checklist tab -> type a Title and type an
+     item into "Add checklist item..." WITHOUT tapping "+":
+     * Tap "Save Note": verify it returns to Notes, shows "Note saved
+       successfully", and re-opening the note shows the checklist item saved.
+   - Repeat creating/editing a checklist item without tapping "+", tap Back:
+     * Verify "Save changes?" dialog offers Save / Discard / Keep editing.
+     * Tap "Save": verify the pending item is saved cleanly with zero duplicates.
+   - Tap "Save Note" when title, body, and pending checklist box are all empty:
+     * Verify inline validation error displays without saving an empty note.
+   - Open an unchanged existing note and press Back:
+     * Verify immediate clean return with no dialog and updated timestamp unchanged.
+
+4. TOTP QR/URI & Media Playback Checks
+   - Add authenticator via QR/URI with `+` in email (e.g. `user+tag@example.com`)
+     and verify literal `+` is preserved cleanly.
+   - Verify invalid `digits=5` or `algorithm=MD5` URIs show clear error text.
+   - Play an encrypted video and lock screen/press Power button:
+     * Verify playback stops cleanly without leaks or crashes.
+
+5. Optional Automated Android Instrumentation Run Over USB
+   - Connect test Android device with USB Debugging enabled and run:
+     `.\gradlew.bat :app:connectedDebugAndroidTest`
+   - Verifies `PrivacyAndSecurityUiAndroidTest` (Notes explicit save + pending
+     checklist + partial/unknown restore scope UI tests), `RoomVaultRepositoryRecoveryAndroidTest`,
+     `PreferencesPersistenceAndroidTest`, and `ShareToVaultAndScreensAndroidTest`.

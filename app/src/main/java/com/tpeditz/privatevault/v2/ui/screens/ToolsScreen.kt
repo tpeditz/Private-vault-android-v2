@@ -20,7 +20,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
@@ -70,7 +70,14 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import com.tpeditz.privatevault.v2.data.TotpAlgorithm
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -106,7 +113,7 @@ fun ToolsScreen(
                 title = { Text("Security Tools", fontWeight = FontWeight.Bold) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -216,6 +223,24 @@ fun GeneratorToolView(
                         fontSize = 18.sp,
                         color = MaterialTheme.colorScheme.primary
                     )
+                    if (mode == "Password" && entropyBits > 0.0) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "Estimated entropy: ~${entropyBits.roundToInt()} bits",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else if (mode == "Passphrase") {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        val passEval = remember(generatedResult) {
+                            OfflinePasswordStrengthEstimator.evaluate(generatedResult)
+                        }
+                        Text(
+                            text = "Strength: ${passEval.band.label} (~${passEval.estimatedEntropyBits} bits)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     Spacer(modifier = Modifier.height(12.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -261,13 +286,17 @@ fun GeneratorToolView(
             }
 
             item {
+                val enabledClassCount = listOf(uppercase, lowercase, digits, symbols).count { it }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("Uppercase (A-Z)")
-                    Switch(checked = uppercase, onCheckedChange = { uppercase = it })
+                    Switch(
+                        checked = uppercase,
+                        onCheckedChange = { if (it || enabledClassCount > 1) uppercase = it }
+                    )
                 }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -275,7 +304,10 @@ fun GeneratorToolView(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("Lowercase (a-z)")
-                    Switch(checked = lowercase, onCheckedChange = { lowercase = it })
+                    Switch(
+                        checked = lowercase,
+                        onCheckedChange = { if (it || enabledClassCount > 1) lowercase = it }
+                    )
                 }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -283,7 +315,10 @@ fun GeneratorToolView(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("Numbers (0-9)")
-                    Switch(checked = digits, onCheckedChange = { digits = it })
+                    Switch(
+                        checked = digits,
+                        onCheckedChange = { if (it || enabledClassCount > 1) digits = it }
+                    )
                 }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -291,7 +326,10 @@ fun GeneratorToolView(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("Symbols (!@#$)")
-                    Switch(checked = symbols, onCheckedChange = { symbols = it })
+                    Switch(
+                        checked = symbols,
+                        onCheckedChange = { if (it || enabledClassCount > 1) symbols = it }
+                    )
                 }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -374,7 +412,7 @@ fun StrengthAuditToolView(
             item {
                 Text("Weak Passwords to Update", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             }
-            items(weakItems) { cred ->
+            items(weakItems, key = { it.id }) { cred ->
                 OutlinedCard(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -402,7 +440,7 @@ fun StrengthAuditToolView(
             item {
                 Text("Reused Passwords", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             }
-            items(reusedItems) { cred ->
+            items(reusedItems, key = { it.id }) { cred ->
                 OutlinedCard(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -436,6 +474,7 @@ fun AuthenticatorToolView(
     onCopyCode: (String, String) -> Unit
 ) {
     var showAddDialog by remember { mutableStateOf(false) }
+    var pendingDeleteAuth by remember { mutableStateOf<AuthenticatorRecord?>(null) }
 
     Scaffold(
         floatingActionButton = {
@@ -449,7 +488,7 @@ fun AuthenticatorToolView(
         }
     ) { innerPadding ->
         if (uiState.authenticators.isEmpty()) {
-            EmptyMediaState("No authenticator accounts added yet", Icons.Default.Timer)
+            EmptyMediaState("No authenticator accounts added yet. Tap + to add one.", Icons.Default.Timer)
         } else {
             LazyColumn(
                 modifier = Modifier
@@ -459,14 +498,26 @@ fun AuthenticatorToolView(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 items(uiState.authenticators, key = { it.id }) { auth ->
+                    val safePeriod = auth.periodSeconds.coerceIn(TotpEngine.MIN_TOTP_PERIOD_SECONDS, TotpEngine.MAX_TOTP_PERIOD_SECONDS)
+                    val remainingSec = TotpEngine.getRemainingSeconds(
+                        epochSeconds = uiState.totpEpochSeconds,
+                        periodSeconds = safePeriod
+                    )
                     val code = runCatching {
                         TotpEngine.generateTotpCode(
                             secretBase32 = auth.secret,
+                            epochSeconds = uiState.totpEpochSeconds,
                             periodSeconds = auth.periodSeconds,
                             digits = auth.digits,
                             algorithm = auth.algorithm
                         )
-                    }.getOrDefault("------")
+                    }.getOrNull()
+                    val formattedCode = if (code != null) {
+                        val groupSize = if (code.length == 8) 4 else 3
+                        code.chunked(groupSize).joinToString(" ")
+                    } else {
+                        "Invalid"
+                    }
 
                     OutlinedCard(
                         modifier = Modifier.fillMaxWidth(),
@@ -478,16 +529,16 @@ fun AuthenticatorToolView(
                                 .padding(16.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            // Circular countdown progress
+                            // Circular countdown progress bound to this item's period
                             Box(contentAlignment = Alignment.Center) {
                                 CircularProgressIndicator(
-                                    progress = { (uiState.totpRemainingSeconds.toFloat() / auth.periodSeconds.toFloat()).coerceIn(0f, 1f) },
+                                    progress = { (remainingSec.toFloat() / safePeriod.toFloat()).coerceIn(0f, 1f) },
                                     modifier = Modifier.size(36.dp),
                                     color = MaterialTheme.colorScheme.primary,
                                     strokeWidth = 3.dp
                                 )
                                 Text(
-                                    text = "${uiState.totpRemainingSeconds}s",
+                                    text = "${remainingSec}s",
                                     style = MaterialTheme.typography.labelSmall,
                                     fontSize = 10.sp
                                 )
@@ -502,19 +553,22 @@ fun AuthenticatorToolView(
                                 }
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Text(
-                                    text = "${code.substring(0, 3)} ${code.substring(3)}",
+                                    text = formattedCode,
                                     fontFamily = JetBrainsMono,
                                     fontSize = 20.sp,
                                     fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary
+                                    color = if (code != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
                                 )
                             }
 
-                            IconButton(onClick = { onCopyCode(auth.serviceName, code) }) {
+                            IconButton(
+                                onClick = { if (code != null) onCopyCode(auth.serviceName, code) },
+                                enabled = code != null
+                            ) {
                                 Icon(Icons.Default.ContentCopy, contentDescription = "Copy Code")
                             }
-                            IconButton(onClick = { onDeleteAuthenticator(auth.id) }) {
-                                Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error)
+                            IconButton(onClick = { pendingDeleteAuth = auth }) {
+                                Icon(Icons.Default.Delete, contentDescription = "Delete Authenticator", tint = MaterialTheme.colorScheme.error)
                             }
                         }
                     }
@@ -523,43 +577,77 @@ fun AuthenticatorToolView(
         }
     }
 
+    val confirmTarget = pendingDeleteAuth
+    if (confirmTarget != null) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { pendingDeleteAuth = null },
+            title = { Text("Delete Authenticator?") },
+            text = {
+                Text("Remove ${confirmTarget.serviceName}? Make sure you have another 2FA backup option before deleting.")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDeleteAuthenticator(confirmTarget.id)
+                        pendingDeleteAuth = null
+                    }
+                ) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteAuth = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     if (showAddDialog) {
         var service by remember { mutableStateOf("") }
         var account by remember { mutableStateOf("") }
         var secret by remember { mutableStateOf("") }
+        var parsedDigits by remember { mutableIntStateOf(6) }
+        var parsedPeriod by remember { mutableIntStateOf(30) }
+        var parsedAlgo by remember { mutableStateOf(TotpAlgorithm.SHA1) }
         var scanError by remember { mutableStateOf<String?>(null) }
 
         val qrPickerLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.PickVisualMedia()
         ) { uri ->
             if (uri != null) {
-                val bitmap = try {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                        ImageDecoder.decodeBitmap(ImageDecoder.createSource(context.contentResolver, uri)) { decoder, _, _ ->
-                            decoder.isMutableRequired = true
-                        }
-                    } else {
-                        @Suppress("DEPRECATION")
-                        MediaStore.Images.Media.getBitmap(context.contentResolver, uri)
+                scope.launch {
+                    val bitmap = withContext(Dispatchers.IO) { decodeBoundedQrBitmap(context, uri) }
+                    if (bitmap == null) {
+                        scanError = "Could not open or decode that image."
+                        return@launch
                     }
-                } catch (_: Exception) {
-                    null
-                }
-                if (bitmap != null) {
-                    val qrText = decodeQrFromBitmap(bitmap)
+                    val qrText = withContext(Dispatchers.Default) {
+                        try {
+                            decodeQrFromBitmap(bitmap)
+                        } finally {
+                            bitmap.recycle()
+                        }
+                    }
                     if (!qrText.isNullOrBlank()) {
-                        val parsed = parseOtpAuthUri(qrText)
-                        if (parsed != null) {
-                            service = parsed.first
-                            account = parsed.second
-                            secret = parsed.third
-                            scanError = null
-                        } else {
-                            scanError = "QR code is not a valid TOTP URI"
+                        when (val parsed = TotpEngine.parseOtpAuthUriWithDetails(qrText)) {
+                            is TotpEngine.ParseOtpAuthResult.Success -> {
+                                service = parsed.parsed.serviceName
+                                account = parsed.parsed.accountName
+                                secret = parsed.parsed.secret
+                                parsedDigits = parsed.parsed.digits
+                                parsedPeriod = parsed.parsed.periodSeconds
+                                parsedAlgo = parsed.parsed.algorithm
+                                scanError = null
+                            }
+                            is TotpEngine.ParseOtpAuthResult.Invalid -> {
+                                scanError = parsed.message
+                            }
                         }
                     } else {
-                        scanError = "No QR code detected in image"
+                        scanError = "No QR code detected in image."
                     }
                 }
             }
@@ -589,7 +677,7 @@ fun AuthenticatorToolView(
 
                     OutlinedTextField(
                         value = service,
-                        onValueChange = { service = it },
+                        onValueChange = { service = it; scanError = null },
                         label = { Text("Service (e.g. GitHub, Google)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
@@ -603,25 +691,47 @@ fun AuthenticatorToolView(
                     )
                     OutlinedTextField(
                         value = secret,
-                        onValueChange = { secret = it },
+                        onValueChange = { secret = it; scanError = null },
                         label = { Text("Secret Key (Base32)") },
                         singleLine = true,
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Ascii,
+                            autoCorrectEnabled = false
+                        ),
                         modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        text = "$parsedDigits digits • ${parsedPeriod}s • ${parsedAlgo.name}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline
                     )
                 }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        if (service.isNotBlank() && secret.isNotBlank()) {
-                            onSaveAuthenticator(
-                                AuthenticatorRecord(
-                                    serviceName = service,
-                                    accountName = account,
-                                    secret = secret.replace(" ", "").uppercase()
-                                )
-                            )
-                            showAddDialog = false
+                        val normalizedSecret = secret.replace(" ", "").replace("-", "").trim().uppercase(java.util.Locale.US)
+                        when {
+                            service.isBlank() -> scanError = "Enter a service name."
+                            normalizedSecret.isBlank() -> scanError = "Enter the Base32 secret key."
+                            else -> {
+                                val decoded = runCatching { TotpEngine.decodeBase32(normalizedSecret) }.getOrNull()
+                                if (decoded == null || decoded.isEmpty()) {
+                                    scanError = "Invalid Base32 secret key. Use letters A-Z and digits 2-7."
+                                } else {
+                                    onSaveAuthenticator(
+                                        AuthenticatorRecord(
+                                            serviceName = service.trim(),
+                                            accountName = account.trim(),
+                                            secret = normalizedSecret,
+                                            digits = parsedDigits,
+                                            periodSeconds = parsedPeriod,
+                                            algorithm = parsedAlgo
+                                        )
+                                    )
+                                    showAddDialog = false
+                                }
+                            }
                         }
                     }
                 ) {
@@ -634,6 +744,36 @@ fun AuthenticatorToolView(
                 }
             }
         )
+    }
+}
+
+private fun decodeBoundedQrBitmap(context: android.content.Context, uri: Uri): Bitmap? {
+    val maxDim = 1024
+    return try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            ImageDecoder.decodeBitmap(ImageDecoder.createSource(context.contentResolver, uri)) { decoder, info, _ ->
+                decoder.isMutableRequired = true
+                val w = info.size.width
+                val h = info.size.height
+                if (w > maxDim || h > maxDim) {
+                    val scale = maxOf(w, h).toFloat() / maxDim.toFloat()
+                    decoder.setTargetSize((w / scale).toInt().coerceAtLeast(1), (h / scale).toInt().coerceAtLeast(1))
+                }
+            }
+        } else {
+            val boundsOpts = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                android.graphics.BitmapFactory.decodeStream(stream, null, boundsOpts)
+            }
+            val maxSide = maxOf(boundsOpts.outWidth, boundsOpts.outHeight)
+            val sample = if (maxSide > maxDim) (maxSide / maxDim).coerceAtLeast(1) else 1
+            val decodeOpts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                android.graphics.BitmapFactory.decodeStream(stream, null, decodeOpts)
+            }
+        }
+    } catch (_: Exception) {
+        null
     }
 }
 
@@ -652,16 +792,6 @@ fun decodeQrFromBitmap(bitmap: Bitmap): String? {
 }
 
 fun parseOtpAuthUri(uriStr: String): Triple<String, String, String>? {
-    return try {
-        val uri = Uri.parse(uriStr)
-        if (uri.scheme != "otpauth") return null
-        val secret = uri.getQueryParameter("secret") ?: return null
-        val issuer = uri.getQueryParameter("issuer")
-            ?: uri.path?.removePrefix("/")?.split(":")?.firstOrNull()?.trim()
-            ?: "Authenticator"
-        val account = uri.path?.removePrefix("/")?.split(":")?.lastOrNull()?.trim().orEmpty()
-        Triple(issuer, account, secret)
-    } catch (_: Exception) {
-        null
-    }
+    val parsed = TotpEngine.parseOtpAuthUri(uriStr) ?: return null
+    return Triple(parsed.serviceName, parsed.accountName, parsed.secret)
 }

@@ -6,6 +6,7 @@ import androidx.work.WorkerParameters
 import com.tpeditz.privatevault.v2.PrivateVaultApplication
 import com.tpeditz.privatevault.v2.data.AppPreferencesRepository
 import com.tpeditz.privatevault.v2.data.CloudBackupFrequency
+import com.tpeditz.privatevault.v2.data.CorruptedVaultRecordsException
 import com.tpeditz.privatevault.v2.security.SafeVaultLogger
 import com.tpeditz.privatevault.v2.security.VaultSessionManager
 import kotlinx.coroutines.flow.first
@@ -67,7 +68,7 @@ class CloudBackupWorker(
                 recoveryPwd != null
             ) {
                 try {
-                    val items = app.repository.getAllItemsForActiveSlot(session.sessionId)
+                    val items = app.repository.getAllItemsForBackupOrThrow(session.sessionId)
                     CloudBackupScheduler.stageEncryptedSnapshot(
                         context = applicationContext,
                         accountEmail = expectedEmail
@@ -80,6 +81,10 @@ class CloudBackupWorker(
                         )
                     }
                     stagedSnapshot = CloudBackupScheduler.acquireLatestReadySnapshot(applicationContext, expectedEmail)
+                } catch (e: CorruptedVaultRecordsException) {
+                    SafeVaultLogger.e("CloudBackupWorker", "Aborted automatic backup because some vault items could not be read", e)
+                    prefs.setAutoCloudBackupStatus("Some vault items could not be read — backup not created")
+                    return Result.failure()
                 } catch (e: Exception) {
                     SafeVaultLogger.e("CloudBackupWorker", "Failed staging automatic snapshot while unlocked", e)
                 } finally {
@@ -122,8 +127,12 @@ class CloudBackupWorker(
             return when (syncResult) {
                 is GoogleDriveSyncManager.SyncResult.Success -> {
                     CloudBackupScheduler.completeUploadedSnapshot(applicationContext, activeSnapshotId)
-                    prefs.recordCloudBackup(System.currentTimeMillis())
-                    prefs.setAutoCloudBackupStatus("Automatic backup completed")
+                    val stillEnabled = prefs.autoCloudBackupEnabled.first()
+                    val currentEmail = prefs.connectedGoogleAccount.first().trim()
+                    if (stillEnabled && currentEmail.equals(expectedEmail.trim(), ignoreCase = true)) {
+                        prefs.recordCloudBackup(System.currentTimeMillis())
+                        prefs.setAutoCloudBackupStatus("Automatic backup completed")
+                    }
                     SafeVaultLogger.i("CloudBackupWorker", "Scheduled cloud backup uploaded cleanly.")
                     Result.success()
                 }

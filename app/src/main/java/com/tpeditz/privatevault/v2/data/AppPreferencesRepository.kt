@@ -22,7 +22,7 @@ enum class CloudBackupFrequency {
     MONTHLY
 }
 
-private val Context.dataStore by preferencesDataStore(name = "private_vault_prefs")
+internal val Context.dataStore by preferencesDataStore(name = "private_vault_prefs")
 
 class AppPreferencesRepository(private val context: Context) {
 
@@ -33,7 +33,9 @@ class AppPreferencesRepository(private val context: Context) {
         val KEY_SCREENSHOT_PROTECTION = booleanPreferencesKey("screenshot_protection")
         val KEY_CLIPBOARD_TTL = intPreferencesKey("clipboard_ttl_seconds")
         val KEY_BIOMETRIC_ENABLED = booleanPreferencesKey("biometric_enabled")
-        val KEY_AUTOFILL_ENABLED = booleanPreferencesKey("autofill_enabled")
+        val KEY_BIOMETRIC_KEY_ALIAS = stringPreferencesKey("biometric_key_alias")
+        val KEY_BIOMETRIC_PENDING_ALIAS = stringPreferencesKey("biometric_pending_alias")
+        val KEY_BIOMETRIC_PENDING_NONCE_SHA256 = stringPreferencesKey("biometric_pending_nonce_sha256")
         val KEY_AUTO_CLOUD_BACKUP = booleanPreferencesKey("auto_cloud_backup")
         val KEY_CLOUD_BACKUP_FREQ = stringPreferencesKey("cloud_backup_frequency")
         val KEY_CLOUD_BACKUP_WIFI = booleanPreferencesKey("cloud_backup_wifi_only")
@@ -70,8 +72,16 @@ class AppPreferencesRepository(private val context: Context) {
         prefs[KEY_BIOMETRIC_ENABLED] ?: false
     }
 
-    val autofillEnabled: Flow<Boolean> = context.dataStore.data.map { prefs ->
-        prefs[KEY_AUTOFILL_ENABLED] ?: false
+    val biometricKeyAlias: Flow<String?> = context.dataStore.data.map { prefs ->
+        prefs[KEY_BIOMETRIC_KEY_ALIAS]?.takeIf { it.isNotBlank() }
+    }
+
+    val biometricPendingAlias: Flow<String?> = context.dataStore.data.map { prefs ->
+        prefs[KEY_BIOMETRIC_PENDING_ALIAS]?.takeIf { it.isNotBlank() }
+    }
+
+    val biometricPendingNonceSha256: Flow<String?> = context.dataStore.data.map { prefs ->
+        prefs[KEY_BIOMETRIC_PENDING_NONCE_SHA256]?.takeIf { it.isNotBlank() }
     }
 
     val autoCloudBackupEnabled: Flow<Boolean> = context.dataStore.data.map { prefs ->
@@ -135,8 +145,43 @@ class AppPreferencesRepository(private val context: Context) {
         context.dataStore.edit { it[KEY_BIOMETRIC_ENABLED] = enabled }
     }
 
-    suspend fun setAutofillEnabled(enabled: Boolean) {
-        context.dataStore.edit { it[KEY_AUTOFILL_ENABLED] = enabled }
+    suspend fun setBiometricKeyAlias(alias: String?) {
+        context.dataStore.edit { prefs ->
+            if (alias.isNullOrBlank()) prefs.remove(KEY_BIOMETRIC_KEY_ALIAS)
+            else prefs[KEY_BIOMETRIC_KEY_ALIAS] = alias
+        }
+    }
+
+    suspend fun stagePendingBiometricCommit(alias: String, nonceSha256Hex: String) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_BIOMETRIC_PENDING_ALIAS] = alias
+            prefs[KEY_BIOMETRIC_PENDING_NONCE_SHA256] = nonceSha256Hex
+        }
+    }
+
+    suspend fun commitPendingBiometricAlias(alias: String) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_BIOMETRIC_KEY_ALIAS] = alias
+            prefs[KEY_BIOMETRIC_ENABLED] = true
+            prefs.remove(KEY_BIOMETRIC_PENDING_ALIAS)
+            prefs.remove(KEY_BIOMETRIC_PENDING_NONCE_SHA256)
+        }
+    }
+
+    suspend fun clearPendingBiometricCommit() {
+        context.dataStore.edit { prefs ->
+            prefs.remove(KEY_BIOMETRIC_PENDING_ALIAS)
+            prefs.remove(KEY_BIOMETRIC_PENDING_NONCE_SHA256)
+        }
+    }
+
+    suspend fun clearBiometricPreferences() {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_BIOMETRIC_ENABLED] = false
+            prefs.remove(KEY_BIOMETRIC_KEY_ALIAS)
+            prefs.remove(KEY_BIOMETRIC_PENDING_ALIAS)
+            prefs.remove(KEY_BIOMETRIC_PENDING_NONCE_SHA256)
+        }
     }
 
     suspend fun setAutoCloudBackupEnabled(enabled: Boolean) {

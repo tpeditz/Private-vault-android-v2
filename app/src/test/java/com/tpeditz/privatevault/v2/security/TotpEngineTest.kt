@@ -121,4 +121,69 @@ class TotpEngineTest {
         assertEquals(30, p.periodSeconds)
         assertEquals(TotpAlgorithm.SHA1, p.algorithm)
     }
+
+    @Test
+    fun testLocaleIndependenceAndBoundsValidation() {
+        val prevLocale = java.util.Locale.getDefault()
+        try {
+            // Arabic-Indic locale must still output pure ASCII digits 0..9
+            java.util.Locale.setDefault(java.util.Locale.forLanguageTag("ar-EG"))
+            val code = TotpEngine.generateTotpCode(
+                secretBase32 = rfcBase32Secret,
+                epochSeconds = 59L,
+                periodSeconds = 30,
+                digits = 8,
+                algorithm = TotpAlgorithm.SHA1
+            )
+            assertEquals("94287082", code)
+            assertTrue(code.all { it in '0'..'9' })
+        } finally {
+            java.util.Locale.setDefault(prevLocale)
+        }
+
+        // Invalid period and digit counts must be rejected cleanly
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            TotpEngine.generateTotpCode(rfcBase32Secret, periodSeconds = 0)
+        }
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            TotpEngine.generateTotpCode(rfcBase32Secret, digits = 4)
+        }
+        org.junit.Assert.assertNull(
+            TotpEngine.parseOtpAuthUri("otpauth://totp/Test?secret=INVALID!@#&digits=6&period=30")
+        )
+        org.junit.Assert.assertNull(
+            TotpEngine.parseOtpAuthUri("otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&algorithm=MD5")
+        )
+    }
+
+    @Test
+    fun testOtpAuthPreservesPlusAndUnicodeLabels() {
+        val uri =
+            "otpauth://totp/Acme%20Corp:alice%2Bwork@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Acme%20%2B%20Co%20%F0%9F%94%90"
+        val res = TotpEngine.parseOtpAuthUriWithDetails(uri)
+        assertTrue(res is TotpEngine.ParseOtpAuthResult.Success)
+        val parsed = (res as TotpEngine.ParseOtpAuthResult.Success).parsed
+        assertEquals("alice+work@example.com", parsed.accountName)
+        assertEquals("Acme + Co \uD83D\uDD10", parsed.serviceName)
+    }
+
+    @Test
+    fun testOtpAuthRejectsExplicitlyInvalidOptionalParams() {
+        val invalidUris = listOf(
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&digits=abc",
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&digits=5",
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&digits=",
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&period=abc",
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&period=0",
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&algorithm=SHA384",
+            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&algorithm="
+        )
+        for (invalid in invalidUris) {
+            org.junit.Assert.assertNull("Expected null for $invalid", TotpEngine.parseOtpAuthUri(invalid))
+            assertTrue(
+                "Expected Invalid result for $invalid",
+                TotpEngine.parseOtpAuthUriWithDetails(invalid) is TotpEngine.ParseOtpAuthResult.Invalid
+            )
+        }
+    }
 }

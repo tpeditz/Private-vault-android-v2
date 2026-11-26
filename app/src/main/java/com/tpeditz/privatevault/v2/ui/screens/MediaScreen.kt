@@ -1,7 +1,9 @@
 package com.tpeditz.privatevault.v2.ui.screens
 
 import android.content.Intent
+import android.graphics.BitmapFactory
 import android.net.Uri
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -24,7 +26,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
@@ -56,12 +58,20 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
+import java.util.Arrays
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -87,7 +97,8 @@ fun MediaScreen(
     onDeleteDocument: (String) -> Unit,
     onDeleteLink: (String) -> Unit,
     onCreateAlbum: (String) -> Unit = {},
-    onDeleteAlbum: (String) -> Unit = {}
+    onDeleteAlbum: (String) -> Unit = {},
+    onLoadThumbnail: (suspend (MediaRecord) -> ByteArray?)? = null
 ) {
     var selectedTab by remember { mutableStateOf(0) } // 0: Photos & Videos, 1: Documents, 2: Links, 3: Albums
     var showCreateAlbumDialog by remember { mutableStateOf(false) }
@@ -141,7 +152,7 @@ fun MediaScreen(
             }
 
             when (selectedTab) {
-                0 -> PhotosAndVideosSection(uiState.media, onNavigateToSecondary, onDeleteMedia)
+                0 -> PhotosAndVideosSection(uiState.media, onNavigateToSecondary, onDeleteMedia, onLoadThumbnail)
                 1 -> DocumentsSection(uiState.documents, onNavigateToSecondary, onDeleteDocument)
                 2 -> SecureLinksSection(uiState.secureLinks, onNavigateToSecondary, onDeleteLink)
                 3 -> AlbumsSection(uiState.albums, onDeleteAlbum)
@@ -188,10 +199,11 @@ fun MediaScreen(
 fun PhotosAndVideosSection(
     mediaList: List<MediaRecord>,
     onNavigateToSecondary: (SecondaryDestination) -> Unit,
-    onDeleteMedia: (String) -> Unit
+    onDeleteMedia: (String) -> Unit,
+    onLoadThumbnail: (suspend (MediaRecord) -> ByteArray?)? = null
 ) {
     if (mediaList.isEmpty()) {
-        EmptyMediaState("No photos or videos encrypted yet", Icons.Default.PhotoLibrary)
+        EmptyMediaState("No photos or videos encrypted yet. Tap + to import.", Icons.Default.PhotoLibrary)
     } else {
         LazyVerticalGrid(
             columns = GridCells.Fixed(3),
@@ -200,6 +212,30 @@ fun PhotosAndVideosSection(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             items(mediaList, key = { it.id }) { item ->
+                val thumbBitmap by produceState<ImageBitmap?>(
+                    initialValue = null,
+                    key1 = item.id,
+                    key2 = onLoadThumbnail
+                ) {
+                    val loader = onLoadThumbnail ?: return@produceState
+                    value = withContext(Dispatchers.IO) {
+                        val bytes = runCatching { loader(item) }.getOrNull() ?: return@withContext null
+                        if (bytes.isEmpty()) return@withContext null
+                        try {
+                            ensureActive()
+                            val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOpts)
+                            val maxSide = maxOf(boundsOpts.outWidth, boundsOpts.outHeight)
+                            val sample = if (maxSide > 320) (maxSide / 240).coerceAtLeast(1) else 1
+                            val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
+                            val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts)?.asImageBitmap()
+                            ensureActive()
+                            decoded
+                        } finally {
+                            Arrays.fill(bytes, 0.toByte())
+                        }
+                    }
+                }
                 OutlinedCard(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -208,18 +244,28 @@ fun PhotosAndVideosSection(
                     shape = RoundedCornerShape(12.dp)
                 ) {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = if (item.mediaKind == MediaKind.VIDEO) Icons.Default.VideoLibrary else Icons.Default.Photo,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(32.dp)
-                        )
+                        val bmp = thumbBitmap
+                        if (bmp != null) {
+                            Image(
+                                bitmap = bmp,
+                                contentDescription = item.title.ifBlank { item.originalFileName },
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        } else {
+                            Icon(
+                                imageVector = if (item.mediaKind == MediaKind.VIDEO) Icons.Default.VideoLibrary else Icons.Default.Photo,
+                                contentDescription = item.title.ifBlank { item.originalFileName },
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(32.dp)
+                            )
+                        }
                         if (item.mediaKind == MediaKind.VIDEO) {
                             Box(
                                 modifier = Modifier
                                     .align(Alignment.BottomEnd)
                                     .padding(4.dp)
-                                    .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+                                    .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.65f), RoundedCornerShape(4.dp))
                                     .padding(horizontal = 4.dp, vertical = 2.dp)
                             ) {
                                 Text(
@@ -243,7 +289,7 @@ fun DocumentsSection(
     onDeleteDocument: (String) -> Unit
 ) {
     if (documents.isEmpty()) {
-        EmptyMediaState("No encrypted documents yet", Icons.Default.Description)
+        EmptyMediaState("No encrypted documents yet. Tap + to import a file.", Icons.Default.Description)
     } else {
         LazyColumn(
             contentPadding = PaddingValues(16.dp),
@@ -303,7 +349,7 @@ fun SecureLinksSection(
     val context = LocalContext.current
 
     if (links.isEmpty()) {
-        EmptyMediaState("No secure links saved yet", Icons.Default.Bookmark)
+        EmptyMediaState("No secure links saved yet. Tap + to save one.", Icons.Default.Bookmark)
     } else {
         LazyColumn(
             contentPadding = PaddingValues(16.dp),
@@ -350,11 +396,28 @@ fun SecureLinksSection(
                         }
                         IconButton(
                             onClick = {
-                                runCatching {
-                                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(link.url)).apply {
-                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                val rawUrl = link.url.trim()
+                                val parsed = runCatching { Uri.parse(rawUrl) }.getOrNull()
+                                val scheme = parsed?.scheme?.lowercase()
+                                if (parsed != null && (scheme == "https" || scheme == "http")) {
+                                    runCatching {
+                                        val intent = Intent(Intent.ACTION_VIEW, parsed).apply {
+                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        }
+                                        context.startActivity(intent)
+                                    }.onFailure {
+                                        android.widget.Toast.makeText(
+                                            context,
+                                            "No browser app available to open this link.",
+                                            android.widget.Toast.LENGTH_SHORT
+                                        ).show()
                                     }
-                                    context.startActivity(intent)
+                                } else {
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        "Only standard http:// or https:// web links can be opened externally.",
+                                        android.widget.Toast.LENGTH_SHORT
+                                    ).show()
                                 }
                             }
                         ) {
@@ -473,7 +536,7 @@ fun LinkEditorScreen(
                 title = { Text(if (linkId == null) "Save Link" else "Edit Link") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 }
             )

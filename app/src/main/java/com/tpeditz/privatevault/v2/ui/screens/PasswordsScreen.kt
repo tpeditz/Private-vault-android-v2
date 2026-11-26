@@ -22,7 +22,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
@@ -62,6 +62,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -103,25 +104,27 @@ fun PasswordsScreen(
     var selectedFolderId by remember { mutableStateOf<String?>(null) }
     var showMenu by remember { mutableStateOf(false) }
 
-    val filteredCredentials = uiState.credentials.filter { cred ->
-        if (selectedFolderId != null && cred.folderId != selectedFolderId) return@filter false
-        when (selectedFilter) {
-            "Favorites" -> cred.isFavorite && !cred.isTrashed
-            "Archived" -> cred.isArchived && !cred.isTrashed
-            "Trash" -> cred.isTrashed
-            else -> !cred.isTrashed && !cred.isArchived
-        }
-    }.filter { cred ->
-        if (uiState.searchQuery.isBlank()) true else {
-            cred.serviceName.contains(uiState.searchQuery, ignoreCase = true) ||
-                cred.username.contains(uiState.searchQuery, ignoreCase = true) ||
-                cred.accountLabel.contains(uiState.searchQuery, ignoreCase = true) ||
-                cred.websiteUrl.contains(uiState.searchQuery, ignoreCase = true)
-        }
-    }.sortedWith(
-        compareByDescending<CredentialRecord> { it.isPinned }
-            .thenBy { it.serviceName.lowercase() }
-    )
+    val filteredCredentials = remember(uiState.credentials, selectedFolderId, selectedFilter, uiState.searchQuery) {
+        uiState.credentials.filter { cred ->
+            if (selectedFolderId != null && cred.folderId != selectedFolderId) return@filter false
+            when (selectedFilter) {
+                "Favorites" -> cred.isFavorite && !cred.isTrashed
+                "Archived" -> cred.isArchived && !cred.isTrashed
+                "Trash" -> cred.isTrashed
+                else -> !cred.isTrashed && !cred.isArchived
+            }
+        }.filter { cred ->
+            if (uiState.searchQuery.isBlank()) true else {
+                cred.serviceName.contains(uiState.searchQuery, ignoreCase = true) ||
+                    cred.username.contains(uiState.searchQuery, ignoreCase = true) ||
+                    cred.accountLabel.contains(uiState.searchQuery, ignoreCase = true) ||
+                    cred.websiteUrl.contains(uiState.searchQuery, ignoreCase = true)
+            }
+        }.sortedWith(
+            compareByDescending<CredentialRecord> { it.isPinned }
+                .thenBy { it.serviceName.lowercase() }
+        )
+    }
 
     Scaffold(
         topBar = {
@@ -223,7 +226,7 @@ fun PasswordsScreen(
                         )
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = if (uiState.searchQuery.isNotBlank()) "No credentials match your search" else "No passwords saved yet",
+                            text = if (uiState.searchQuery.isNotBlank()) "No credentials match your search" else "No passwords saved yet. Tap + to add one.",
                             style = MaterialTheme.typography.bodyLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -375,7 +378,7 @@ fun PasswordEditorScreen(
                 title = { Text(if (credentialId == null) "New Credential" else "Edit Credential") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 actions = {
@@ -488,7 +491,7 @@ fun PasswordEditorScreen(
                 OutlinedTextField(
                     value = websiteUrl,
                     onValueChange = { websiteUrl = it },
-                    label = { Text("Website URL (for Autofill)") },
+                    label = { Text("Website or App URL (optional)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -536,14 +539,19 @@ fun PasswordEditorScreen(
     }
 
     if (showHistoryDialog && existing != null) {
+        val revealedHistoryIds = remember(existing.id) { mutableStateMapOf<String, Boolean>() }
         AlertDialog(
-            onDismissRequest = { showHistoryDialog = false },
+            onDismissRequest = {
+                revealedHistoryIds.clear()
+                showHistoryDialog = false
+            },
             title = { Text("Password History") },
             text = {
                 LazyColumn {
-                    items(existing.passwordHistory) { hist ->
+                    items(existing.passwordHistory, key = { it.id }) { hist ->
                         val dateStr = SimpleDateFormat("MMM d, yyyy HH:mm", Locale.getDefault())
                             .format(Date(hist.changedAtEpochMs))
+                        val isRevealed = revealedHistoryIds[hist.id] == true
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -552,14 +560,25 @@ fun PasswordEditorScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(hist.password, fontFamily = JetBrainsMono, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    text = if (isRevealed) hist.password else "••••••••••••",
+                                    fontFamily = JetBrainsMono,
+                                    fontWeight = FontWeight.SemiBold
+                                )
                                 Text(dateStr, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                            }
+                            IconButton(onClick = { revealedHistoryIds[hist.id] = !isRevealed }) {
+                                Icon(
+                                    if (isRevealed) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                    contentDescription = if (isRevealed) "Hide password" else "Show password"
+                                )
                             }
                             IconButton(onClick = { onCopyPassword(existing.serviceName, hist.password) }) {
                                 Icon(Icons.Default.ContentCopy, contentDescription = "Copy")
                             }
                             IconButton(onClick = {
                                 password = hist.password
+                                revealedHistoryIds.clear()
                                 showHistoryDialog = false
                             }) {
                                 Icon(Icons.Default.Refresh, contentDescription = "Restore")
@@ -569,7 +588,10 @@ fun PasswordEditorScreen(
                 }
             },
             confirmButton = {
-                TextButton(onClick = { showHistoryDialog = false }) {
+                TextButton(onClick = {
+                    revealedHistoryIds.clear()
+                    showHistoryDialog = false
+                }) {
                     Text("Close")
                 }
             }

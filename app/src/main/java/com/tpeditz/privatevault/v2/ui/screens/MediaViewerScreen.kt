@@ -19,7 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -49,6 +49,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -61,7 +62,11 @@ import com.tpeditz.privatevault.v2.data.MediaKind
 import com.tpeditz.privatevault.v2.data.MediaRecord
 import com.tpeditz.privatevault.v2.security.StreamingMediaCryptoEngine
 import com.tpeditz.privatevault.v2.ui.VaultViewModel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 import java.util.Arrays
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -139,7 +144,7 @@ fun MediaViewerScreen(
                 },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
                     }
                 },
                 actions = {
@@ -173,7 +178,7 @@ private fun PhotoViewerContent(
     mediaRecord: MediaRecord,
     viewModel: VaultViewModel
 ) {
-    var photoBytes by remember(mediaRecord.id) { mutableStateOf<ByteArray?>(null) }
+    var imageBitmap by remember(mediaRecord.id) { mutableStateOf<ImageBitmap?>(null) }
     var loadError by remember(mediaRecord.id) { mutableStateOf<String?>(null) }
 
     var scale by remember { mutableFloatStateOf(1f) }
@@ -181,32 +186,43 @@ private fun PhotoViewerContent(
     var offsetY by remember { mutableFloatStateOf(0f) }
 
     LaunchedEffect(mediaRecord.id) {
+        imageBitmap = null
+        loadError = null
+        var rawBytes: ByteArray? = null
         try {
-            photoBytes = viewModel.loadDecryptedPhotoBytes(mediaRecord)
+            val bytes = viewModel.loadDecryptedPhotoBytes(mediaRecord)
+            rawBytes = bytes
+            val decoded = withContext(Dispatchers.Default) {
+                ensureActive()
+                val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+                var sample = 1
+                while (opts.outWidth / sample > 2048 || opts.outHeight / sample > 2048) {
+                    sample *= 2
+                }
+                val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts)?.asImageBitmap()
+            }
+            ensureActive()
+            if (decoded != null) {
+                imageBitmap = decoded
+            } else {
+                loadError = "Unable to decode this photo."
+            }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             loadError = "Unable to open this encrypted photo. Check that the vault is unlocked and try again."
+        } finally {
+            rawBytes?.let { Arrays.fill(it, 0.toByte()) }
+            rawBytes = null
         }
     }
 
     DisposableEffect(mediaRecord.id) {
         onDispose {
-            photoBytes?.let { Arrays.fill(it, 0.toByte()) }
-            photoBytes = null
+            imageBitmap = null
         }
-    }
-
-    val imageBitmap = remember(photoBytes) {
-        val bytes = photoBytes ?: return@remember null
-        runCatching {
-            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
-            var sample = 1
-            while (opts.outWidth / sample > 2048 || opts.outHeight / sample > 2048) {
-                sample *= 2
-            }
-            val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts)?.asImageBitmap()
-        }.getOrNull()
     }
 
     Box(
@@ -226,17 +242,19 @@ private fun PhotoViewerContent(
             },
         contentAlignment = Alignment.Center
     ) {
+        val err = loadError
+        val bmp = imageBitmap
         when {
-            loadError != null -> {
+            err != null -> {
                 Text(
-                    text = loadError.orEmpty(),
+                    text = err,
                     color = MaterialTheme.colorScheme.error,
                     modifier = Modifier.padding(16.dp)
                 )
             }
-            imageBitmap != null -> {
+            bmp != null -> {
                 Image(
-                    bitmap = imageBitmap,
+                    bitmap = bmp,
                     contentDescription = mediaRecord.title,
                     contentScale = ContentScale.Fit,
                     modifier = Modifier
@@ -339,8 +357,12 @@ private fun VideoPlayerContent(
                                                 isPlaying = false
                                                 currentPosMs = totalDurationMs
                                             }
-                                            setOnErrorListener { _, what, extra ->
-                                                playerError = "Playback error ($what, $extra)"
+                                            setOnErrorListener { mp, _, _ ->
+                                                runCatching { mp.reset(); mp.release() }
+                                                mediaPlayer = null
+                                                runCatching { dataSource?.close() }
+                                                dataSource = null
+                                                playerError = "This encrypted video could not be played on this device."
                                                 true
                                             }
                                             prepareAsync()

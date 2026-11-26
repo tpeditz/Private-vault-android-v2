@@ -13,6 +13,7 @@ import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.Arrays
+import java.util.concurrent.CancellationException
 import javax.crypto.AEADBadTagException
 
 /**
@@ -87,7 +88,8 @@ object StreamingMediaCryptoEngine {
         mediaId: String,
         vaultSlot: Int,
         fileMediaKey: ByteArray,
-        onProgress: (bytesProcessed: Long, totalBytes: Long) -> Unit = { _, _ -> }
+        onProgress: (bytesProcessed: Long, totalBytes: Long) -> Unit = { _, _ -> },
+        isCancelled: () -> Boolean = { false }
     ): ParsedMediaHeader {
         require(fileMediaKey.size == CryptoEngine.DEK_BYTES) { "Media key must be 32 bytes." }
         require(expectedPlaintextSize > 0L) { "Cannot import an empty (0-byte) file." }
@@ -116,6 +118,9 @@ object StreamingMediaCryptoEngine {
                 fos.write(headerBytes)
 
                 while (true) {
+                    if (isCancelled()) {
+                        throw java.util.concurrent.CancellationException("Media encryption cancelled.")
+                    }
                     val bytesRead = readChunkFullyOrUntilEof(inputStream, readBuffer)
                     if (bytesRead <= 0) break
 
@@ -152,6 +157,9 @@ object StreamingMediaCryptoEngine {
                         plaintext = plainChunkSlice,
                         aad = aad
                     )
+                    if (plainChunkSlice !== readBuffer) {
+                        Arrays.fill(plainChunkSlice, 0.toByte())
+                    }
 
                     val frameHeader = ByteArray(4 + CryptoEngine.NONCE_BYTES)
                     ByteBuffer.wrap(frameHeader).apply {
@@ -164,10 +172,11 @@ object StreamingMediaCryptoEngine {
                     chunkIndex++
                     onProgress(totalPlainRead, expectedPlaintextSize)
                 }
+                fos.flush()
+                fos.fd.sync()
             }
 
             if (totalPlainRead != expectedPlaintextSize || chunkIndex != totalChunks) {
-                targetFile.delete()
                 throw IllegalArgumentException("Stream terminated prematurely ($totalPlainRead of $expectedPlaintextSize bytes read).")
             }
 
@@ -178,6 +187,9 @@ object StreamingMediaCryptoEngine {
                 totalChunks = totalChunks,
                 totalPlaintextBytes = expectedPlaintextSize
             )
+        } catch (t: Throwable) {
+            targetFile.delete()
+            throw t
         } finally {
             Arrays.fill(readBuffer, 0.toByte())
         }
@@ -188,7 +200,8 @@ object StreamingMediaCryptoEngine {
         encryptedFile: File,
         mediaId: String,
         vaultSlot: Int,
-        fileMediaKey: ByteArray
+        fileMediaKey: ByteArray,
+        isCancelled: () -> Boolean = { false }
     ): EncryptedMediaVerifyReport {
         require(encryptedFile.exists() && encryptedFile.isFile) { "Encrypted file does not exist." }
         val fileLength = encryptedFile.length()
@@ -210,6 +223,7 @@ object StreamingMediaCryptoEngine {
             val nonce = ByteArray(CryptoEngine.NONCE_BYTES)
 
             for (i in 0 until header.totalChunks) {
+                if (isCancelled()) throw CancellationException("Encrypted asset verification cancelled.")
                 raf.readFully(frameHeaderBuf)
                 md.update(frameHeaderBuf)
 
@@ -313,6 +327,31 @@ object StreamingMediaCryptoEngine {
         fileMediaKey: ByteArray
     ): ByteArray {
         val out = ByteArrayOutputStream()
+        decryptMediaFileToStream(
+            encryptedFile = encryptedFile,
+            outputStream = out,
+            mediaId = mediaId,
+            vaultSlot = vaultSlot,
+            fileMediaKey = fileMediaKey
+        )
+        return out.toByteArray()
+    }
+
+    /**
+     * Streams decrypted chunks sequentially to `outputStream` (max 256 KiB chunk buffer in memory at once)
+     * and zeroes each temporary plaintext buffer immediately after writing.
+     */
+    @Throws(IOException::class, AEADBadTagException::class)
+    fun decryptMediaFileToStream(
+        encryptedFile: File,
+        outputStream: java.io.OutputStream,
+        mediaId: String,
+        vaultSlot: Int,
+        fileMediaKey: ByteArray,
+        maxPlaintextBytes: Long = Long.MAX_VALUE,
+        isCancelled: () -> Boolean = { false }
+    ): Long {
+        var totalWritten = 0L
         RandomAccessFile(encryptedFile, "r").use { raf ->
             val headerBytes = ByteArray(HEADER_BYTES)
             raf.readFully(headerBytes)
@@ -323,6 +362,9 @@ object StreamingMediaCryptoEngine {
             val nonce = ByteArray(CryptoEngine.NONCE_BYTES)
 
             for (i in 0 until header.totalChunks) {
+                if (isCancelled()) {
+                    throw java.util.concurrent.CancellationException("Decryption cancelled.")
+                }
                 raf.readFully(frameHeaderBuf)
                 val bb = ByteBuffer.wrap(frameHeaderBuf)
                 val chunkPlainLen = bb.int
@@ -352,13 +394,18 @@ object StreamingMediaCryptoEngine {
                     aad = aad
                 )
                 try {
-                    out.write(plain)
+                    val remainingCap = maxPlaintextBytes - totalWritten
+                    if (remainingCap <= 0L) break
+                    val writeLen = minOf(plain.size.toLong(), remainingCap).toInt()
+                    outputStream.write(plain, 0, writeLen)
+                    totalWritten += writeLen
+                    if (totalWritten >= maxPlaintextBytes) break
                 } finally {
                     Arrays.fill(plain, 0.toByte())
                 }
             }
         }
-        return out.toByteArray()
+        return totalWritten
     }
 
     fun encryptThumbnail(
@@ -403,6 +450,59 @@ object StreamingMediaCryptoEngine {
         )
     }
 
+    /**
+     * Authenticates an encrypted thumbnail file (either compact AES-GCM thumbnail payload or
+     * chunked `PVM1` stream) against `mediaId`, `vaultSlot`, and `thumbKey`, wiping decrypted
+     * plaintext immediately and returning `(fileBytes, sha256Hex)`.
+     */
+    fun verifyEncryptedThumbnailFile(
+        thumbFile: File,
+        mediaId: String,
+        vaultSlot: Int,
+        thumbKey: ByteArray,
+        isCancelled: () -> Boolean = { false }
+    ): Pair<Long, String> {
+        require(thumbKey.size == CryptoEngine.DEK_BYTES) { "Thumb key must be 32 bytes." }
+        require(thumbFile.exists() && thumbFile.isFile) { "Thumbnail file does not exist." }
+        val fileLen = thumbFile.length()
+        require(fileLen > 0L && fileLen <= 16L * 1024L * 1024L) {
+            "Encrypted thumbnail file size ($fileLen bytes) is invalid."
+        }
+        if (isCancelled()) throw CancellationException("Thumbnail verification cancelled.")
+
+        val magic = ByteArray(4)
+        thumbFile.inputStream().use { ins ->
+            var r = 0
+            while (r < 4) {
+                val n = ins.read(magic, r, 4 - r)
+                if (n < 0) break
+                r += n
+            }
+            if (r == 4 && magic.contentEquals(PVM1_MAGIC)) {
+                val report = verifyEncryptedMediaFileEveryChunk(
+                    encryptedFile = thumbFile,
+                    mediaId = mediaId,
+                    vaultSlot = vaultSlot,
+                    fileMediaKey = thumbKey,
+                    isCancelled = isCancelled
+                )
+                return report.encryptedFileBytes to report.ciphertextSha256Hex
+            }
+        }
+
+        val raw = thumbFile.readBytes()
+        require(raw.size.toLong() == fileLen) { "Thumbnail file changed while reading." }
+        val plain = decryptThumbnail(
+            encryptedThumbBytes = raw,
+            mediaId = mediaId,
+            vaultSlot = vaultSlot,
+            thumbKey = thumbKey
+        )
+        Arrays.fill(plain, 0.toByte())
+        val shaHex = MessageDigest.getInstance("SHA-256").digest(raw).joinToString("") { "%02x".format(it) }
+        return fileLen to shaHex
+    }
+
     private fun readChunkFullyOrUntilEof(stream: InputStream, buffer: ByteArray): Int {
         var totalRead = 0
         while (totalRead < buffer.size) {
@@ -421,12 +521,15 @@ object StreamingMediaCryptoEngine {
         private val mediaFile: File,
         private val mediaId: String,
         private val vaultSlot: Int,
-        fileMediaKey: ByteArray
+        fileMediaKey: ByteArray,
+        private val isSessionValid: () -> Boolean = { true }
     ) : MediaDataSource() {
         private val fileMediaKey = fileMediaKey.copyOf()
 
         private val raf: RandomAccessFile = RandomAccessFile(mediaFile, "r")
         private val header: ParsedMediaHeader
+        @Volatile
+        private var closed: Boolean = false
 
         // Ring buffer holding at most 2 decrypted chunks (512 KiB) in memory
         private var cachedChunkIndexA: Int = -1
@@ -441,10 +544,11 @@ object StreamingMediaCryptoEngine {
                 raf.readFully(headerBuf)
                 header = parseHeaderBytes(headerBuf)
                 requireFileSize(header, raf.length())
-            } catch (e: Exception) {
-                raf.close()
-                Arrays.fill(fileMediaKey, 0.toByte())
-                throw e
+            } catch (t: Throwable) {
+                closed = true
+                runCatching { raf.close() }
+                Arrays.fill(this.fileMediaKey, 0.toByte())
+                throw t
             }
         }
 
@@ -454,6 +558,11 @@ object StreamingMediaCryptoEngine {
         @Synchronized
         override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
             require(position >= 0L && offset >= 0 && size >= 0 && offset <= buffer.size && size <= buffer.size - offset)
+            if (closed) return -1
+            if (!isSessionValid()) {
+                close()
+                throw IOException("Vault session locked or invalidated.")
+            }
             if (size == 0) return 0
             if (position >= header.totalPlaintextBytes) return -1
 
@@ -536,6 +645,8 @@ object StreamingMediaCryptoEngine {
 
         @Synchronized
         override fun close() {
+            if (closed) return
+            closed = true
             cachedChunkBytesA?.let { Arrays.fill(it, 0.toByte()) }
             cachedChunkBytesB?.let { Arrays.fill(it, 0.toByte()) }
             cachedChunkBytesA = null

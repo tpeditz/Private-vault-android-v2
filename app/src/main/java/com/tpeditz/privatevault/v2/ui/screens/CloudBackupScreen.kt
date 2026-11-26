@@ -375,18 +375,6 @@ fun CloudBackupScreen(
                                         onCheckedChange = null
                                     )
                                 }
-
-                                OutlinedButton(
-                                    onClick = {
-                                        autoPwd = ""
-                                        autoPwdConfirm = ""
-                                        autoSetupError = null
-                                        showAutoSetupDialog = true
-                                    },
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Text("Change automatic backup password")
-                                }
                             }
                         }
                     }
