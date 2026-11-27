@@ -1,145 +1,60 @@
-# PRIVATE VAULT V2 (Android)
+# Private Vault for Android
 
-> **Zero-Knowledge, Offline-First Cryptographic Vault & Password Manager for Android**  
-> **Version:** `2.0.4` (Version Code: `5`)  
-> **Application ID:** `com.tpeditz.privatevault.v2`  
-> **Developed by:** **Tp Editz**  
-> **Official Website:** [https://tpeditz.github.io/Private-vault-android-v2/](https://tpeditz.github.io/Private-vault-android-v2/)  
-> **Official Contact:** Telegram [@Tp_Editz](https://t.me/Tp_Editz) | Instagram [@tp_ediitz](https://www.instagram.com/tp_ediitz/)  
-> **Official GitHub Repository:** [https://github.com/tpeditz/Private-vault-android-v2](https://github.com/tpeditz/Private-vault-android-v2) (Branch: `main`)
+Private Vault is a native Android application by **Tp Editz** for organizing passwords, notes, photos, videos, documents, secure links, and authenticator entries in a locally encrypted vault.
 
----
+[Download the latest release](https://github.com/tpeditz/Private-vault-android-v2/releases/latest) · [Official website](https://tpeditz.github.io/Private-vault-android-v2/) · [Privacy policy](https://tpeditz.github.io/Private-vault-android-v2/privacy.html)
 
-## 1. Overview & Architecture
+| Current stable release | Platform | Package |
+| --- | --- | --- |
+| [2.1.0](https://github.com/tpeditz/Private-vault-android-v2/releases/tag/v2.1.0) (version code 6) | Android 7.0+ | `com.tpeditz.privatevault.v2` |
 
-**Private Vault** is a native Android application built with **Jetpack Compose**, **Material 3**, and modern local-first cryptography. Engineered for complete offline-first sovereignty, Private Vault never transmits unencrypted data, contains zero third-party analytics trackers, and operates with zero telemetry.
+## Features
 
-### Core Architecture Highlights
-- **Jetpack Compose & Material 3:** Modern declarative UI with fluid navigation, Light/Dark/OLED Black themes, and edge-to-edge support.
-- **Argon2id v1.3 (RFC 9106) Key Derivation:** Memory-hard password hashing (`32 MiB` standard / `16 MiB` constrained) via BouncyCastle, with Unicode NFC normalization and legacy fallback.
-- **Unified 72-Byte Key Envelopes (`PVE1`):** Slot 0 (Real Vault) and Slot 1 (Decoy Vault) share an identical 72-byte ciphertext footprint in SQLite with zero plaintext flags, guaranteeing plausible deniability.
-- **Streaming Media & Document Encryption (`PVM1` / `PVT1`):** Chunked 256 KiB AES-256-GCM encryption for photos, videos, thumbnails, and documents, with a custom seekable `MediaDataSource` that streams plaintext directly in memory.
-- **PVAULTB2 Streaming Backup & Crash-Safe Restore:** Supports up to 2 GiB containers with bounded streaming I/O, per-file SHA-256 + `thumbSha256` verification, file-first durable disk writes (`fd.sync()`), atomic Room transactions, `vaultMutationMutex` serialization, fail-closed recovery journal rollback, and friendly retryable error UX (`VaultErrorMapper`).
-- **New Password Strength Policy (`PasswordPolicy`):** Enforces a 12-character minimum (with multi-word spaces and Unicode support) on newly created vault/master/backup/cloud passwords while keeping full backward compatibility for existing `<12`-character vaults, backups, and automatic cloud schedules.
-- **Legacy V1 Backward Compatibility:** `LegacyV1BackupReader` restores original `PVAULTB1` containers, legacy Unicode passwords, and embedded media payloads.
-- **Standalone Password & Authenticator Manager:** Encrypted credential vault with `websiteUrl` associations, masked-by-default password history with deliberate reveal, CSPRNG password/passphrase generator, repeated-word passphrase penalty scoring, offline RFC 4226/6238 TOTP authenticator, bounded CSV import (`login_uri`, duplicate detection), and auto-clearing clipboard protection (Android Autofill intentionally removed in V2.0.4).
-- **Encrypted Cloud Backup (Optional):** Modern Credential Manager + GIS `AuthorizationClient` (`drive.appdata`), UUID-keyed immutable staged snapshots (`CloudBackupScheduler`), Keystore-protected recovery passwords (`AutoCloudBackupKeyStore`), paginated `modifiedTime desc` Drive listing, and multipart / resumable streaming uploads.
-- **Share-to-Vault (`ACTION_SEND`):** Receives shared text/URLs when unlocked to save cleanly as encrypted Notes or Secure Links.
-- **Cryptographic OTA Updates & CI/CD:** Checks `https://github.com/tpeditz/Private-vault-android-v2/releases/latest/download/update.json`, enforcing `FLAG_DEBUGGABLE == false`, SHA-256 checksums, version monotonicity, `ApkVerifier` v1/v2/v3 signing certificates, `ON_RESUME` Unknown Sources re-verification, and hardened draft-staged `.github/workflows/`.
+- **Personal encrypted vault:** passwords, private notes, media, documents, folders, and links.
+- **Offline-first access:** local vault features work without an internet connection or a Google account.
+- **Backup and restore:** encrypted local backups, optional Google Drive backup, automatic backup scheduling, and legacy V1 backup compatibility.
+- **Security tools:** password generation and strength guidance, TOTP authenticator, biometric unlock, app locking, and privacy controls.
+- **Verified updates:** production-signed APKs, checksum and certificate verification, and a Supabase policy control plane for compatible clients.
+- **Remote administration:** authorized administrators can manage release policies, announcements, and feature flags through the separate web dashboard. Feedback submission is currently disabled.
 
----
+Vault contents are stored separately from operational policy metadata. Online services may process standard network request information as described in the [privacy policy](https://tpeditz.github.io/Private-vault-android-v2/privacy.html). Keep verified backups of important data.
 
-## 2. Toolchain & Requirements
+## Project structure
 
-| Component | Specification |
-| :--- | :--- |
-| **Language** | Kotlin `2.2.10` |
-| **Android Gradle Plugin** | AGP `9.1.1` |
-| **Gradle** | Gradle `9.3.1` (wrapper included) |
-| **Java Development Kit** | JDK `17`, `21`, or `25` |
-| **Minimum SDK** | Android 7.0 (`API 24`) |
-| **Target SDK** | Android (`API 36`) |
-| **Database** | AndroidX Room `2.7.0` (Schema version `5`) |
-| **Cryptography** | BouncyCastle `1.80` (`bcprov-jdk18on`) & Android Keystore |
+| Directory | Responsibility |
+| --- | --- |
+| `app/` | Kotlin, Jetpack Compose, local database, encryption, backup, and OTA |
+| `admin-web/` | React and TypeScript Admin Control Center |
+| `supabase/` | Database migrations and backend Edge Functions |
+| `docs/` | Public website and compiled admin website |
+| `scripts/` | OTA manifest generation and release verification |
+| `.github/workflows/` | Android CI and signed release automation |
 
----
+## Build and test
 
-## 3. Project Directory Structure
-
-```text
-Private-vault-android-v2/
-├── .github/workflows/
-│   ├── ci.yml                                 # Push/PR unit tests, lint, debug & androidTest compile
-│   └── publish-production-apk.yml             # Manual test/publish signed release & update.json pipeline
-├── scripts/
-│   └── generate_ota_manifest.py               # Schema v1 update.json generator
-├── app/
-│   ├── build.gradle.kts                       # App build script, flavors/signing env wiring
-│   ├── proguard-rules.pro                     # Proguard/R8 shrinking rules
-│   └── src/
-│       ├── main/
-│       │   ├── AndroidManifest.xml
-│       │   ├── java/com/tpeditz/privatevault/v2/
-│       │   │   ├── MainActivity.kt
-│       │   │   ├── data/
-│       │   │   │   ├── AppPreferencesRepository.kt
-│       │   │   │   ├── EncryptedBackupV2Engine.kt
-│       │   │   │   ├── LegacyV1BackupReader.kt
-│       │   │   │   ├── PortableBackupModels.kt
-│       │   │   │   ├── PrivateVaultDatabase.kt
-│       │   │   │   ├── VaultDao.kt
-│       │   │   │   ├── VaultDomainModels.kt
-│       │   │   │   ├── VaultEntities.kt
-│       │   │   │   ├── VaultRecordCodec.kt
-│       │   │   │   └── VaultRepository.kt
-│       │   │   ├── ota/
-│       │   │   │   ├── OtaModels.kt
-│       │   │   │   └── OtaUpdateManager.kt
-│       │   │   ├── security/
-│       │   │   │   ├── BiometricKeystoreManager.kt
-│       │   │   │   ├── CryptoEngine.kt
-│       │   │   │   ├── OfflinePasswordStrengthEstimator.kt
-│       │   │   │   ├── PasswordGeneratorEngine.kt
-│       │   │   │   ├── SafeVaultLogger.kt
-│       │   │   │   ├── SensitiveClipboardManager.kt
-│       │   │   │   ├── StreamingMediaCryptoEngine.kt
-│       │   │   │   ├── TotpEngine.kt
-│       │   │   │   └── VaultSessionManager.kt
-│       │   │   ├── sync/
-│       │   │   │   ├── AutoCloudBackupKeyStore.kt
-│       │   │   │   ├── CloudBackupScheduler.kt
-│       │   │   │   ├── CloudBackupWorker.kt
-│       │   │   │   ├── GoogleDriveAuthHelper.kt
-│       │   │   │   └── GoogleDriveSyncManager.kt
-│       │   │   └── ui/
-│       │   │       ├── VaultNavigation.kt
-│       │   │       ├── VaultUiState.kt
-│       │   │       ├── VaultViewModel.kt
-│       │   │       ├── screens/
-│       │   │       └── theme/
-│       │   └── res/
-│       ├── androidTest/java/com/tpeditz/privatevault/v2/  # Room, DataStore & Compose instrumentation tests
-│       └── test/java/com/tpeditz/privatevault/v2/         # 19 JVM unit & regression test suites (101 tests)
-├── gradle/
-│   ├── libs.versions.toml
-│   └── wrapper/
-├── DEFECT_RESOLUTION.md
-├── FEATURE_CHECKLIST.md
-├── GOOGLE_SETUP.md
-├── OTA_CONTRACT.md
-├── RELEASE_SETUP.md
-├── SECURITY_AND_DATA_FORMAT.md
-└── TEST_REPORT.md
-```
-
----
-
-## 4. Build & Verification Commands
+Use Android Studio or Java 21 with the included Gradle wrapper and Android SDK. Run from the repository root:
 
 ```bash
-# Run all 19 unit & repository regression suites (101 tests)
-./gradlew :app:testDebugUnitTest
-
-# Run Android Lint verification (0 errors)
-./gradlew :app:lintDebug
-
-# Compile Compose & Room AndroidX instrumentation tests
-./gradlew :app:compileDebugAndroidTestKotlin
-
-# Build Debug APK
+./gradlew :app:testDebugUnitTest :app:lintDebug
 ./gradlew :app:assembleDebug
-
-# Build Release APK (signed automatically when signing env vars or GitHub Secrets are provided)
 ./gradlew :app:assembleRelease
 ```
 
-For non-programmer step-by-step GitHub publishing instructions (`test` dry-run vs `publish` release mode), read [RELEASE_SETUP.md](RELEASE_SETUP.md).
+On Windows, use `gradlew.bat` instead of `./gradlew`. Production builds must use the existing release signing configuration; do not create or commit signing keys.
 
----
+## Documentation
 
-## 5. Author & Support
+| Topic | Reference |
+| --- | --- |
+| Features and latest verification | [Feature checklist](FEATURE_CHECKLIST.md) · [Test report](TEST_REPORT.md) |
+| Security and backup formats | [Cryptographic specification](SECURITY_AND_DATA_FORMAT.md) · [Backup compatibility](BACKUP_FORMAT_AND_COMPATIBILITY_REPORT.md) |
+| Updates and publishing | [OTA contract](OTA_CONTRACT.md) · [Release setup](RELEASE_SETUP.md) · [Release policy and privacy](RELEASE_POLICY_AND_PRIVACY.md) |
+| Google Drive | [Google setup](GOOGLE_SETUP.md) |
+| Supabase and hosting | [Deployment guide](SUPABASE_DEPLOYMENT_GUIDE.md) · [Hosting guide](DEPLOYMENT_AND_HOSTING_GUIDE.md) · [Schema compatibility](SUPABASE_SCHEMA_COMPATIBILITY_REPORT.md) |
+| Administrator operations and QA | [Admin setup](ADMIN_SETUP_GUIDE.md) · [Admin test checklist](ADMIN_CONTROL_CENTER_TEST_CHECKLIST.md) · [Device test checklist](OWNER_ANDROID_DEVICE_TEST_CHECKLIST.md) |
 
-- **Developer:** **Tp Editz**
-- **Telegram:** [@Tp_Editz](https://t.me/Tp_Editz)
-- **Instagram:** [@tp_ediitz](https://www.instagram.com/tp_ediitz/)
-- **Repository:** [https://github.com/tpeditz/Private-vault-android-v2](https://github.com/tpeditz/Private-vault-android-v2)
+Superseded development reports are preserved in earlier Git commits. The current test report and the technical guides above are the maintained entry points.
+
+## Developer and support
+
+Developed by **Tp Editz** · [Telegram](https://t.me/Tp_Editz) · [Instagram](https://www.instagram.com/tp_ediitz/)
