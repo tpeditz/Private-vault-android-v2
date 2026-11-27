@@ -1,54 +1,63 @@
 # Private Vault V2.1.0 — Verification & Test Report
 
-**Project Root:** `Private-vault-android-v2-1-0-work`  
-**Verification Scope:** Local automated unit tests, static analysis/linting, debug & release APK compilation/packaging, instrumentation Kotlin compilation, Admin Control Center linting/tests/build, and Deno Edge Function tests. Live authenticated Supabase end-to-end execution and on-device instrumentation tests were not run in this environment (no Android device or emulator connected via ADB, and no live Supabase Edge Function deployment executed).
+**Build Target:** `com.tpeditz.privatevault.v2` (`versionName = "2.1.0"`, `versionCode = 6`, `minSdk = 24`, `targetSdk = 36`)
 
 ---
 
-## 1. Automated Test Summary
+## 1. Pre-release local execution status
 
-| Layer | Command | Result | Scope & Exact Counts |
+| Test / Check Category | Status | Exact Result | Scope & Limitations |
 | --- | --- | --- | --- |
-| **Android Unit Tests** | `.\gradlew.bat :app:testDebugUnitTest --no-daemon` | **PASSED** | `26` suites, `145` tests, `0` failures, `0` errors, `0` skipped (`130` V2.0.4 baseline tests + `15` new V2.1.0 policy/OTA/announcement/feedback tests) |
-| **Android Lint** | `.\gradlew.bat :app:lintDebug --rerun-tasks --no-daemon` | **PASSED** | `0` errors, `66` warnings |
-| **Android Instrumentation Compile** | `.\gradlew.bat :app:compileDebugAndroidTestKotlin --no-daemon` | **PASSED** | All `androidTest` Kotlin sources compile cleanly against V2.1.0 code (not executed on device; `adb devices -l` empty) |
-| **Android Debug Build** | `.\gradlew.bat :app:assembleDebug --no-daemon` | **PASSED** | Generated `app-debug.apk` (`25,519,459` bytes) |
-| **Android Release Build (R8)** | `.\gradlew.bat :app:assembleRelease --no-daemon` | **PASSED** | Generated `app-release-unsigned.apk` (`4,447,645` bytes); `lintVitalRelease` passed |
-| **Admin Control Center Lint** | `npm run lint` (in `admin-web/`) | **PASSED** | ESLint `0` errors, `0` warnings |
-| **Admin Control Center Tests** | `npm run test` (Vitest in `admin-web/`) | **PASSED** | `1` file, `3` tests passed (unauthenticated block / no sign-up, AAL1 -> AAL2 MFA gate, AAL2 dashboard & disabled live publish state) |
-| **Admin Control Center Build** | `npm run build` (`tsc -b && vite build` in `admin-web/`) | **PASSED** | Clean TypeScript & Vite production bundle written to `docs/admin/` (`docs/admin/index.html`, `0.48 kB`) |
-| **Supabase Edge Function Tests** | `deno test supabase/functions/tests/edge_functions_test.ts --no-check=remote` | **PASSED** | `5` tests passed, `0` failed (manifest/repo/HTTPS URL checks, JWT AAL decoding, feedback validation) |
+| **Android Debug Unit Tests (`:app:testDebugUnitTest`)** | **PASSED** | `27` suites, `151` tests, `0` failed, `0` skipped | Executed locally after all code edits (`130` V2.0.4 baseline + `21` V2.1.0 contract/policy/OTA/feedback/upgrade-continuity tests) |
+| **Android Release Unit Test Task (`testReleaseUnitTest`)** | **NOT AVAILABLE** | Task does not exist in AGP 9 single unit-test variant setup | Standard Android Gradle Plugin builds unit tests against `testDebugUnitTest` only; `compileReleaseKotlin` + `lintRelease` + `assembleRelease` verified release variant |
+| **Android Release Lint (`:app:lintRelease`)** | **PASSED** | `0` errors, `67` warnings | Full static check on release variant |
+| **Android Debug Lint (`:app:lintDebug`)** | **PASSED** | `0` errors, `73` warnings | Full static check on debug + test sources |
+| **Android Instrumentation Kotlin Compile (`:app:compileDebugAndroidTestKotlin`)** | **PASSED** | Compiled cleanly | Verified syntax & Compose/Room UI test compatibility; **NOT executed on device** |
+| **Android Debug APK (`:app:assembleDebug`)** | **PASSED** | `26,141,577` bytes | Signed with debug key for development testing |
+| **Android Unsigned Release APK (`:app:assembleRelease`)** | **PASSED** | `4,447,645` bytes (R8 minified) | **Unsigned** — must be signed via GitHub release keystore before distribution |
+| **Admin Web (`eslint`, `vitest`, `tsc -b && vite build`)** | **PASSED** | Lint `0` errors; Vitest `1` file / `4` tests passed; bundle in `docs/admin/` | Tested with mocked `ControlCenterApi` (live Supabase Auth/TOTP UI requires deployed dashboard check) |
+| **Supabase Edge Function Tests (`deno test`)** | **PASSED** | `7` passed, `0` failed | Verified manifest checks, `StreamingSha256`, `verifyApkBinaryStream`, JWT AAL decoding, and feedback validation locally |
+| **On-Device Instrumentation / Physical Device QA** | **NOT EXECUTED** | `adb devices -l` returned zero attached devices | Requires owner's Android device via [OWNER_ANDROID_DEVICE_TEST_CHECKLIST.md](OWNER_ANDROID_DEVICE_TEST_CHECKLIST.md) |
+| **Live Supabase Migration & Edge Function Integration** | **NOT EXECUTED** | Prohibited in this workspace by authorization rules; local Supabase Docker stack not running | Requires owner review & deployment via [SUPABASE_DEPLOYMENT_GUIDE.md](SUPABASE_DEPLOYMENT_GUIDE.md) |
 
 ---
 
-## 2. Detailed Android Unit Test Suites (`app/build/test-results/testDebugUnitTest/`)
+## 2. Detailed Android Unit Test Suites (`27` Suites, `151` Tests)
 
-### New V2.1.0 Suites (`15` tests)
-- `com.tpeditz.privatevault.v2.policy.ControlPolicyAndRolloutTest` (`6` tests, `0` failed): API-24–safe ISO-8601 UTC parsing, snapshot validation rejecting spoofed cert / unofficial repo / drafts, deterministic cohort bucketing `0..99`, stable vs beta channel gating (`betaEnrollmentEnabled`), fail-closed schedule/pause/withdrawn/stale cache gating, `PolicyCacheStore` atomic round-trip & TTL expiry.
-- `com.tpeditz.privatevault.v2.policy.AnnouncementsAndFeatureFlagsTest` (`4` tests, `0` failed): strict allowlist & `6..72h` clamping ignoring unknown flags, plain-text control-character sanitization, announcement channel/version/schedule/`once` vs `repeat` selection, safe defaults fallback on stale snapshot.
-- `com.tpeditz.privatevault.v2.policy.OtaPolicyGateTest` (`3` tests, `0` failed): missing Supabase policy fail-closed with `0` requests to GitHub `/releases/latest/`, exact tagged manifest fetch for eligible `10%` cohort (`bucket = 5`) and deferral for `bucket = 50`, paused/withdrawn downloaded candidate blocking installer/download without corrupting staged file.
-- `com.tpeditz.privatevault.v2.policy.FeedbackValidationTest` (`2` tests, `0` failed): `BuildConfig.FEEDBACK_SUBMISSION_ENABLED == false` enforcement and consent/category/length boundary checks.
+### New / Repaired V2.1.0 Contract & Policy Suites (`21` tests)
+- `com.tpeditz.privatevault.v2.policy.SupabaseSchemaContractTest` (`2` tests): Asserts exact REST field lists matching `20261126120731` foundation SQL, asserts zero deprecated field names, verifies `NetworkUnavailable` vs `ServiceUnavailable` classification.
+- `com.tpeditz.privatevault.v2.policy.ControlPolicyAndRolloutTest` (`6` tests): API-24 UTC ISO parsing, rejection of unverified `published` releases (missing `apk_sha256`/`apk_size_bytes`/`verified_at`), deterministic cohort `0..99`, `beta_enrollment_enabled` & `optional`/`recommended`/`critical` priorities, fail-closed unavailable/paused/withdrawn/scheduled checks, `PolicyCacheStore` round-trip.
+- `com.tpeditz.privatevault.v2.policy.AnnouncementsAndFeatureFlagsTest` (`4` tests): Exact 4 foundation flags (`beta_enrollment_enabled`, `feedback_enabled`, `online_maintenance`, `update_check_interval_hours`), `6..72h` bounds & unknown-key rejection, `banner` vs `dialog` & `all`/`stable`/`beta` & `once` vs `repeat`, safe defaults when offline/stale.
+- `com.tpeditz.privatevault.v2.policy.OtaPolicyGateTest` (`6` tests): Confirms **cached policy after failed network refresh cannot authorize OTA updates or installations**, asserts `UNABLE_TO_VERIFY_UPDATE_MESSAGE`, blocks GitHub `/releases/latest/` fallback, checks Supabase-vs-GitHub `versionName`/`versionCode`/`sha256`/`sizeBytes`/`signingCertSha256` parity across check, download, permission recovery, and install gates, preserves verified local APK when paused, and verifies V2.0.4 DataStore upgrade continuity.
+- `com.tpeditz.privatevault.v2.policy.FeedbackValidationTest` (`3` tests): Confirms `BuildConfig.FEEDBACK_SUBMISSION_ENABLED == false`, enforces consent/bounds, verifies `SupabaseFeedbackClient` minimal zero-telemetry POST body & `429` rate-limit handling.
 
-### Preserved V2.0.4 Baseline Suites (`130` tests across `22` suites, all passing)
+### Preserved V2.0.4 Baseline Regression Suites (`130` tests)
 - `BackupPrivacyAndIntegrityV3RegressionTest` (`9`), `EncryptedBackupV2EngineTest` (`4`), `LegacyV1BackupReaderTest` (`5`), `LocalBackupAndRestoreIntegrationTest` (`7`), `V204HardeningRegressionTest` (`8`), `VaultFileSafetyTest` (`2`), `VaultRecordCodecTest` (`9`), `VaultRepositoryRestoreRegressionTest` (`11`), `VaultRepositorySafetyHardeningTest` (`2`), `OtaManifestTest` (`10`), `CryptoEngineTest` (`12`), `OfflinePasswordStrengthEstimatorTest` (`6`), `PasswordGeneratorEngineTest` (`5`), `PasswordPolicyTest` (`2`), `StreamingMediaCryptoEngineTest` (`7`), `TotpEngineTest` (`9`), `VaultSessionPolicyTest` (`2`), `CloudBackupSchedulerAndSyncTest` (`9`), `AutofillRemovalAndPasswordManagerRegressionTest` (`2`), `BackupOperationCompletionTest` (`4`), `DocumentExportCleanupTest` (`3`), `VaultErrorMapperTest` (`2`).
 
 ---
 
-## 3. APK Packaging & Badging Verification (`aapt2 dump badging`)
+## 3. APK Artifacts & Security Hygiene Verification
 
-- **Debug APK:** `app/build/outputs/apk/debug/app-debug.apk`
-  - Size: `25,519,459` bytes
-  - SHA-256: `604646AF2E092FE539881804D8764A3245FFFE14A7E827199FA90223C569E906`
-  - Package: `com.tpeditz.privatevault.v2.debug`, `versionCode='6'`, `versionName='2.1.0-debug'`, `minSdkVersion='24'`, `targetSdkVersion='36'`
-- **Unsigned Release APK:** `app/build/outputs/apk/release/app-release-unsigned.apk`
+- **Debug APK (Development Testing Only):**
+  - Path: `app/build/outputs/apk/debug/app-debug.apk`
+  - Size: `26,141,577` bytes
+  - SHA-256: `5745B4162CDF16D58929A9E789A1E6B217395619FE32263A5DA43E17A4237147`
+  - Package (`aapt2 dump badging`): `com.tpeditz.privatevault.v2.debug`, `versionCode='6'`, `versionName='2.1.0-debug'`, `minSdkVersion='24'`, `targetSdkVersion='36'`
+- **Unsigned Minified Release APK (Not Yet Production-Signed):**
+  - Path: `app/build/outputs/apk/release/app-release-unsigned.apk`
   - Size: `4,447,645` bytes
-  - SHA-256: `18FA768F20846C3E94214F7CB9862DC7D1225F4191E921C17D21E88C04C682E0`
-  - Package: `com.tpeditz.privatevault.v2`, `versionCode='6'`, `versionName='2.1.0'`, `minSdkVersion='24'`, `targetSdkVersion='36'`
+  - SHA-256: `4DFBCA711A648B2B988926A18E6298D85D91438D206F8D7674138E439F72875C`
+  - Package (`aapt2 dump badging`): `com.tpeditz.privatevault.v2`, `versionCode='6'`, `versionName='2.1.0'`, `minSdkVersion='24'`, `targetSdkVersion='36'`
+- **Hygiene Scans:**
+  - `AutofillService|autofill` across `app/src/main`: `0` matches.
+  - `service_role|eyJhbGci` across `app/src/main`, `admin-web/src`, `docs/admin`: `1` documentation comment (`admin-web/src/lib/supabaseClient.ts:3`), `0` embedded secrets or JWT tokens.
 
----
+## 4. Production Release Verification
 
-## 4. Static Security & Hygiene Checks
+The published V2.1.0 release was subsequently built and signed by GitHub Actions. The release workflow completed its build, lint, unit tests, signing, package metadata checks, and publication. Its initial live OTA byte check encountered stale responses; the separate verification-only workflow passed.
 
-- `AutofillService|autofill` scan across `app/src/main`: `0` matches.
-- `service_role|eyJhbGci` scan across `app/src/main`, `admin-web/src`, `docs/admin`: only `1` documentation comment match (`admin-web/src/lib/supabaseClient.ts:3`, warning never to embed `service_role`); `0` secrets, tokens, or JWT strings in shipped code/assets.
-- Connected devices check (`adb devices -l`): `List of devices attached` empty (on-device instrumentation & physical manual QA pending hardware availability).
+- [Signed production build and publication](https://github.com/tpeditz/Private-vault-android-v2/actions/runs/45878067776)
+- [Successful public OTA verification](https://github.com/tpeditz/Private-vault-android-v2/actions/runs/45879005924)
+- [Published V2.1.0 APK and manifest](https://github.com/tpeditz/Private-vault-android-v2/releases/tag/v2.1.0)
+
+The owner installed the signed test build and reported no major bugs during initial use. Administrator MFA, a version-targeted test announcement, and protected release activation were verified with the deployed Supabase project. The test announcement was archived. This does not replace the complete physical-device checklist or testing the next OTA upgrade from an installed V2.1.0 client.
