@@ -17,8 +17,8 @@
 | **Android Unsigned Release APK (`:app:assembleRelease`)** | **PASSED** | `4,447,645` bytes (R8 minified) | **Unsigned** — must be signed via GitHub release keystore before distribution |
 | **Admin Web (`eslint`, `vitest`, `tsc -b && vite build`)** | **PASSED** | Lint `0` errors; Vitest `1` file / `4` tests passed; bundle in `docs/admin/` | Tested with mocked `ControlCenterApi` (live Supabase Auth/TOTP UI requires deployed dashboard check) |
 | **Supabase Edge Function Tests (`deno test`)** | **PASSED** | `7` passed, `0` failed | Verified manifest checks, `StreamingSha256`, `verifyApkBinaryStream`, JWT AAL decoding, and feedback validation locally |
-| **On-Device Instrumentation / Physical Device QA** | **NOT EXECUTED** | `adb devices -l` returned zero attached devices | Requires owner's Android device via [OWNER_ANDROID_DEVICE_TEST_CHECKLIST.md](OWNER_ANDROID_DEVICE_TEST_CHECKLIST.md) |
-| **Live Supabase Migration & Edge Function Integration** | **NOT EXECUTED** | Prohibited in this workspace by authorization rules; local Supabase Docker stack not running | Requires owner review & deployment via [SUPABASE_DEPLOYMENT_GUIDE.md](SUPABASE_DEPLOYMENT_GUIDE.md) |
+| **On-Device Instrumentation / Physical Device QA** | **NOT EXECUTED** | `adb devices -l` returned zero attached devices | Requires owner's Android device via [OWNER_ANDROID_DEVICE_TEST_CHECKLIST.md](android-device-checklist.md) |
+| **Live Supabase Migration & Edge Function Integration** | **NOT EXECUTED** | Prohibited in this workspace by authorization rules; local Supabase Docker stack not running | Requires owner review & deployment via [SUPABASE_DEPLOYMENT_GUIDE.md](../guides/supabase-deployment.md) |
 
 ---
 

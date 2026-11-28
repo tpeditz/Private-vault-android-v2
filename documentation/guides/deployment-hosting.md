@@ -7,10 +7,10 @@
 ## 1. Repository Artifacts Overview
 
 - **Supabase Foundation Snapshot (Already Applied Live — Reference Only):**
-  - [20261126120731_private_vault_v210_control_center_foundation.sql](file:///supabase/migrations/20261126120731_private_vault_v210_control_center_foundation.sql)
+  - [20261126120731_private_vault_v210_control_center_foundation.sql](../../supabase/migrations/20261126120731_private_vault_v210_control_center_foundation.sql)
   - Do **not** re-run against the live database where the V2.1.0 foundation has already been applied.
 - **Reviewable Follow-Up Migration (Atomic Release Control & Feedback Rate Limiting):**
-  - [20261126130000_v210_release_control_and_feedback_rpc.sql](file:///supabase/migrations/20261126130000_v210_release_control_and_feedback_rpc.sql)
+  - [20261126130000_v210_release_control_and_feedback_rpc.sql](../../supabase/migrations/20261126130000_v210_release_control_and_feedback_rpc.sql)
 - **Supabase Edge Functions:**
   - `supabase/functions/release-control/index.ts` (owner / `release_manager` AAL2 JWT + `admin_roles` verification, CORS validation, calls `pv_private.admin_transition_release`)
   - `supabase/functions/submit-feedback/index.ts` (rate-limited feedback submission via `pv_private.submit_verified_feedback`, gated by `client_policy_state.feedback_enabled`)

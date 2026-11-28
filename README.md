@@ -1,60 +1,89 @@
-# Private Vault for Android
+<div align="center">
+  <img src="docs/logo.png" alt="Private Vault logo" width="104">
 
-Private Vault is a native Android application by **Tp Editz** for organizing passwords, notes, photos, videos, documents, secure links, and authenticator entries in a locally encrypted vault.
+  <h1>Private Vault</h1>
 
-[Download the latest release](https://github.com/tpeditz/Private-vault-android-v2/releases/latest) · [Official website](https://tpeditz.github.io/Private-vault-android-v2/) · [Privacy policy](https://tpeditz.github.io/Private-vault-android-v2/privacy.html)
+  <p><strong>Your privacy, in your hands.</strong></p>
+  <p>A native Android vault for passwords, notes, media and important files.</p>
 
-| Current stable release | Platform | Package |
-| --- | --- | --- |
-| [2.1.0](https://github.com/tpeditz/Private-vault-android-v2/releases/tag/v2.1.0) (version code 6) | Android 7.0+ | `com.tpeditz.privatevault.v2` |
+  <a href="https://github.com/tpeditz/Private-vault-android-v2/releases/latest"><img src="https://img.shields.io/github/v/release/tpeditz/Private-vault-android-v2?style=flat-square&label=Release&color=555555" alt="Latest release"></a>
+  <a href="https://github.com/tpeditz/Private-vault-android-v2/actions/workflows/ci.yml"><img src="https://github.com/tpeditz/Private-vault-android-v2/actions/workflows/ci.yml/badge.svg?branch=main" alt="Android build and test status"></a>
+  <img src="https://img.shields.io/badge/Android-7.0%2B-555555?style=flat-square" alt="Android 7.0 and newer">
+
+  <p>
+    <a href="https://github.com/tpeditz/Private-vault-android-v2/releases/latest"><strong>Download APK</strong></a>
+    &nbsp;·&nbsp;
+    <a href="https://tpeditz.github.io/Private-vault-android-v2/">Website</a>
+    &nbsp;·&nbsp;
+    <a href="https://tpeditz.github.io/Private-vault-android-v2/privacy.html">Privacy policy</a>
+    &nbsp;·&nbsp;
+    <a href="documentation/README.md">Documentation</a>
+  </p>
+</div>
+
+---
+
+## Overview
+
+Private Vault is an offline-first Android application developed by **Tp Editz**. Organize personal information in a locally encrypted vault, with optional encrypted backup to your own Google Drive account. A Google account is not required for local vault use.
 
 ## Features
 
-- **Personal encrypted vault:** passwords, private notes, media, documents, folders, and links.
-- **Offline-first access:** local vault features work without an internet connection or a Google account.
-- **Backup and restore:** encrypted local backups, optional Google Drive backup, automatic backup scheduling, and legacy V1 backup compatibility.
-- **Security tools:** password generation and strength guidance, TOTP authenticator, biometric unlock, app locking, and privacy controls.
-- **Verified updates:** production-signed APKs, checksum and certificate verification, and a Supabase policy control plane for compatible clients.
-- **Remote administration:** authorized administrators can manage release policies, announcements, and feature flags through the separate web dashboard. Feedback submission is currently disabled.
+| Vault | Privacy & utilities |
+| :--- | :--- |
+| Passwords, private notes and folders | Local encrypted storage |
+| Photos, videos, albums and documents | Biometric unlock and configurable app lock |
+| Secure links and authenticator entries | Password generator and strength guidance |
+| Search and record organization | Local backup and optional Google Drive backup |
+| Backup restoration and recovery | Verified in-app update checks |
 
-Vault contents are stored separately from operational policy metadata. Online services may process standard network request information as described in the [privacy policy](https://tpeditz.github.io/Private-vault-android-v2/privacy.html). Keep verified backups of important data.
+## Download
 
-## Project structure
+1. Open the [latest official release](https://github.com/tpeditz/Private-vault-android-v2/releases/latest).
+2. Download `private-vault.apk` and follow Android's installation prompts.
+3. Create your vault or restore an existing compatible encrypted backup.
 
-| Directory | Responsibility |
-| --- | --- |
-| `app/` | Kotlin, Jetpack Compose, local database, encryption, backup, and OTA |
-| `admin-web/` | React and TypeScript Admin Control Center |
-| `supabase/` | Database migrations and backend Edge Functions |
-| `docs/` | Public website and compiled admin website |
-| `scripts/` | OTA manifest generation and release verification |
-| `.github/workflows/` | Android CI and signed release automation |
+**Android 7.0 (API 24) or newer.** Keep an independently verified encrypted backup before updating. Use only the official release page or the application's built-in verified update flow.
 
-## Build and test
+## Development
 
-Use Android Studio or Java 21 with the included Gradle wrapper and Android SDK. Run from the repository root:
+The Android application uses **Kotlin**, **Jetpack Compose**, **Material 3**, **Room**, and the Android Keystore. The separate administration frontend uses **React**, **TypeScript**, and **Vite**, backed by Supabase.
+
+Use Android Studio, Android SDK, and JDK 21. The included Gradle wrapper makes the Android build reproducible.
 
 ```bash
 ./gradlew :app:testDebugUnitTest :app:lintDebug
 ./gradlew :app:assembleDebug
-./gradlew :app:assembleRelease
 ```
 
-On Windows, use `gradlew.bat` instead of `./gradlew`. Production builds must use the existing release signing configuration; do not create or commit signing keys.
+On Windows, use `gradlew.bat` instead of `./gradlew`. Debug builds are for development and testing, not production distribution. See [release setup](documentation/guides/release-setup.md) for the existing production-signing procedure.
+
+### Repository layout
+
+| Directory | Purpose |
+| :--- | :--- |
+| [`app/`](app/) | Android application and automated tests |
+| [`admin-web/`](admin-web/) | Administration frontend |
+| [`supabase/`](supabase/) | Backend configuration, migrations and functions |
+| [`docs/`](docs/) | Public website and compiled admin site |
+| [`documentation/`](documentation/) | Technical guides, specifications and QA references |
+| [`scripts/`](scripts/) | Release verification utilities |
+| [`.github/workflows/`](.github/workflows/) | Continuous integration and release workflows |
 
 ## Documentation
 
-| Topic | Reference |
-| --- | --- |
-| Features and latest verification | [Feature checklist](FEATURE_CHECKLIST.md) · [Test report](TEST_REPORT.md) |
-| Security and backup formats | [Cryptographic specification](SECURITY_AND_DATA_FORMAT.md) · [Backup compatibility](BACKUP_FORMAT_AND_COMPATIBILITY_REPORT.md) |
-| Updates and publishing | [OTA contract](OTA_CONTRACT.md) · [Release setup](RELEASE_SETUP.md) · [Release policy and privacy](RELEASE_POLICY_AND_PRIVACY.md) |
-| Google Drive | [Google setup](GOOGLE_SETUP.md) |
-| Supabase and hosting | [Deployment guide](SUPABASE_DEPLOYMENT_GUIDE.md) · [Hosting guide](DEPLOYMENT_AND_HOSTING_GUIDE.md) · [Schema compatibility](SUPABASE_SCHEMA_COMPATIBILITY_REPORT.md) |
-| Administrator operations and QA | [Admin setup](ADMIN_SETUP_GUIDE.md) · [Admin test checklist](ADMIN_CONTROL_CENTER_TEST_CHECKLIST.md) · [Device test checklist](OWNER_ANDROID_DEVICE_TEST_CHECKLIST.md) |
+- [Developer and setup guides](documentation/README.md#guides)
+- [Security and data formats](documentation/reference/security-data-format.md)
+- [Backup compatibility](documentation/reference/backup-compatibility.md)
+- [OTA update contract](documentation/reference/ota-contract.md)
+- [Quality assurance and verification](documentation/README.md#quality-assurance)
 
-Superseded development reports are preserved in earlier Git commits. The current test report and the technical guides above are the maintained entry points.
+Automated test code remains with the modules it tests. Operational guides and verification records are organized separately from the application source.
 
-## Developer and support
+## Privacy & support
 
-Developed by **Tp Editz** · [Telegram](https://t.me/Tp_Editz) · [Instagram](https://www.instagram.com/tp_ediitz/)
+Vault content is stored separately from remote operational policy metadata. Cloud backup is optional. Online services may handle standard network request information as described in the [Privacy Policy](https://tpeditz.github.io/Private-vault-android-v2/privacy.html). Feedback submission in the current stable app is disabled.
+
+Developed by **Tp Editz**.
+
+[Telegram](https://t.me/Tp_Editz) · [Instagram](https://www.instagram.com/tp_ediitz/) · [Official website](https://tpeditz.github.io/Private-vault-android-v2/)

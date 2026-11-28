@@ -1,7 +1,7 @@
 # Private Vault V2.1.0 — Supabase Schema Compatibility Report
 
-**Authoritative Reference:** [20261126120731_private_vault_v210_control_center_foundation.sql](file:///supabase/migrations/20261126120731_private_vault_v210_control_center_foundation.sql)  
-**Follow-Up & Corrective Migrations:** [20261126130000_v210_release_control_and_feedback_rpc.sql](file:///supabase/migrations/20261126130000_v210_release_control_and_feedback_rpc.sql), [20261126140000_v210_corrective_rpc_bridges_and_audit_attribution.sql](file:///supabase/migrations/20261126140000_v210_corrective_rpc_bridges_and_audit_attribution.sql)
+**Authoritative Reference:** [20261126120731_private_vault_v210_control_center_foundation.sql](../../supabase/migrations/20261126120731_private_vault_v210_control_center_foundation.sql)  
+**Follow-Up & Corrective Migrations:** [20261126130000_v210_release_control_and_feedback_rpc.sql](../../supabase/migrations/20261126130000_v210_release_control_and_feedback_rpc.sql), [20261126140000_v210_corrective_rpc_bridges_and_audit_attribution.sql](../../supabase/migrations/20261126140000_v210_corrective_rpc_bridges_and_audit_attribution.sql)
 
 ---
 

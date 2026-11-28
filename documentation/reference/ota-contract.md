@@ -34,7 +34,7 @@ GitHub redirects are constrained strictly to `github.com`, `raw.githubuserconten
 
 ## 2. Schema Version 1 Manifest Contract (`update.json`)
 
-The release workflow generates `update.json` using [`scripts/generate_ota_manifest.py`](file:///scripts/generate_ota_manifest.py) directly from the verified signed `private-vault.apk`:
+The release workflow generates `update.json` using [`scripts/generate_ota_manifest.py`](../../scripts/generate_ota_manifest.py) directly from the verified signed `private-vault.apk`:
 
 ```json
 {
